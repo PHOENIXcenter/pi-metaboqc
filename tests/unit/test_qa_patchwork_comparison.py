@@ -13,7 +13,6 @@ from pimqc.plotting.assessment import (
     plot_assessment_comparison,
     AssessmentPlotter,
 )
-from pimqc.plotting.base import BasePlotter
 from test_saved_diagnostics import _dataset
 
 
