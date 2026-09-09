@@ -6,14 +6,58 @@ They supply stage defaults, constrain method names and numerical options, and
 provide the normalized configuration surface consumed by every pipeline stage.
 """
 
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union, get_args, get_origin
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from ..constants import DEFAULT_RANDOM_SEED
 
 
-class MetaboIntConfig(BaseModel):
+class _StrictConfigModel(BaseModel):
+    """Base class that rejects misspelled or legacy configuration fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_choices(cls, values):
+        """Resolve case-insensitive choices consistently at every boundary."""
+        if not isinstance(values, dict):
+            return values
+        normalized = dict(values)
+        for key, field in cls.model_fields.items():
+            value = normalized.get(key)
+            if (
+                isinstance(value, str)
+                and get_origin(field.annotation) is Literal
+            ):
+                normalized[key] = next(
+                    (
+                        choice
+                        for choice in get_args(field.annotation)
+                        if isinstance(choice, str)
+                        and choice.casefold() == value.casefold()
+                    ),
+                    value,
+                )
+        return normalized
+
+    @field_validator("n_jobs", check_fields=False)
+    @classmethod
+    def validate_workers(cls, value: int) -> int:
+        """Reject zero workers before starting scientific computation."""
+        if value == 0:
+            raise ValueError("n_jobs must be -1 or a positive integer.")
+        return value
+
+
+class DatasetConfig(_StrictConfigModel):
     """Core Dataset Construction Schema."""
 
     mode: Literal[
@@ -30,7 +74,7 @@ class MetaboIntConfig(BaseModel):
     ] = "ESI+"
     sample_name: str = "Sample Name"
     sample_type: str = "Sample Type"
-    bio_group: str = "Bio Group"
+    bio_group: Optional[str] = "Bio Group"
     group_order: Optional[List[str]] = Field(default_factory=list)
     batch: str = "Batch"
     inject_order: str = "Inject Order"
@@ -48,7 +92,7 @@ class MetaboIntConfig(BaseModel):
     )
 
 
-class AssessorConfig(BaseModel):
+class QualityAssessorConfig(_StrictConfigModel):
     """Quality Assessment Schema.
 
     Includes scaling parameters applied locally during assessment.
@@ -111,7 +155,7 @@ class AssessorConfig(BaseModel):
         return v
 
 
-class FilterConfig(BaseModel):
+class FeatureFilterConfig(_StrictConfigModel):
     """Filtering Thresholds Schema for samples and features."""
 
     # Sample-level filtering
@@ -132,7 +176,7 @@ class FilterConfig(BaseModel):
     qc_rsd_tol: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
-class CorrectorConfig(BaseModel):
+class SignalCorrectorConfig(_StrictConfigModel):
     """Signal Drift Correction Schema."""
 
     base_est: Literal[
@@ -152,6 +196,23 @@ class CorrectorConfig(BaseModel):
         "Auto",
         "AUTO",
     ] = "Auto"
+
+    @field_validator("regression_batch_size", "serrf_batch_size")
+    @classmethod
+    def validate_batch_size(cls, value: Union[str, int]) -> Union[str, int]:
+        """Require a positive explicit joblib batch size."""
+        if isinstance(value, int) and value <= 0:
+            raise ValueError("batch size must be 'auto' or positive.")
+        return value
+
+    @field_validator("svr_gamma")
+    @classmethod
+    def validate_gamma(cls, value: Union[str, float]) -> Union[str, float]:
+        """Require positive numeric SVR gamma."""
+        if isinstance(value, (int, float)) and value <= 0:
+            raise ValueError("svr_gamma must be positive.")
+        return value
+
     loess_span: float = Field(
         default=0.3,
         gt=0.0,
@@ -247,9 +308,14 @@ class CorrectorConfig(BaseModel):
         ge=2,
         description="Number of folds for Out-Of-Fold (OOF) cross-validation.",
     )
+    n_jobs: int = Field(
+        default=-1,
+        ge=-1,
+        description="Number of worker processes; -1 uses all available CPUs.",
+    )
 
 
-class NormalizerConfig(BaseModel):
+class DataNormalizerConfig(_StrictConfigModel):
     """Configuration for global normalization."""
 
     norm_method: Literal[
@@ -263,9 +329,14 @@ class NormalizerConfig(BaseModel):
         "VSN",
         "Quantile",
     ] = "Auto"
+    n_jobs: int = Field(
+        default=-1,
+        ge=-1,
+        description="Number of worker processes for parallel normalization.",
+    )
 
 
-class ImputerConfig(BaseModel):
+class MissingValueImputerConfig(_StrictConfigModel):
     """Missing Value Imputation Schema."""
 
     mnar_method: Literal["Row-wise", "Column-wise", "Global", "QRILC"] = "QRILC"
@@ -281,14 +352,22 @@ class ImputerConfig(BaseModel):
     sim_mask_ratio: float = Field(default=0.05, gt=0.0, lt=1.0)
 
 
-class PipelineConfig(BaseModel):
+class PipelineConfig(_StrictConfigModel):
     """Master Pipeline Configuration Root mapping to TOML sections."""
 
-    MetaboInt: MetaboIntConfig = Field(default_factory=MetaboIntConfig)
-    MetaboIntAssessor: AssessorConfig = Field(default_factory=AssessorConfig)
-    MetaboIntFilter: FilterConfig = Field(default_factory=FilterConfig)
-    MetaboIntCorrector: CorrectorConfig = Field(default_factory=CorrectorConfig)
-    MetaboIntNormalizer: NormalizerConfig = Field(
-        default_factory=NormalizerConfig
+    Dataset: DatasetConfig = Field(default_factory=DatasetConfig)
+    QualityAssessor: QualityAssessorConfig = Field(
+        default_factory=QualityAssessorConfig
     )
-    MetaboIntImputer: ImputerConfig = Field(default_factory=ImputerConfig)
+    FeatureFilter: FeatureFilterConfig = Field(
+        default_factory=FeatureFilterConfig
+    )
+    SignalCorrector: SignalCorrectorConfig = Field(
+        default_factory=SignalCorrectorConfig
+    )
+    DataNormalizer: DataNormalizerConfig = Field(
+        default_factory=DataNormalizerConfig
+    )
+    MissingValueImputer: MissingValueImputerConfig = Field(
+        default_factory=MissingValueImputerConfig
+    )

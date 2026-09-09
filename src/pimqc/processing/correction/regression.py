@@ -196,9 +196,13 @@ class RegressionCorrector:
 
                 oof_matrix = pred_matrix.copy()
                 qc_indices = np.where(b_qc_mask)[0]
-                if len(qc_indices) >= max(3, cv_folds):
+                oof_matrix[:, qc_indices] = np.nan
+                effective_folds = min(len(qc_indices), cv_folds)
+                if effective_folds >= 3:
                     kf = KFold(
-                        n_splits=cv_folds, shuffle=True, random_state=seed
+                        n_splits=effective_folds,
+                        shuffle=True,
+                        random_state=seed,
                     )
                     for train_idx, test_idx in kf.split(qc_indices):
                         train_qc_mask = b_qc_mask.copy()
@@ -262,7 +266,9 @@ class RegressionCorrector:
         batch_qc_means = qc_intensity.T.groupby(batch_array[qc_mask]).mean().T
 
         base_bc = pd.DataFrame(
-            index=intensity_df.index, columns=intensity_df.columns
+            index=intensity_df.index,
+            columns=intensity_df.columns,
+            dtype=float,
         )
         for b_id in unique_batches:
             b_mask = batch_array == b_id

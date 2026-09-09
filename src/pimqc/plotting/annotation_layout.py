@@ -340,7 +340,9 @@ def _path_collection_bboxes(
 
 
 def _line_path_in_axes(ax: plt.Axes, line: object) -> np.ndarray | None:
-    """Transform a Line2D path, including blended transforms, into axes units."""
+    """
+    Transform a Line2D path, including blended transforms, into axes units.
+    """
     try:
         display_path = line.get_transform().transform_path(line.get_path())
         vertices = ax.transAxes.inverted().transform(display_path.vertices)
@@ -394,7 +396,7 @@ def _collect_obstacles(
     """Collect all rendered geometry used by annotation collision scoring."""
     excluded = {id(item) for item in (exclude or [])}
     ax.figure.canvas.draw()
-    renderer = ax.figure.canvas.get_renderer()
+    renderer = ax.figure._get_renderer()
     boxes = list(blocked_regions or [])
     line_paths: list[np.ndarray] = []
     has_marker_collections = False
@@ -606,7 +608,7 @@ def _measure_text(
     )
     try:
         ax.figure.canvas.draw()
-        renderer = ax.figure.canvas.get_renderer()
+        renderer = ax.figure._get_renderer()
         bbox = probe.get_window_extent(renderer).transformed(
             ax.transAxes.inverted()
         )
@@ -675,7 +677,7 @@ def artist_bboxes_in_axes(
         Axes-coordinate ``(x0, y0, x1, y1)`` rectangles.
     """
     ax.figure.canvas.draw()
-    renderer = ax.figure.canvas.get_renderer()
+    renderer = ax.figure._get_renderer()
     selected = list(artists or [])
     if include_legend:
         legend = ax.get_legend()
@@ -923,16 +925,25 @@ def place_annotation_in_least_occupied_corner(
     """
     try:
         ax.figure.canvas.draw()
-        renderer = ax.figure.canvas.get_renderer()
+        renderer = ax.figure._get_renderer()
         measured = text_artist.get_window_extent(renderer).transformed(
             ax.transAxes.inverted()
         )
-        width = min(0.92, max(0.02, float(measured.width)))
-        height = min(0.75, max(0.02, float(measured.height)))
         background_padding = _annotation_background_padding(
             ax,
             text_artist,
             renderer,
+        )
+        # Candidate scoring must use the complete opaque patch extent, not
+        # only the glyph rectangle.  Otherwise a padded annotation can be
+        # placed inside the axes while its rounded background crosses a spine.
+        width = min(
+            0.92,
+            max(0.02, float(measured.width) + 2.0 * background_padding),
+        )
+        height = min(
+            0.75,
+            max(0.02, float(measured.height) + 2.0 * background_padding),
         )
     except (AttributeError, RuntimeError, TypeError, ValueError):
         width, height = 0.46, 0.18
@@ -978,15 +989,6 @@ def place_annotation_in_least_occupied_corner(
     text_artist.set_position(best["xy"])
     text_artist.set_ha(str(best["ha"]))
     text_artist.set_va(str(best["va"]))
-    if background_padding > 0.0:
-        best = {
-            **best,
-            "bbox": _expand_bbox(
-                best["bbox"],
-                background_padding,
-                background_padding,
-            ),
-        }
     return best
 
 
@@ -1000,7 +1002,16 @@ def place_annotation_with_legend_awareness(
 ) -> dict[str, object]:
     """Place a free annotation after legend and colorbar layout is finalized."""
     regions = list(blocked_regions or [])
-    if legend is not None and legend_is_inside_axes(ax, legend=legend):
+    discovered_legend_ids = {
+        id(item)
+        for item in [ax.get_legend(), *getattr(ax, "artists", [])]
+        if isinstance(item, Legend)
+    }
+    if (
+        legend is not None
+        and id(legend) not in discovered_legend_ids
+        and legend_is_inside_axes(ax, legend=legend)
+    ):
         regions.extend(legend_bboxes_in_axes(ax, legend=legend))
     placement = place_annotation_in_least_occupied_corner(
         ax=ax,
@@ -1035,10 +1046,16 @@ def add_auto_annotation(
     text: str,
     occupancy_arrays: Sequence[np.ndarray] | None = None,
     blocked_regions: Sequence[BBoxTuple] | None = None,
+    legend: object | None = None,
     expand_axes: bool = True,
     **kwargs: object,
 ) -> object:
-    """Create and place a free annotation after fixed guides are rendered."""
+    """Create and place a free annotation after fixed guides are rendered.
+
+    ``legend`` can identify the finalized dynamic legend explicitly. This is
+    useful for Axes implementations that do not reliably expose their local
+    legend through ``get_legend()`` during composite construction.
+    """
     artist = ax.text(
         0.5,
         0.5,
@@ -1053,6 +1070,7 @@ def add_auto_annotation(
         text_artist=artist,
         occupancy_arrays=occupancy_arrays,
         blocked_regions=blocked_regions,
+        legend=legend,
         expand_axes=expand_axes,
     )
     return artist

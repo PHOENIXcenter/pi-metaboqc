@@ -7,6 +7,29 @@ processing stage. Numerical stage logic remains under
 """
 
 from .base import BasePlotter
+from .payloads import (
+    AssessmentPlotPayload,
+    CorrectionPlotPayload,
+    DatasetPlotPayload,
+    FilteringPlotPayload,
+    ImputationPlotPayload,
+    NormalizationPlotPayload,
+    PlotPayload,
+    snapshot_dataset,
+    snapshot_plot_value,
+)
 from .sample_structure import plot_sample_structure_change_map
 
-__all__ = ["BasePlotter", "plot_sample_structure_change_map"]
+__all__ = [
+    "AssessmentPlotPayload",
+    "BasePlotter",
+    "CorrectionPlotPayload",
+    "DatasetPlotPayload",
+    "FilteringPlotPayload",
+    "ImputationPlotPayload",
+    "NormalizationPlotPayload",
+    "PlotPayload",
+    "plot_sample_structure_change_map",
+    "snapshot_dataset",
+    "snapshot_plot_value",
+]

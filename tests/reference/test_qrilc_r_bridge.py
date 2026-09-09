@@ -15,7 +15,7 @@ from rpy2.robjects.conversion import localconverter
 from scipy.stats import spearmanr
 
 from pimqc.constants import DEFAULT_RANDOM_SEED
-from pimqc.processing.imputation import MetaboIntImputer
+from pimqc.processing.imputation import MissingValueImputer
 
 from .helpers import relative_mae, require_r_package
 
@@ -71,7 +71,7 @@ def test_qrilc_matches_imputelcmd_distributional_reference() -> None:
     """Check that Python QRILC tracks the imputeLCMD distribution."""
     masked_df, missing_mask = _make_left_censored_log_matrix()
 
-    py_df = MetaboIntImputer.impute_by_qrilc(
+    py_df = MissingValueImputer.impute_by_qrilc(
         masked_df,
         tune_sigma=1.0,
         global_seed=DEFAULT_RANDOM_SEED,

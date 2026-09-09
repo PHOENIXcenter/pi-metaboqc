@@ -112,7 +112,7 @@ class CorrectionDiagnosticsMixin:
         """Collect finite feature-wise QC RSD arrays from correction stages."""
         rsd_arrays: list[np.ndarray] = []
         for df_obj in stage_dfs.values():
-            rsd = self.corr.extract_qc_rsd_series(df_obj)
+            rsd = self.payload.extract_qc_rsd_series(df_obj)
             if not rsd.empty:
                 values = rsd.to_numpy(dtype=float)
                 values = values[np.isfinite(values)]
@@ -120,7 +120,7 @@ class CorrectionDiagnosticsMixin:
                     rsd_arrays.append(values)
 
         for df_obj in (stage_oof_dfs or {}).values():
-            rsd = self.corr.extract_qc_rsd_series(df_obj)
+            rsd = self.payload.extract_qc_rsd_series(df_obj)
             if not rsd.empty:
                 values = rsd.to_numpy(dtype=float)
                 values = values[np.isfinite(values)]
@@ -233,6 +233,7 @@ class CorrectionDiagnosticsMixin:
         tick_pos = []
         tick_labels = []
         medians_text = []
+        legend_artist = None
 
         c_base = pu.get_equivalent_hex("tab:gray", alpha=1.0)
         c_cv = pu.get_equivalent_hex(pu.PRIMARY_ACCENT_COLOR, alpha=0.33)
@@ -244,7 +245,7 @@ class CorrectionDiagnosticsMixin:
 
         orig_df = stage_dfs.get("Original")
         if orig_df is not None:
-            orig_rsd = self.corr.extract_qc_rsd_series(orig_df)
+            orig_rsd = self.payload.extract_qc_rsd_series(orig_df)
             box_data.append(orig_rsd.values)
             positions.append(1.0)
             box_colors.append(c_base)
@@ -262,11 +263,11 @@ class CorrectionDiagnosticsMixin:
 
             clean_name = stage_name.replace("\n", " ")
             has_cv = stage_name in stage_oof_dfs
-            full_rsd = self.corr.extract_qc_rsd_series(df)
+            full_rsd = self.payload.extract_qc_rsd_series(df)
             is_last = stage_name == last_stage_key
 
             if has_cv:
-                cv_rsd = self.corr.extract_qc_rsd_series(
+                cv_rsd = self.payload.extract_qc_rsd_series(
                     stage_oof_dfs[stage_name]
                 )
                 box_data.extend([cv_rsd.values, full_rsd.values])
@@ -374,10 +375,12 @@ class CorrectionDiagnosticsMixin:
                 ),
             ]
             current_ax.legend(handles=legend_elements)
-            self._format_single_legend(
+            legend_artist = self._format_single_legend(
                 ax=current_ax,
                 group_title="Correction evaluation",
-                loc="lower right",
+                # Resolve the legend first, then let the annotation allocator
+                # choose a non-overlapping free region around that result.
+                loc="best",
                 bbox_to_anchor=None,
                 max_item_rows=6,
             )
@@ -411,6 +414,7 @@ class CorrectionDiagnosticsMixin:
         al.add_auto_annotation(
             ax=current_ax,
             text=annot_text,
+            legend=legend_artist,
             fontsize=pu.DEFAULT_ANNOTATION_FONTSIZE,
             bbox=pu.ai_ready_text_bbox(pad=0.25 if article_compact else 0.4),
         )

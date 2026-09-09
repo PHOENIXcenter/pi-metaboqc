@@ -15,6 +15,18 @@ import numpy as np
 from . import plot_utils as pu
 
 
+def format_heatmap_colorbar_axes(ax: plt.Axes) -> None:
+    """Match a colorbar outline to the standard heatmap cell grid."""
+    pu.format_colorbar_axes(ax)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    outline = ax.spines.get("outline")
+    if outline is not None:
+        outline.set_visible(True)
+        outline.set_edgecolor("k")
+        outline.set_linewidth(pu.DEFAULT_HEATMAP_CELL_LINEWIDTH)
+
+
 def score_heatmap_cmap(
     base_color: str = pu.PRIMARY_ACCENT_COLOR,
     n_colors: int = 256,

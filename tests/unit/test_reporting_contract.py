@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from pimqc.reporting import NarrativeStatsReporter, ReportInput
 
 
@@ -28,7 +30,12 @@ def _report_input() -> ReportInput:
                 },
                 "feature_wise": {
                     "filtering_level": "Group",
-                    "thresholds": {"mnar_group_mv_tol": 0.73},
+                    "thresholds": {
+                        "mv_group_tol": 0.31,
+                        "mv_qc_tol": 0.27,
+                        "mnar_group_mv_tol": 0.73,
+                        "mnar_qc_mv_tol": 0.19,
+                    },
                     "missing_classification": {
                         "mar_count": 1,
                         "mnar_total": 1,
@@ -62,7 +69,10 @@ def _report_input() -> ReportInput:
                         "mnar_count": 1,
                     },
                 },
-                "thresholds": {"qc_rsd_tol": 0.25},
+                "thresholds": {
+                    "blank_qc_ratio_tol": 0.17,
+                    "qc_rsd_tol": 0.25,
+                },
                 "filtering_breakdown": {},
             },
             "missing_value_imputation": {
@@ -103,9 +113,14 @@ def _report_input() -> ReportInput:
                 },
             },
         },
-        qa_metrics={},
+        qa_metrics={
+            "raw_dataset": {
+                "pca": {"scaling_method": "unit-test-scaling"},
+                "correlation": {"method": "pearson"},
+            }
+        },
         metadata={"date": "2026-08-18 12:00", "mode": "POS"},
-        resolved_config={"MetaboInt": {"mode": "POS"}},
+        resolved_config={"Dataset": {"mode": "POS"}},
         asset_manifest={"pca": "assets/02_PCA_Scatter_Dashboard.svg"},
     )
 
@@ -117,7 +132,7 @@ def test_report_input_writes_a_portable_json_snapshot(tmp_path: Path) -> None:
     payload = json.loads(output_path.read_text(encoding="utf-8"))
 
     assert payload["metadata"]["mode"] == "POS"
-    assert payload["resolved_config"]["MetaboInt"]["mode"] == "POS"
+    assert payload["resolved_config"]["Dataset"]["mode"] == "POS"
     assert payload["asset_manifest"]["pca"].endswith(".svg")
 
 
@@ -135,16 +150,189 @@ def test_reporter_renders_markdown_from_report_input(tmp_path: Path) -> None:
     assert "Ionization Mode:** POS" in comprehensive
     assert "test-version" in comprehensive
     assert "0.42" in comprehensive
+    assert "0.31" in comprehensive
+    assert "0.27" in comprehensive
+    assert "0.73" in comprehensive
+    assert "0.19" in comprehensive
+    assert "0.17" in comprehensive
+    assert "0.25" in comprehensive
     assert "LOESS" in comprehensive
     assert "KNN" in comprehensive
     assert "QUANTILE" in comprehensive
-    assert "**Deterministic Substitution for MNAR Features**\n\nFor" in comprehensive
+    assert "unit-test-scaling" in comprehensive
+    assert "Pearson" in comprehensive
+    assert "MV_Classification_Dashboard.svg" in comprehensive
+    assert "Missing-Value Classification Dashboard" in comprehensive
+    assert "MV_Feature_Classification_Dashboard.svg" not in comprehensive
+    assert "**Imputation of MNAR Features**\n\nFor" in comprehensive
     assert "**Configured MAR Imputation Method**\n\nFor" in comprehensive
     assert "Jensen-Shannon distance of **0.125**" in comprehensive
     assert "normalized Wasserstein distance of **0.375**" in comprehensive
 
 
-def test_imputation_dashboards_follow_selection_evidence(tmp_path: Path) -> None:
+@pytest.mark.parametrize("imputation_status", ["Skipped", "Completed"])
+def test_skipped_mv_and_mnar_only_reports_omit_unproduced_figures(
+    tmp_path, imputation_status
+):
+    """Render current audit states even if an older dashboard file exists."""
+    report = _report_input()
+    metrics = report.pipeline_metrics
+    metrics["high_mv_feature_filtering"]["feature_wise"].update(
+        {"execution_status": "skipped", "skip_reason": "No missing values."}
+    )
+    imputation = metrics["missing_value_imputation"]
+    imputation["imputation_status"] = imputation_status
+    imputation["feature_distribution"] = {"mar_count": 0, "mnar_count": 2}
+    reporter = NarrativeStatsReporter(base_dir=str(tmp_path))
+    reporter.generate_markdown(report, report_folder="report")
+    text = (tmp_path / "report" / "Report_Comprehensive.md").read_text(
+        encoding="utf-8"
+    )
+    assert "MV_Classification_Dashboard.svg" not in text
+    assert "Imputation_Dashboard_" not in text
+    assert "Imputation_Candidate_Dashboard_" not in text
+    assert "Automatic MAR Imputation Selection" not in text
+
+
+def test_missing_pandoc_never_downloads_or_installs(tmp_path, monkeypatch):
+    """Report export is a conversion operation, not environment provisioning."""
+    import pypandoc
+
+    source = tmp_path / "Report_Comprehensive.md"
+    source.write_text("# Report\n", encoding="utf-8")
+    reporter = NarrativeStatsReporter(base_dir=str(tmp_path))
+    reporter._generated_md_paths = [str(source)]
+
+    def missing():
+        raise OSError("Pandoc unavailable")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Unexpected download")
+
+    monkeypatch.setattr(pypandoc, "get_pandoc_version", missing)
+    monkeypatch.setattr(pypandoc, "download_pandoc", forbidden)
+    assert not reporter.export_report()
+
+
+def test_partial_markdown_generation_cannot_claim_export_success(
+    tmp_path, monkeypatch
+):
+    """An earlier successful report cannot mask a failed current template."""
+    reporter = NarrativeStatsReporter(base_dir=str(tmp_path))
+    reporter.generate_markdown(_report_input(), report_folder="report")
+    original = reporter.env.get_template
+
+    def template(name):
+        if "brief" in name:
+            raise ValueError("Broken template")
+        return original(name)
+
+    monkeypatch.setattr(reporter.env, "get_template", template)
+    monkeypatch.setattr(reporter, "_debug_template_errors", lambda *args: None)
+    reporter.generate_markdown(_report_input(), report_folder="report")
+    assert len(reporter._generated_md_paths) == 1
+    assert not reporter.export_report()
+
+
+def test_all_comprehensive_tables_have_pandoc_captions(
+    tmp_path: Path,
+) -> None:
+    """Keep generated tables in the numbered PDF caption system."""
+    report_input = _report_input()
+    report_input.pipeline_metrics["signal_correction"]["selection"] = {
+        "requested_method": "AUTO",
+        "selected_method": "LOESS",
+        "selected_label": "LOESS",
+        "is_auto": True,
+        "candidate_results": [
+            {
+                "method": "LOESS",
+                "selected": True,
+                "status": "ok",
+                "auto_score": 0.8,
+            }
+        ],
+    }
+    report_input.pipeline_metrics["missing_value_imputation"]["selection"][
+        "requested_method"
+    ] = "AUTO"
+    report_input.pipeline_metrics["missing_value_imputation"]["selection"][
+        "is_auto"
+    ] = True
+    report_input.pipeline_metrics["normalization"]["selection"].update(
+        {
+            "requested_method": "AUTO",
+            "is_auto": True,
+            "candidate_results": [
+                {
+                    "method": "QUANTILE",
+                    "selected": True,
+                    "status": "ok",
+                    "overall_score": 0.7,
+                }
+            ],
+        }
+    )
+
+    reporter = NarrativeStatsReporter(base_dir=str(tmp_path))
+    reporter.generate_markdown(report_input, report_folder="report")
+    comprehensive = (tmp_path / "report" / "Report_Comprehensive.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Table: Correction Candidate Comparison" in comprehensive
+    assert "Table: MAR Imputation Candidate Comparison" in comprehensive
+    assert "Table: Normalization Candidate Comparison" in comprehensive
+    lines = comprehensive.splitlines()
+    table_count = sum(
+        bool(NarrativeStatsReporter._TABLE_SEPARATOR.fullmatch(line))
+        for line in lines
+    )
+    caption_count = sum(line.startswith("Table: ") for line in lines)
+    assert table_count == caption_count
+
+
+def test_export_preflight_rejects_unresolved_assets_and_table_titles(
+    tmp_path: Path,
+) -> None:
+    """Reject blank figures and unnumbered tables before PDF conversion."""
+    asset = tmp_path / "figure.svg"
+    asset.write_text(
+        "<svg xmlns='http://www.w3.org/2000/svg'/>", encoding="utf-8"
+    )
+    markdown = tmp_path / "report.md"
+    markdown.write_text(
+        "Table: Parsed values\n\n"
+        "| Parameter | Value |\n"
+        "| --- | --- |\n"
+        "| method | AUTO |\n\n"
+        "![Dashboard](figure.svg)\n",
+        encoding="utf-8",
+    )
+
+    NarrativeStatsReporter._validate_markdown_source(markdown)
+
+    asset.unlink()
+    with pytest.raises(FileNotFoundError, match="figure.svg"):
+        NarrativeStatsReporter._validate_markdown_source(markdown)
+
+    asset.write_text(
+        "<svg xmlns='http://www.w3.org/2000/svg'/>", encoding="utf-8"
+    )
+    markdown.write_text(
+        "| Parameter | Value |\n"
+        "| --- | --- |\n"
+        "| method | AUTO |\n\n"
+        "![Dashboard](figure.svg)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="lack a caption"):
+        NarrativeStatsReporter._validate_markdown_source(markdown)
+
+
+def test_imputation_dashboards_follow_selection_evidence(
+    tmp_path: Path,
+) -> None:
     """Place candidate dashboard before the selected-method dashboard."""
     report_input = _report_input()
     selection = report_input.pipeline_metrics["missing_value_imputation"][
@@ -172,7 +360,9 @@ def test_imputation_dashboards_follow_selection_evidence(tmp_path: Path) -> None
     assert "KNN (selected)" in comprehensive
 
 
-def test_auto_normalization_renders_candidate_comparison(tmp_path: Path) -> None:
+def test_auto_normalization_renders_candidate_comparison(
+    tmp_path: Path,
+) -> None:
     """Render a compact AUTO comparison from the unified candidate contract."""
     report_input = _report_input()
     selection = report_input.pipeline_metrics["normalization"]["selection"]
@@ -217,10 +407,14 @@ def test_auto_normalization_renders_candidate_comparison(tmp_path: Path) -> None
     assert "PQN (selected)" in comprehensive
 
 
-def test_reporter_does_not_render_missing_metrics_as_zero(tmp_path: Path) -> None:
+def test_reporter_does_not_render_missing_metrics_as_zero(
+    tmp_path: Path,
+) -> None:
     """Show unavailable correction and VSN metrics without numeric fallbacks."""
     report_input = _report_input()
-    report_input.pipeline_metrics["signal_correction"]["stages_executed"].append(
+    report_input.pipeline_metrics["signal_correction"][
+        "stages_executed"
+    ].append(
         {
             "stage_name": "Final correction",
             "algorithm": "LOESS",

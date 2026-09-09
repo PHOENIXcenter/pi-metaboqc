@@ -1,10 +1,14 @@
-"""Missing-value filtering decision flowchart.
+"""Responsive missing-value filtering decision flowcharts.
 
-The module draws the stage decision topology and adapts it to the presence or
-absence of biological-group metadata. It does not assemble dashboards.
+The flowchart topology is selected independently from the outer dashboard
+layout.  Nodes and edges share one normalized coordinate system so changing a
+Patchworklib Brick's physical width changes spacing without detaching arrows
+from their node boundaries.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import matplotlib.patches as mpatches
 import matplotlib.path as mpath
@@ -14,14 +18,38 @@ import pandas as pd
 from .. import plot_utils as pu
 
 
+@dataclass(frozen=True)
+class _FlowNode:
+    """Describe one node in normalized flowchart coordinates."""
+
+    key: str
+    x: float
+    y: float
+    text: str
+    color: str
+    width: float
+    height: float
+    body_fontsize: float | None = None
+    line_step: float | None = None
+
+
+@dataclass(frozen=True)
+class _FlowEdge:
+    """Describe one directed connection between named nodes."""
+
+    source: str
+    target: str
+    style: str = "horizontal"
+
+
 class FilteringFlowchartMixin:
-    """Render the decision flowchart used by filtering dashboards."""
+    """Render group-aware and QC-only filtering decision topologies."""
 
     def _plot_mv_filtering_flowchart(
         self,
         df: pd.DataFrame,
         ax: plt.Axes,
-        mnar_group_mv_tol: float,
+        mnar_group_mv_tol: float | None,
         mnar_qc_mv_tol: float,
         active_base_tol: float,
         has_group_info: bool,
@@ -32,32 +60,38 @@ class FilteringFlowchartMixin:
         margin_bottom: float = 0.0,
         compact: bool = False,
     ) -> None:
+        """Draw a responsive missingness-classification flowchart.
+
+        ``has_group_info`` selects a grouped or QC-only topology.  Geometry is
+        expressed on a 0-1 canvas and every arrow endpoint is derived from the
+        final node boundary.  The outer dashboard can therefore use either a
+        compact or full-width Brick without maintaining a second set of edge
+        coordinates.
         """
-        Horizontal flowchart with strictly QC-anchored logic.
-        Dynamically adapts topology (removes Group Rescue nodes completely
-        if no bio-group info exists) and re-balances X-axis coordinates.
-        """
+        statuses = df["Stage1_Status"].astype(str)
         total = len(df)
-        count_group = sum(df["Stage1_Status"].str.contains("Group"))
-        df_s2 = df[~df["Stage1_Status"].str.contains("Group")]
-        count_qc = sum(df_s2["Stage1_Status"].str.contains("QC"))
-        df_s3 = df_s2[~df_s2["Stage1_Status"].str.contains("QC")]
-        count_mar = sum(df_s3["Stage1_Status"] == "MAR")
-        count_inv = sum(df_s3["Stage1_Status"] == "INVALID")
+        group_mask = statuses.str.contains("Group", na=False)
+        count_group = int(group_mask.sum())
+        after_group = df.loc[~group_mask]
+        qc_mask = (
+            after_group["Stage1_Status"]
+            .astype(str)
+            .str.contains("QC", na=False)
+        )
+        count_qc = int(qc_mask.sum())
+        after_qc = after_group.loc[~qc_mask]
+        count_mar = int((after_qc["Stage1_Status"] == "MAR").sum())
+        count_inv = int((after_qc["Stage1_Status"] == "INVALID").sum())
 
         ax.axis("off")
-
-        # Keep only a small safety margin around the outermost nodes and arrows
-        # so the compact flowchart aligns with neighboring dashboard panels.
-        ax.set_xlim(0.2 - margin_left, 32.9 + margin_right)
-        ax.set_ylim(0.5 - margin_bottom, 9.35 + margin_top)
+        ax.set_xlim(0.0 - margin_left, 1.0 + margin_right)
+        ax.set_ylim(0.0 - margin_bottom, 1.0 + margin_top)
 
         color_mar = pu.PRIMARY_ACCENT_COLOR
         color_mnar = pu.get_equivalent_hex(pu.PRIMARY_ACCENT_COLOR, alpha=0.5)
         color_inv = "tab:gray"
         color_pass = "white"
-        box_style = "round,pad=0.12,rounding_size=0.18"
-        node_fontsize = 7.0 if compact else (12 if has_group_info else 14)
+        node_fontsize = 7.0 if compact else (12.0 if has_group_info else 14.0)
         node_body_fontsize = 5.5 if compact else 10.0
         flow_linewidth = pu.DEFAULT_AXIS_LINEWIDTH if compact else 1.2
         arrow_linewidth = pu.DEFAULT_GUIDE_LINEWIDTH if compact else 2.0
@@ -65,122 +99,255 @@ class FilteringFlowchartMixin:
             f"QC intensity <= {pu.format_percentile_label(mnar_intensity_pct)}"
         )
 
-        def _node(
-            x: float,
-            y: float,
-            text: str,
-            bg: str,
-            width: float = 5.2,
-            height: float = 1.5,
-            fontsize: float | None = None,
-            body_fontsize: float | None = None,
-            line_step: float | None = None,
-        ) -> dict[str, float]:
-            """Draw a fixed-size flowchart node and return its data bounds."""
-            text_color = pu.get_contrast_color(bg)
-            text_fontsize = node_fontsize if fontsize is None else fontsize
-            text_body_fontsize = (
-                node_body_fontsize if body_fontsize is None else body_fontsize
+        if has_group_info:
+            group_tol = (
+                active_base_tol
+                if mnar_group_mv_tol is None
+                else mnar_group_mv_tol
             )
-            text_line_step = (
-                (0.49 if has_group_info else 0.55)
-                if line_step is None
-                else line_step
-            )
+            nodes = [
+                _FlowNode(
+                    "raw",
+                    0.08,
+                    0.50,
+                    f"Raw Features\n(n={total})",
+                    color_pass,
+                    0.14,
+                    0.17,
+                ),
+                _FlowNode(
+                    "group_check",
+                    0.29,
+                    0.50,
+                    "Group Rescue\n"
+                    f"Max MV >= {group_tol * 100:.0f}%\n"
+                    f"Min MV <= {active_base_tol * 100:.0f}%",
+                    color_pass,
+                    0.17,
+                    0.22,
+                ),
+                _FlowNode(
+                    "group_mnar",
+                    0.29,
+                    0.85,
+                    f"MNAR Group\n(n={count_group})",
+                    color_mnar,
+                    0.15,
+                    0.14,
+                ),
+                _FlowNode(
+                    "qc_check",
+                    0.50,
+                    0.50,
+                    "QC Rescue\n"
+                    f"QC MV > {mnar_qc_mv_tol * 100:.0f}%\n"
+                    f"{intensity_label}\n"
+                    f"Min group MV <= {active_base_tol * 100:.0f}%",
+                    color_pass,
+                    0.18,
+                    0.28,
+                    body_fontsize=(
+                        pu.DEFAULT_ANNOTATION_FONTSIZE if compact else 10.0
+                    ),
+                    line_step=0.047,
+                ),
+                _FlowNode(
+                    "qc_mnar",
+                    0.50,
+                    0.85,
+                    f"MNAR QC\n(n={count_qc})",
+                    color_mnar,
+                    0.15,
+                    0.14,
+                ),
+                _FlowNode(
+                    "eligibility",
+                    0.72,
+                    0.50,
+                    "MAR Eligibility\n"
+                    f"Min group MV <= {active_base_tol * 100:.0f}%",
+                    color_pass,
+                    0.17,
+                    0.20,
+                    body_fontsize=(
+                        pu.DEFAULT_ANNOTATION_FONTSIZE if compact else 10.0
+                    ),
+                    line_step=0.047,
+                ),
+                _FlowNode(
+                    "mar",
+                    0.94,
+                    0.73,
+                    f"MAR\n(n={count_mar})",
+                    color_mar,
+                    0.12,
+                    0.14,
+                ),
+                _FlowNode(
+                    "invalid",
+                    0.94,
+                    0.27,
+                    f"INVALID\n(n={count_inv})",
+                    color_inv,
+                    0.12,
+                    0.14,
+                ),
+            ]
+            edges = [
+                _FlowEdge("raw", "group_check"),
+                _FlowEdge("group_check", "qc_check"),
+                _FlowEdge("group_check", "group_mnar", "vertical"),
+                _FlowEdge("qc_check", "eligibility"),
+                _FlowEdge("qc_check", "qc_mnar", "vertical"),
+                _FlowEdge("eligibility", "mar", "step_h"),
+                _FlowEdge("eligibility", "invalid", "step_h"),
+            ]
+        else:
+            nodes = [
+                _FlowNode(
+                    "raw",
+                    0.10,
+                    0.50,
+                    f"Raw Features\n(n={total})",
+                    color_pass,
+                    0.16,
+                    0.17,
+                ),
+                _FlowNode(
+                    "qc_check",
+                    0.37,
+                    0.50,
+                    "QC Rescue\n"
+                    f"QC MV > {mnar_qc_mv_tol * 100:.0f}%\n"
+                    f"{intensity_label}",
+                    color_pass,
+                    0.20,
+                    0.22,
+                ),
+                _FlowNode(
+                    "qc_mnar",
+                    0.37,
+                    0.85,
+                    f"MNAR QC\n(n={count_qc})",
+                    color_mnar,
+                    0.17,
+                    0.14,
+                ),
+                _FlowNode(
+                    "eligibility",
+                    0.66,
+                    0.50,
+                    f"QC MV Check\nQC MV <= {active_base_tol * 100:.0f}%",
+                    color_pass,
+                    0.19,
+                    0.18,
+                ),
+                _FlowNode(
+                    "mar",
+                    0.92,
+                    0.73,
+                    f"MAR\n(n={count_mar})",
+                    color_mar,
+                    0.14,
+                    0.14,
+                ),
+                _FlowNode(
+                    "invalid",
+                    0.92,
+                    0.27,
+                    f"INVALID\n(n={count_inv})",
+                    color_inv,
+                    0.14,
+                    0.14,
+                ),
+            ]
+            edges = [
+                _FlowEdge("raw", "qc_check"),
+                _FlowEdge("qc_check", "eligibility"),
+                _FlowEdge("qc_check", "qc_mnar", "vertical"),
+                _FlowEdge("eligibility", "mar", "step_h"),
+                _FlowEdge("eligibility", "invalid", "step_h"),
+            ]
+
+        rendered_nodes: dict[str, _FlowNode] = {}
+        box_style = "round,pad=0.012,rounding_size=0.018"
+        for node in nodes:
             patch = mpatches.FancyBboxPatch(
-                (x - width / 2, y - height / 2),
-                width,
-                height,
+                (node.x - node.width / 2, node.y - node.height / 2),
+                node.width,
+                node.height,
                 boxstyle=box_style,
-                facecolor=bg,
+                facecolor=node.color,
                 edgecolor="k",
                 linewidth=flow_linewidth,
                 zorder=3,
                 clip_on=False,
             )
             ax.add_patch(patch)
-            text_lines = text.splitlines()
-            if len(text_lines) == 1:
+            rendered_nodes[node.key] = node
+
+            lines = node.text.splitlines()
+            line_step = node.line_step or (0.055 if has_group_info else 0.060)
+            start_y = node.y + (len(lines) - 1) * line_step / 2
+            text_color = pu.get_contrast_color(node.color)
+            for line_index, line_text in enumerate(lines):
+                is_title = line_index == 0
                 ax.text(
-                    x,
-                    y,
-                    text,
+                    node.x,
+                    start_y - line_index * line_step,
+                    line_text,
                     ha="center",
                     va="center",
                     multialignment="center",
-                    fontsize=text_fontsize,
-                    fontweight="semibold",
+                    fontsize=(
+                        node_fontsize
+                        if is_title
+                        else (node.body_fontsize or node_body_fontsize)
+                    ),
+                    fontweight="semibold" if is_title else "normal",
                     color=text_color,
                     zorder=4,
                 )
-            else:
-                total_text_height = (len(text_lines) - 1) * text_line_step
-                start_y = y + total_text_height / 2
-                for line_idx, line_text in enumerate(text_lines):
-                    is_title_line = line_idx == 0
-                    ax.text(
-                        x,
-                        start_y - line_idx * text_line_step,
-                        line_text,
-                        ha="center",
-                        va="center",
-                        multialignment="center",
-                        fontsize=text_fontsize
-                        if is_title_line
-                        else text_body_fontsize,
-                        fontweight="semibold" if is_title_line else "normal",
-                        color=text_color,
-                        zorder=4,
-                    )
-            return {"x": x, "y": y, "width": width, "height": height}
 
-        def _anchor(node: dict[str, float], side: str) -> tuple[float, float]:
-            """Return one boundary midpoint for a node."""
-            x = float(node["x"])
-            y = float(node["y"])
-            half_w = float(node["width"]) / 2
-            half_h = float(node["height"]) / 2
+        def _anchor(node: _FlowNode, side: str) -> tuple[float, float]:
             if side == "left":
-                return (x - half_w, y)
+                return (node.x - node.width / 2, node.y)
             if side == "right":
-                return (x + half_w, y)
+                return (node.x + node.width / 2, node.y)
             if side == "top":
-                return (x, y + half_h)
+                return (node.x, node.y + node.height / 2)
             if side == "bottom":
-                return (x, y - half_h)
-            return (x, y)
+                return (node.x, node.y - node.height / 2)
+            return (node.x, node.y)
 
-        def _arrow(
-            node_a: dict[str, float],
-            node_b: dict[str, float],
-            style: str = "horizontal",
-        ) -> None:
-            kwargs = dict(
-                arrowstyle="-|>",
-                color="gray",
-                lw=arrow_linewidth,
-                mutation_scale=8 if compact else 15,
-                zorder=2,
-                shrinkA=0,
-                shrinkB=0,
-                clip_on=False,
-            )
-
-            if style == "horizontal":
-                start = _anchor(node_a, "right")
-                end = _anchor(node_b, "left")
-                arrow = mpatches.FancyArrowPatch(posA=start, posB=end, **kwargs)
-            elif style == "vertical":
-                if float(node_b["y"]) >= float(node_a["y"]):
-                    start = _anchor(node_a, "top")
-                    end = _anchor(node_b, "bottom")
+        arrow_kwargs = {
+            "arrowstyle": "-|>",
+            "color": "gray",
+            "lw": arrow_linewidth,
+            "mutation_scale": 8 if compact else 15,
+            "zorder": 2,
+            "shrinkA": 0,
+            "shrinkB": 0,
+            "clip_on": False,
+        }
+        for edge in edges:
+            source = rendered_nodes[edge.source]
+            target = rendered_nodes[edge.target]
+            if edge.style == "vertical":
+                if target.y >= source.y:
+                    start = _anchor(source, "top")
+                    end = _anchor(target, "bottom")
                 else:
-                    start = _anchor(node_a, "bottom")
-                    end = _anchor(node_b, "top")
-                arrow = mpatches.FancyArrowPatch(posA=start, posB=end, **kwargs)
-            elif style == "step_h":
-                start = _anchor(node_a, "right")
-                end = _anchor(node_b, "left")
+                    start = _anchor(source, "bottom")
+                    end = _anchor(target, "top")
+                arrow = mpatches.FancyArrowPatch(
+                    posA=start,
+                    posB=end,
+                    **arrow_kwargs,
+                )
+            elif edge.style == "step_h":
+                start = _anchor(source, "right")
+                end = _anchor(target, "left")
                 mid_x = (start[0] + end[0]) / 2
                 path = mpath.Path(
                     [start, (mid_x, start[1]), (mid_x, end[1]), end],
@@ -191,148 +358,11 @@ class FilteringFlowchartMixin:
                         mpath.Path.LINETO,
                     ],
                 )
-                arrow = mpatches.FancyArrowPatch(path=path, **kwargs)
+                arrow = mpatches.FancyArrowPatch(path=path, **arrow_kwargs)
             else:
-                start = _anchor(node_a, "right")
-                end = _anchor(node_b, "left")
-                arrow = mpatches.FancyArrowPatch(posA=start, posB=end, **kwargs)
+                arrow = mpatches.FancyArrowPatch(
+                    posA=_anchor(source, "right"),
+                    posB=_anchor(target, "left"),
+                    **arrow_kwargs,
+                )
             ax.add_patch(arrow)
-
-        # Full pipeline with four logical columns when BioGroup is available.
-        if has_group_info:
-            str_group = (
-                f"Max MV >= {mnar_group_mv_tol * 100:.0f}%\n"
-                f"Min MV <= {active_base_tol * 100:.0f}%"
-            )
-            qc_cond = (
-                f"QC MV > {mnar_qc_mv_tol * 100:.0f}%\n"
-                f"{intensity_label}\n"
-                f"Min group MV <= {active_base_tol * 100:.0f}%"
-            )
-
-            node_root = _node(3.0, 5, f"Raw Features\n(n={total})", color_pass)
-            node_c1 = _node(
-                9.8,
-                5,
-                f"Group Rescue\n{str_group}",
-                color_pass,
-                width=5.7,
-                height=1.95,
-            )
-            node_g = _node(
-                9.8,
-                8.5,
-                f"MNAR Group\n(n={count_group})",
-                color_mnar,
-                width=5.1,
-                height=1.35,
-            )
-            node_c2 = _node(
-                16.6,
-                5,
-                f"QC Rescue\n{qc_cond}",
-                color_pass,
-                width=5.9,
-                height=2.45,
-                body_fontsize=(
-                    pu.DEFAULT_ANNOTATION_FONTSIZE if compact else 10.0
-                ),
-                line_step=0.41,
-            )
-            node_q = _node(
-                16.6,
-                8.5,
-                f"MNAR QC\n(n={count_qc})",
-                color_mnar,
-                width=5.1,
-                height=1.35,
-            )
-            node_c3 = _node(
-                23.4,
-                5,
-                "MAR Eligibility\nMin group MV "
-                f"<= {active_base_tol * 100:.0f}%",
-                color_pass,
-                width=5.6,
-                height=1.75,
-                body_fontsize=(
-                    pu.DEFAULT_ANNOTATION_FONTSIZE if compact else 10.0
-                ),
-                line_step=0.42,
-            )
-            node_mar = _node(
-                30.5,
-                7.5,
-                f"MAR\n(n={count_mar})",
-                color_mar,
-                width=4.4,
-                height=1.25,
-            )
-            node_inv = _node(
-                30.5,
-                2.5,
-                f"INVALID\n(n={count_inv})",
-                color_inv,
-                width=4.4,
-                height=1.25,
-            )
-
-            _arrow(node_root, node_c1, "horizontal")
-            _arrow(node_c1, node_c2, "horizontal")
-            _arrow(node_c1, node_g, "vertical")
-            _arrow(node_c2, node_c3, "horizontal")
-            _arrow(node_c2, node_q, "vertical")
-            _arrow(node_c3, node_mar, "step_h")
-            _arrow(node_c3, node_inv, "step_h")
-
-        # Simplified three-column pipeline when BioGroup is unavailable.
-        else:
-            qc_cond = f"QC MV > {mnar_qc_mv_tol * 100:.0f}%\n{intensity_label}"
-
-            node_root = _node(3.2, 5, f"Raw Features\n(n={total})", color_pass)
-            node_c2 = _node(
-                12.0,
-                5,
-                f"QC Rescue\n{qc_cond}",
-                color_pass,
-                width=5.3,
-                height=1.75,
-            )
-            node_q = _node(
-                12.0,
-                8.5,
-                f"MNAR QC\n(n={count_qc})",
-                color_mnar,
-                width=4.6,
-                height=1.35,
-            )
-            node_c3 = _node(
-                21.0,
-                5,
-                f"QC MV Check\nQC MV >= {active_base_tol * 100:.0f}%",
-                color_pass,
-                width=5.0,
-                height=1.45,
-            )
-            node_mar = _node(
-                30.0,
-                7.5,
-                f"MAR\n(n={count_mar})",
-                color_mar,
-                width=4.4,
-                height=1.25,
-            )
-            node_inv = _node(
-                30.0,
-                2.5,
-                f"INVALID\n(n={count_inv})",
-                color_inv,
-                width=4.4,
-                height=1.25,
-            )
-
-            _arrow(node_root, node_c2, "horizontal")
-            _arrow(node_c2, node_c3, "horizontal")
-            _arrow(node_c2, node_q, "vertical")
-            _arrow(node_c3, node_mar, "step_h")
-            _arrow(node_c3, node_inv, "step_h")

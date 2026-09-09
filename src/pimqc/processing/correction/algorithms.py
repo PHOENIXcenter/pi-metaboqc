@@ -114,7 +114,8 @@ def fit_predict_intra_batch_safely(
 
     if safe_folds < 3:
         pred_all_full = _run_model(x_qc, y_qc, x_all)
-        pred_qc_oof = _run_model(x_qc, y_qc, x_qc)
+        # Training predictions are not cross-validation evidence.
+        pred_qc_oof = np.full(n_qc, np.nan)
         return (
             np.clip(pred_all_full, a_min=1e-6, a_max=None),
             np.clip(pred_qc_oof, a_min=1e-6, a_max=None),

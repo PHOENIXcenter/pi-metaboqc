@@ -14,9 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from ..constants import DEFAULT_RANDOM_SEED
 from ..statistics import metrics as su
-from ..statistics import sample_structure as structure_stats
 from . import annotation_layout as al
 from . import plot_utils as pu
 
@@ -32,54 +30,16 @@ def _finite_metric(metrics: Mapping[str, object], *keys: str) -> float:
 
 def plot_sample_structure_change_map(
     ax: plt.Axes,
-    raw_obj: pd.DataFrame,
-    transformed_obj: pd.DataFrame,
-    structure_metrics: Mapping[str, float] | None = None,
-    sample_cols: pd.Index | None = None,
-    seed: int = DEFAULT_RANDOM_SEED,
-    max_features: int | None = 5000,
-    scale_log_ratio_tol: float = 0.25,
-    scale_rel_delta_tol: float = 0.35,
+    diagnostics: Mapping[str, object],
     title: str = "Sample Structure Change Map",
     compact_style: bool = False,
 ) -> plt.Axes:
-    """Plot sample-level scale, rank, and local-trustworthiness changes.
+    """Render saved sample coordinates and scores without numerical fitting.
 
-    Args:
-        ax: Target axes.
-        raw_obj: Matrix before processing.
-        transformed_obj: Matrix after processing.
-        structure_metrics: Optional precomputed global preservation metrics.
-        sample_cols: Optional sample columns to include in geometry.
-        seed: Deterministic feature-subsampling seed.
-        max_features: Maximum features used for geometry calculation.
-        scale_log_ratio_tol: Practical scale-change tolerance.
-        scale_rel_delta_tol: Practical relative-distance tolerance.
-        title: Panel title.
-        compact_style: Use article-sized markers and text.
-
-    Returns:
-        The supplied axes.
+    Diagnostics are computed by calc_sample_structure_diagnostics during
+    stage computation and retained in the stage plot payload.
     """
-    metrics = dict(structure_metrics or {})
-    if not metrics:
-        metrics = structure_stats.calc_sample_structure_preservation(
-            raw_obj=raw_obj,
-            transformed_obj=transformed_obj,
-            sample_cols=sample_cols,
-            max_features=max_features,
-            seed=seed,
-            scale_log_ratio_tol=scale_log_ratio_tol,
-            scale_rel_delta_tol=scale_rel_delta_tol,
-        )
-
-    geometry = structure_stats.calc_sample_structure_arrays(
-        raw_obj=raw_obj,
-        transformed_obj=transformed_obj,
-        sample_cols=sample_cols,
-        max_features=max_features,
-        seed=seed,
-    )["geometry"]
+    metrics = diagnostics.get("metrics", {})
     trust_score = _finite_metric(
         metrics,
         "sample_structure_trustworthiness",
@@ -99,25 +59,7 @@ def plot_sample_structure_change_map(
         "distance_scale_preservation",
     )
 
-    plot_df = pd.concat(
-        [
-            pd.to_numeric(
-                geometry.get("sample_log2_distance_ratio", pd.Series()),
-                errors="coerce",
-            ).rename("scale_shift"),
-            pd.to_numeric(
-                geometry.get("sample_distance_rank_rho", pd.Series()),
-                errors="coerce",
-            ).rename("rank_rho"),
-            pd.to_numeric(
-                geometry.get(
-                    "sample_neighborhood_trustworthiness", pd.Series()
-                ),
-                errors="coerce",
-            ).rename("local_trust"),
-        ],
-        axis=1,
-    ).dropna(subset=["scale_shift", "rank_rho"])
+    plot_df = diagnostics.get("samples", pd.DataFrame())
 
     if plot_df.empty:
         ax.text(

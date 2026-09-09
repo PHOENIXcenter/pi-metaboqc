@@ -6,7 +6,7 @@
 # ------------------------------------------------------------------------------
 # Core Dataset Construction
 # ------------------------------------------------------------------------------
-[MetaboInt]
+[Dataset]
 # [String] Mass spectrometry polarity mode. Used for titles and file naming ("ESI+" or "ESI-").
 mode = "ESI+"
 
@@ -72,7 +72,7 @@ resort_inject_order = "Auto"
 
 # [Table] Dictionary mapping your raw metadata string values to the pipeline's internal standards.
 # The keys ("Actual sample", etc.) are your data's strings; the values ("Sample", etc.) must remain fixed.
-[MetaboInt.sample_dict]
+[Dataset.sample_dict]
 "Actual sample" = "Sample"
 "Blank sample" = "Blank"
 "QC sample" = "QC"
@@ -80,7 +80,7 @@ resort_inject_order = "Auto"
 # ------------------------------------------------------------------------------
 # Quality Assessment (PCA & Correlations)
 # ------------------------------------------------------------------------------
-[MetaboIntAssessor]
+[QualityAssessor]
 # [String] Method for calculating sample-to-sample correlations. Options: "spearman", "pearson".
 corr_method = "Spearman"
 
@@ -96,7 +96,7 @@ orf_outlier_threshold = 0.5
 # ------------------------------------------------------------------------------
 # Filtering Thresholds (Missing Values & RSD)
 # ------------------------------------------------------------------------------
-[MetaboIntFilter]
+[FeatureFilter]
 
 # 1. Sample-Level Filtering (Filtering bad injections/patients - Columns)
 # [Float] Maximum allowed missing value ratio for a single SAMPLE. 
@@ -133,7 +133,7 @@ qc_rsd_tol = 0.3
 # ------------------------------------------------------------------------------
 # Signal Drift Correction
 # ------------------------------------------------------------------------------
-[MetaboIntCorrector]
+[SignalCorrector]
 # [String] Primary algorithm for intra/inter-batch signal drift correction.
 # Options: "QC-SVR", "QC-RFSC", "QC-RLSC", "SERRF", "RUV-III", "WaveICA 2.0", "Auto".
 # "RUV", "WaveICA2", "WaveICA2.0", and "WaveICA-2.0" are accepted aliases.
@@ -227,10 +227,13 @@ regression_batch_size = "auto"
 # [Integer] Cross-Validation folds for Out-Of-Fold (OOF) prediction to prevent overfitting.
 cv_folds = 3
 
+# [Integer] Number of worker processes for correction; -1 uses all available CPUs.
+n_jobs = -1
+
 # ------------------------------------------------------------------------------
 # Missing Value Imputation
 # ------------------------------------------------------------------------------
-[MetaboIntImputer]
+[MissingValueImputer]
 # [String] Imputation algorithm specifically for MNAR (LOD/Detection failure) values. Options: "Row-wise", "Column-wise", "Global", "QRILC".
 mnar_method = "QRILC"
 
@@ -261,7 +264,7 @@ sim_mask_ratio = 0.05
 # ------------------------------------------------------------------------------
 # Normalization
 # ------------------------------------------------------------------------------
-[MetaboIntNormalizer]
+[DataNormalizer]
 
 # [String] Normalization strategy.
 # Options: "Auto", "ROBUST_LOG_ONLY", "PQN", "MDFC", "TIC", "Median", "VSN", "Quantile".
@@ -273,3 +276,6 @@ sim_mask_ratio = 0.05
 # Auto also includes Sample-structure guardrails to penalize over-normalization
 # without using biological group labels or differential-abundance outcomes.
 norm_method = "Auto"
+
+# [Integer] Number of worker processes for parallel normalization; -1 uses all available CPUs.
+n_jobs = -1

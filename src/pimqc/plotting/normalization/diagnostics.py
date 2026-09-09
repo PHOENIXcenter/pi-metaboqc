@@ -11,10 +11,8 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scipy.stats as stats
 import seaborn as sns
 
-from ...constants import DEFAULT_RANDOM_SEED
 from ...statistics import metrics as su
 from .. import annotation_layout as al
 from .. import plot_utils as pu
@@ -44,68 +42,14 @@ class NormalizationDiagnosticsMixin:
             current_ax = ax
             fig = current_ax.figure
 
-        plot_records = []
-        sample_metric_values: dict[str, dict[str, pd.Series]] = {}
-        for label, obj in self.stages:
-            log_d = su._extract_log2_target(obj)
-            if log_d is None or log_d.empty:
-                continue
-
-            qc_cols = obj._qc.columns.intersection(log_d.columns)
-            if len(qc_cols) < 2:
-                continue
-
-            global_feature_median = log_d.median(axis=1)
-            qc_rle = (
-                log_d[qc_cols].astype(float).sub(global_feature_median, axis=0)
-            )
-            qc_rle = qc_rle.replace([np.inf, -np.inf], np.nan)
-
-            sample_medians = qc_rle.median(axis=0).replace(
-                [np.inf, -np.inf], np.nan
-            )
-            sample_q25 = qc_rle.quantile(0.25, axis=0)
-            sample_q75 = qc_rle.quantile(0.75, axis=0)
-            sample_iqrs = (sample_q75 - sample_q25).replace(
-                [np.inf, -np.inf], np.nan
-            )
-            sample_iqrs = sample_iqrs.replace([np.inf, -np.inf], np.nan)
-
-            sample_medians = sample_medians.dropna()
-            sample_iqrs = sample_iqrs.dropna()
-            if sample_medians.empty or sample_iqrs.empty:
-                continue
-
-            sample_metric_values[label] = {
-                "RLE center offset": sample_medians.abs(),
-                "RLE spread": sample_iqrs,
-            }
-            center_values = sample_metric_values[label]["RLE center offset"]
-            spread_values = sample_metric_values[label]["RLE spread"]
-
-            center_offset = su.finite_or_nan(center_values.median())
-            rle_spread = su.finite_or_nan(spread_values.median())
-            if not all(np.isfinite(v) for v in [center_offset, rle_spread]):
-                continue
-
-            plot_records.extend(
-                [
-                    {
-                        "Metric": "RLE center offset",
-                        "Stage": label,
-                        "Value": center_offset,
-                        "Q25": su.finite_or_nan(center_values.quantile(0.25)),
-                        "Q75": su.finite_or_nan(center_values.quantile(0.75)),
-                    },
-                    {
-                        "Metric": "RLE spread",
-                        "Stage": label,
-                        "Value": rle_spread,
-                        "Q25": su.finite_or_nan(spread_values.quantile(0.25)),
-                        "Q75": su.finite_or_nan(spread_values.quantile(0.75)),
-                    },
-                ]
-            )
+        plot_records = [
+            record
+            for diagnostic in self.payload.qc_diagnostics.values()
+            for record in diagnostic.get("rle_records", [])
+        ]
+        pvalues = self.payload.qc_diagnostics.get(
+            "After Norm", {}
+        ).get("rle_pvalues", {})
 
         annotation_note: str | None = None
         if plot_records:
@@ -264,10 +208,7 @@ class NormalizationDiagnosticsMixin:
             bracket_height = y_upper * 0.018
             bracket_gap = y_upper * 0.045
             for metric_idx, metric in enumerate(metric_order):
-                p_val = self._paired_wilcoxon_pvalue(
-                    sample_metric_values.get("Before Norm", {}).get(metric),
-                    sample_metric_values.get("After Norm", {}).get(metric),
-                )
+                p_val = pvalues.get(metric, float("nan"))
                 local_bar_top = max(
                     bar_top_lookup.get((metric, "Before Norm"), 0.0),
                     bar_top_lookup.get((metric, "After Norm"), 0.0),
@@ -333,40 +274,6 @@ class NormalizationDiagnosticsMixin:
             return "*"
         return "ns"
 
-    @staticmethod
-    def _paired_wilcoxon_pvalue(
-        before_values: pd.Series | None,
-        after_values: pd.Series | None,
-    ) -> float:
-        """
-        Calculate a paired Wilcoxon signed-rank p-value for matched QC samples.
-        """
-        if before_values is None or after_values is None:
-            return float("nan")
-
-        common_index = before_values.index.intersection(after_values.index)
-        if len(common_index) < 3:
-            return float("nan")
-
-        before_arr = before_values.loc[common_index].to_numpy(dtype=float)
-        after_arr = after_values.loc[common_index].to_numpy(dtype=float)
-        finite_mask = np.isfinite(before_arr) & np.isfinite(after_arr)
-        before_arr = before_arr[finite_mask]
-        after_arr = after_arr[finite_mask]
-        if before_arr.size < 3 or np.allclose(before_arr, after_arr):
-            return 1.0
-
-        try:
-            return float(
-                stats.wilcoxon(
-                    before_arr,
-                    after_arr,
-                    zero_method="wilcox",
-                    alternative="two-sided",
-                ).pvalue
-            )
-        except ValueError:
-            return float("nan")
 
     @staticmethod
     def _add_pairwise_significance(
@@ -418,14 +325,10 @@ class NormalizationDiagnosticsMixin:
                 if log_d is None or log_d.empty:
                     continue
 
-                if grp == "QC" and hasattr(obj, "_qc"):
-                    cols = obj._qc.columns.intersection(log_d.columns)
-                elif hasattr(obj, "_actual_sample"):
-                    cols = obj._actual_sample.columns.intersection(
-                        log_d.columns
-                    )
-                else:
-                    cols = []
+                role_key = "QC sample" if grp == "QC" else "Actual sample"
+                cols = su._role_columns(obj, role_key, grp).intersection(
+                    log_d.columns
+                )
 
                 if len(cols) > 0:
                     vals = log_d[cols].values.flatten()
@@ -512,19 +415,8 @@ class NormalizationDiagnosticsMixin:
         pu.mark_preserve_alpha(current_ax)
 
         stage_records = []
-        for label, obj in self.stages:
-            log_d = su._extract_log2_target(obj)
-            if log_d is None or log_d.empty:
-                continue
-
-            qc_cols = obj._qc.columns.intersection(log_d.columns)
-            if len(qc_cols) < 3:
-                continue
-
-            variance_metrics = self.norm._calc_qc_variance_stabilization_values(
-                log_d,
-                qc_cols=qc_cols,
-            )
+        for label, diagnostic in self.payload.qc_diagnostics.items():
+            variance_metrics = diagnostic["variance"]
             feature_stats = variance_metrics["feature_stats"]
             trend_df = variance_metrics["trend"]
             if feature_stats.empty or trend_df.empty:
@@ -705,20 +597,8 @@ class NormalizationDiagnosticsMixin:
             fig = current_ax.figure
 
         summary_by_stage = {}
-        for label, obj in self.stages:
-            log_d = su._extract_log2_target(obj)
-            if log_d is None or log_d.empty:
-                continue
-
-            qc_cols = obj._qc.columns.intersection(log_d.columns)
-            qc_structure = self.norm._calc_qc_structure_values(
-                log_d,
-                qc_cols=qc_cols,
-                max_features=max_features,
-                seed=int(
-                    self.norm.attrs.get("global_seed", DEFAULT_RANDOM_SEED)
-                ),
-            )
+        for label, diagnostic in self.payload.qc_diagnostics.items():
+            qc_structure = diagnostic["structure"]
             distances = qc_structure["qc_centroid_distance"]
             if distances.empty:
                 continue
@@ -814,9 +694,7 @@ class NormalizationDiagnosticsMixin:
             )
             return fig if ax is None else current_ax
 
-        rng = np.random.default_rng(
-            int(self.norm.attrs.get("global_seed", DEFAULT_RANDOM_SEED))
-        )
+        rng = np.random.default_rng(self.payload.global_seed)
         stage_order = ["Before Norm", "After Norm"]
         stage_offsets = {"Before Norm": -0.17, "After Norm": 0.17}
         box_width = 0.22 if article_compact else 0.28
@@ -1024,39 +902,9 @@ class NormalizationDiagnosticsMixin:
         else:
             created_fig = None
 
-        structure_metrics: dict[str, float] | None = None
-        auto_summary = self.norm.attrs.get("selection", {}).get(
-            "candidate_results"
-        )
-        if auto_summary:
-            selected_method = str(
-                self.norm.attrs.get("selection", {}).get(
-                    "selected_method", ""
-                )
-            )
-            selected_row = next(
-                (
-                    row
-                    for row in auto_summary
-                    if row.get("selected") is True
-                    or str(row.get("method", "")) == selected_method
-                ),
-                None,
-            )
-            if selected_row is not None:
-                structure_metrics = selected_row
-
         plot_sample_structure_change_map(
             ax=ax_geom,
-            raw_obj=self.raw,
-            transformed_obj=self.norm,
-            structure_metrics=structure_metrics,
-            seed=int(
-                self.norm.attrs.get("global_seed", DEFAULT_RANDOM_SEED)
-            ),
-            max_features=max_features,
-            scale_log_ratio_tol=self.norm._SAMPLE_SCALE_LOG_RATIO_TOL,
-            scale_rel_delta_tol=self.norm._SAMPLE_SCALE_REL_DELTA_TOL,
+            diagnostics=self.payload.sample_structure,
             title="Sample Structure Change Map",
             compact_style=compact_style,
         )

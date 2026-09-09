@@ -1,32 +1,35 @@
 """End-to-end orchestration from input tables to structured stage results.
 
 ``run_pipeline`` constructs the dataset, executes QA checkpoints, runs the
-two filtering passes, correction, imputation, and normalization, then builds
-the report input. Every processing and assessment call returns a
+three explicit filtering actions, correction, imputation, and normalization,
+then builds the report input. Every processing and assessment call returns a
 ``StageResult``; the pipeline keeps stage tables, results, assessments, and
 metrics in explicit mappings. With no ``output_dir`` it performs the complete
 calculation in memory and skips filesystem export, plotting, and reporting.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+import os
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
-from .core import MetaboInt
+from ._version import __version__
+from .core import MetaboDataset
+from .config import validate_pipeline_params
 from .io import ensure_directory
 from .runtime import log_execution_time
 from .reporting import ReportInput
 from .reporting import utils as ru
-from .dataset.builder import build_dataset
-from .processing.assessment import AssessmentDiagnostics, MetaboIntAssessor
-from .processing.filtering import MetaboIntFilter
-from .processing.correction import MetaboIntCorrector
-from .processing.imputation import MetaboIntImputer
-from .processing.normalization import MetaboIntNormalizer
+from .dataset import MetaboDatasetBuilder
+from .processing.assessment import AssessmentDiagnostics, QualityAssessor
+from .processing.filtering import FilteringOrchestrator
+from .processing.correction import SignalCorrector
+from .processing.imputation import MissingValueImputer
+from .processing.normalization import DataNormalizer
 from .processing.stage import StageResult
 
 
@@ -34,7 +37,7 @@ from .processing.stage import StageResult
 class PipelineResult:
     """Carry all in-memory products of one end-to-end pipeline execution."""
 
-    stage_tables: dict[str, MetaboInt]
+    stage_tables: dict[str, MetaboDataset]
     stage_results: dict[str, StageResult[Any]]
     assessments: dict[str, StageResult[AssessmentDiagnostics]]
     pipeline_metrics: dict[str, Any]
@@ -42,9 +45,10 @@ class PipelineResult:
     report_input: ReportInput
     output_dir: Path | None = None
     report_generated: bool = False
+    filtering_results: dict[str, StageResult[Any]] = field(default_factory=dict)
 
     @property
-    def data(self) -> MetaboInt:
+    def data(self) -> MetaboDataset:
         """Return the final normalized matrix as the primary pipeline output."""
         return self.stage_tables["normalized"]
 
@@ -58,11 +62,11 @@ def run_pipeline(
 ) -> PipelineResult:
     """Run the complete pi-metaboqc pipeline.
 
-    Executes dataset construction, QA checkpoints, the two filtering passes,
-    signal correction, missingness-aware imputation, normalization, and
-    optional report generation. Omitting ``output_dir`` still performs every
-    calculation but skips all table, figure, and report side effects while
-    returning the same structured in-memory result.
+    Executes dataset construction, QA checkpoints, the three explicit
+    filtering actions, signal correction, missingness-aware imputation,
+    normalization, and optional report generation. Omitting ``output_dir``
+    still performs every calculation but skips all table, figure, and report
+    side effects while returning the same structured in-memory result.
 
     Args:
         meta_df (pd.DataFrame): The metadata pandas DataFrame.
@@ -73,6 +77,13 @@ def run_pipeline(
     Returns:
         Structured stage tables, diagnostics, metrics, and report status.
     """
+    logger.info(f"pi-metaboqc version: {__version__}")
+
+    # Normalize the in-memory configuration through the same strict schema as
+    # TOML/JSON loading. This makes old section names and misspelled fields
+    # fail before any stage starts and guarantees one precedence surface.
+    params = validate_pipeline_params(params)
+
     # =========================================================================
     # Step 00: Environment Initialization
     # **Purpose & Function**:
@@ -91,34 +102,41 @@ def run_pipeline(
 
     def stage_dir(name: str) -> Path | None:
         """Resolve a stage artifact directory without creating it eagerly."""
-        return root_dir / name if root_dir is not None else None
+        return (
+            Path(os.path.join(root_dir, name))
+            if root_dir is not None
+            else None
+        )
 
     stage_results: dict[str, StageResult[Any]] = {}
+    filtering_results: dict[str, StageResult[Any]] = {}
     assessments: dict[str, StageResult[AssessmentDiagnostics]] = {}
-    stage_tables: dict[str, MetaboInt] = {}
+    stage_tables: dict[str, MetaboDataset] = {}
 
     # =========================================================================
     # Step 01: Dataset Construction
     # **Purpose & Function**:
     # Validates metadata and peak-table consistency, resolves duplicated
     # features and injection-order issues, aligns intensity columns to
-    # metadata, and builds the MultiIndex-backed `MetaboInt` source object.
+    # metadata, and builds the composition-based `MetaboDataset` object.
     # Explicit zero intensities are converted to missing values. When an
     # output directory is supplied, the builder exports the raw matrix and
-    # renders the global acquisition overview as part of this stage.
+    # renders the global acquisition overview as part of this stage. The
+    # builder returns its own DatasetAuditPayload with composition metrics
+    # and a detached plot payload, just like the downstream processing actors.
     # =========================================================================
     logger.info("Step 01: Dataset Construction...")
     step1_dir = stage_dir("01_Raw_Data")
-    raw_data = build_dataset(
+    dataset_builder = MetaboDatasetBuilder(
         meta_info=meta_df,
         int_df=int_df,
         pipeline_params=params,
-        output_dir=step1_dir,
     )
-    raw_result = StageResult(data=raw_data, metrics=raw_data.dataset_metrics)
+    raw_result = dataset_builder.run_build(output_dir=step1_dir)
+    raw_data = raw_result.data
     stage_results["raw_dataset"] = raw_result
     stage_tables["raw"] = raw_data
-    is_multi_batch_flag = raw_data.attrs["is_multi_batch"]
+    is_multi_batch_flag = raw_data.is_multi_batch
 
     # =========================================================================
     # QA-Step 01: Quality Assessment of Raw Data
@@ -131,26 +149,38 @@ def run_pipeline(
     # =========================================================================
     logger.info("QA-Step 01: Quality Assessment of Raw Data...")
     qa_step1_dir = stage_dir("QA_01_Raw_Data")
-    qa_raw_engine = MetaboIntAssessor(data=raw_data, pipeline_params=params)
+    qa_raw_engine = QualityAssessor(data=raw_data, pipeline_params=params)
     qa_raw_result = qa_raw_engine.run_assessment(output_dir=qa_step1_dir)
     assessments["raw_dataset"] = qa_raw_result
 
     # =========================================================================
-    # Step 02: High-Missing Value Feature Filtering
+    # Step 02: Missing-Value Filtering
     # **Purpose & Function**:
-    # This call performs two dependent computations. First, only QC and Actual
-    # samples are screened for sample-level missingness; Blank and other
-    # non-target types remain intact. The resulting matrix is then used to
-    # calculate global, QC, and biological-group missingness and classify
-    # features as MAR, MNAR, or INVALID. Group and QC rescue rules retain
-    # plausible sparse signals. Both attrition tables and the MAR/MNAR labels
-    # are carried in the StageResult for the next filtering pass and imputation.
+    # Runs two explicit but dependent actions. First, pooled-QC and Actual
+    # samples are screened by sample-level missingness; Blank and other
+    # non-target roles remain intact. Second, the retained sample matrix is
+    # evaluated for global, pooled-QC, and biological-group missingness.
+    # Feature routing applies MAR eligibility, group/QC MNAR rescue, or
+    # exclusion. The independent sample and feature Audits retain counts,
+    # reasons, thresholds, and plot payloads. The complete feature tracking
+    # table is reused later by quality filtering and imputation.
     # =========================================================================
-    logger.info("Step 02: High-Missing Value Feature Filtering...")
+    logger.info("Step 02: Sample and Feature Missing-Value Filtering...")
     step2_dir = stage_dir("02_MV_Filtered")
-    fltr_mv_engine = MetaboIntFilter(data=raw_data, pipeline_params=params)
-    mv_filter_result = fltr_mv_engine.run_mv_filtering(output_dir=step2_dir)
+    filtering_orchestrator = FilteringOrchestrator(
+        data=raw_data,
+        pipeline_params=params,
+    )
+    missingness_results = filtering_orchestrator.run_missingness(
+        output_dir=step2_dir,
+    )
+    sample_mv_result = missingness_results.sample_result
+    mv_filter_result = missingness_results.feature_result
     mv_filter_data = mv_filter_result.data
+    filtering_results["sample_missing_value_filtering"] = sample_mv_result
+    filtering_results["feature_missing_value_filtering"] = mv_filter_result
+    stage_tables["sample_mv_filtered"] = sample_mv_result.data
+    stage_results["sample_missing_value_filtering"] = sample_mv_result
     stage_results["high_mv_feature_filtering"] = mv_filter_result
     stage_tables["high_mv_filtered"] = mv_filter_data
 
@@ -159,12 +189,14 @@ def run_pipeline(
     # **Evaluation Logic**:
     # Compares the post-filter matrix with the raw baseline to reveal the
     # effect of sample attrition and MAR/MNAR routing on QC consistency, RSD,
-    # sample structure, and reference-feature behaviour. Filtering labels and
-    # attrition reasons remain in the preceding processing StageResult.
+    # PCA geometry, multivariate outliers, and reference-feature behaviour.
+    # Filtering labels and attrition reasons remain authoritative in the
+    # preceding processing Audits; this checkpoint describes only the state
+    # of the retained matrix.
     # =========================================================================
     logger.info("QA-Step 02: Quality Assessment of High-MV Filtered Data...")
     qa_step2_dir = stage_dir("QA_02_MV_Filtered")
-    qa_mv_filter_engine = MetaboIntAssessor(
+    qa_mv_filter_engine = QualityAssessor(
         data=mv_filter_data, pipeline_params=params
     )
     qa_mv_filter_result = qa_mv_filter_engine.run_assessment(
@@ -181,12 +213,13 @@ def run_pipeline(
     # and QC-RFSC fit feature-wise drift from QC samples; multi-batch runs
     # also evaluate batch alignment where applicable. Only the selected
     # method's stage matrices cross the StageResult boundary; candidate
-    # metrics remain in `StageResult.candidates`. Blanks are excluded from
-    # fitting where supported and receive frozen-model corrections in output.
+    # metrics remain in `CorrectionAuditPayload.candidate_results`. Blanks are
+    # excluded from fitting where supported and receive frozen-model
+    # corrections in output.
     # =========================================================================
     logger.info("Step 03: Signal Drift & Batch Effect Correction...")
     step3_dir = stage_dir("03_Corrected_Data")
-    sc_engine = MetaboIntCorrector(data=mv_filter_data, pipeline_params=params)
+    sc_engine = SignalCorrector(data=mv_filter_data, pipeline_params=params)
     correction_result = sc_engine.run_signal_correction(output_dir=step3_dir)
     corrected_stages = correction_result.data
     stage_results["signal_correction"] = correction_result
@@ -210,12 +243,14 @@ def run_pipeline(
             f"QA-Step 03: Quality Assessment for corrected stage "
             f"'{stage_name}'..."
         )
-        qa_corr_engine = MetaboIntAssessor(
+        qa_corr_engine = QualityAssessor(
             data=stage_data, pipeline_params=params
         )
         qa_corr_result = qa_corr_engine.run_assessment(
             output_dir=(
-                qa_step3_dir / stage_name if qa_step3_dir is not None else None
+                Path(os.path.join(qa_step3_dir, stage_name))
+                if qa_step3_dir is not None
+                else None
             )
         )
         qa_results_dict[stage_name] = qa_corr_result
@@ -232,13 +267,15 @@ def run_pipeline(
     # =========================================================================
     logger.info("Step 04: Low-Quality Feature Filtering...")
     step4_dir = stage_dir("04_Quality_Filtered")
-    fltr_low_quality_engine = MetaboIntFilter(
-        data=final_corr_data, pipeline_params=params
+    filtering_orchestrator.run_quality(
+        data=final_corr_data,
+        output_dir=step4_dir,
     )
-    low_quality_filter_result = fltr_low_quality_engine.run_quality_filtering(
-        output_dir=step4_dir
-    )
+    assert filtering_orchestrator.result is not None
+    low_quality_filter_result = filtering_orchestrator.result.quality_result
+    assert low_quality_filter_result is not None
     low_quality_filter_data = low_quality_filter_result.data
+    filtering_results["feature_quality_filtering"] = low_quality_filter_result
     stage_results["low_quality_feature_filtering"] = low_quality_filter_result
     stage_tables["quality_filtered"] = low_quality_filter_data
 
@@ -253,7 +290,7 @@ def run_pipeline(
         "QA-Step 04: Quality Assessment of Low-Quality Filtered Data..."
     )
     qa_step4_dir = stage_dir("QA_04_Quality_Filtered")
-    qa_low_quality_filter_engine = MetaboIntAssessor(
+    qa_low_quality_filter_engine = QualityAssessor(
         data=low_quality_filter_data, pipeline_params=params
     )
     qa_low_quality_filter_result = qa_low_quality_filter_engine.run_assessment(
@@ -274,7 +311,7 @@ def run_pipeline(
     # =========================================================================
     logger.info("Step 05: Missing Value Imputation...")
     step5_dir = stage_dir("05_Imputation")
-    imp_engine = MetaboIntImputer(
+    imp_engine = MissingValueImputer(
         data=low_quality_filter_data, pipeline_params=params
     )
     imputation_result = imp_engine.run_imputation(output_dir=step5_dir)
@@ -291,7 +328,7 @@ def run_pipeline(
     # =========================================================================
     logger.info("QA-Step 05: Quality Assessment of Imputed Data...")
     qa_step5_dir = stage_dir("QA_05_Imputed_Data")
-    qa_imp_engine = MetaboIntAssessor(data=imputed_data, pipeline_params=params)
+    qa_imp_engine = QualityAssessor(data=imputed_data, pipeline_params=params)
     qa_imp_result = qa_imp_engine.run_assessment(output_dir=qa_step5_dir)
     assessments["missing_value_imputation"] = qa_imp_result
 
@@ -309,7 +346,7 @@ def run_pipeline(
     # =========================================================================
     logger.info("Step 06: Data Normalization...")
     step6_dir = stage_dir("06_Normalized_Data")
-    norm_engine = MetaboIntNormalizer(imputed_data, pipeline_params=params)
+    norm_engine = DataNormalizer(imputed_data, pipeline_params=params)
     normalization_result = norm_engine.run_normalization(output_dir=step6_dir)
     normalized_data = normalization_result.data
     stage_results["normalization"] = normalization_result
@@ -319,13 +356,15 @@ def run_pipeline(
     # QA-Step 06: Quality Assessment of Normalized Data
     # **Evaluation Logic**:
     # Checks whether normalization reduced residual scale/batch effects while
-    # preserving sample structure and reference-feature behaviour. RLE and
-    # candidate scores belong to Step 06's processing result, not QA; MA is
-    # not part of 1.3.0.
+    # preserving sample structure and reference-feature behaviour. The
+    # normalized MetaboDataset carries its log/scale state explicitly, so
+    # scale-sensitive QA does not infer state from a DataFrame or stage name.
+    # RLE diagnostics and candidate scores belong to Step 06's processing
+    # Audit rather than this observational assessment.
     # =========================================================================
     logger.info("QA-Step 06: Quality Assessment of Normalized Data...")
     qa_step6_dir = stage_dir("QA_06_Norm_Data")
-    qa_norm_engine = MetaboIntAssessor(
+    qa_norm_engine = QualityAssessor(
         data=normalized_data, pipeline_params=params
     )
     qa_norm_result = qa_norm_engine.run_assessment(output_dir=qa_step6_dir)
@@ -334,11 +373,14 @@ def run_pipeline(
     # =========================================================================
     # Step 07: Sequential Audit Report Compilation
     # **Purpose & Function**:
-    # Consolidates explicit stage/QA metrics and visual assets into the report
-    # workspace. With an output directory, the asset compiler runs first, then
-    # the reporter renders comprehensive and brief Markdown reports and
-    # exports the configured PDF representation. Without one, ReportInput
-    # remains available in PipelineResult but no report files are generated.
+    # Draws four cross-stage QA dashboards directly from saved assessment
+    # Audits, in processing order, without recalculating distances or reading
+    # intermediate SVG panels. RSD, PCA, correlation, and outlier grids each
+    # share their project-wide legend. ReportInput then combines stage metrics,
+    # QA metrics, the validated configuration, package version, metadata, and
+    # the asset manifest for comprehensive and brief Markdown reports plus the
+    # configured PDF output. Without an output folder, ReportInput remains
+    # available but no report files are generated.
     # =========================================================================
     # Dynamic QA Mapping
     qa_corr_metrics = {}
@@ -352,47 +394,43 @@ def run_pipeline(
 
     for stage_name, result in qa_results_dict.items():
         safe_key = stage_key_map.get(stage_name, "unknown_correction")
-        qa_corr_metrics[safe_key] = result.metrics
+        qa_corr_metrics[safe_key] = result.audit.metrics
 
     # Assemble Final Metrics
     pipeline_metrics_objs = {
-        "raw_dataset": stage_results["raw_dataset"].metrics,
+        "raw_dataset": stage_results["raw_dataset"].audit.metrics,
+        "sample_missing_value_filtering": sample_mv_result.audit.metrics,
         "high_mv_feature_filtering": stage_results[
             "high_mv_feature_filtering"
-        ].metrics,
-        "signal_correction": stage_results["signal_correction"].metrics,
+        ].audit.metrics,
+        "signal_correction": stage_results["signal_correction"].audit.metrics,
         "low_quality_feature_filtering": stage_results[
             "low_quality_feature_filtering"
-        ].metrics,
+        ].audit.metrics,
         "missing_value_imputation": stage_results[
             "missing_value_imputation"
-        ].metrics,
-        "normalization": stage_results["normalization"].metrics,
+        ].audit.metrics,
+        "normalization": stage_results["normalization"].audit.metrics,
     }
 
     qa_metrics_objs = {
-        "raw_dataset": qa_raw_result.metrics,
-        "high_mv_feature_filtering": qa_mv_filter_result.metrics,
+        "raw_dataset": qa_raw_result.audit.metrics,
+        "high_mv_feature_filtering": qa_mv_filter_result.audit.metrics,
         **qa_corr_metrics,
-        "low_quality_feature_filtering": (qa_low_quality_filter_result.metrics),
-        "missing_value_imputation": qa_imp_result.metrics,
-        "normalization": qa_norm_result.metrics,
+        "low_quality_feature_filtering": (
+            qa_low_quality_filter_result.audit.metrics
+        ),
+        "missing_value_imputation": qa_imp_result.audit.metrics,
+        "normalization": qa_norm_result.audit.metrics,
     }
-
-    try:
-        from . import __version__ as package_version
-    except ImportError:
-        package_version = raw_result.metrics.get(
-            "pi-metaboqc_version", "Unknown"
-        )
 
     report_input = ReportInput(
         pipeline_metrics=pipeline_metrics_objs,
         qa_metrics=qa_metrics_objs,
         metadata={
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "version": package_version,
-            "mode": raw_result.metrics.get("mode", "N/A"),
+            "version": __version__,
+            "mode": raw_result.audit.metrics.get("mode", "N/A"),
             "is_multi_batch": is_multi_batch_flag,
         },
         resolved_config=params,
@@ -403,7 +441,21 @@ def run_pipeline(
         report_dir = "07_Report_Summary"
 
         visual_rep = ru.VisualAssetReporter(base_dir=str(root_dir))
+        # Preserve processing order and distinguish batch-correction stages.
+        qa_audits = {
+            (
+                key.split("/", 1)[1]
+                if key.startswith("signal_correction/")
+                else (
+                    result.audit.plot_payload.data.context.pipeline_stage
+                    or key
+                )
+            ): result.audit
+            for key, result in assessments.items()
+            if not result.audit.skipped
+        }
         asset_manifest = visual_rep.compile_assessor_report(
+            audits=qa_audits,
             report_folder=report_dir,
             is_multi_batch=is_multi_batch_flag,
         )
@@ -428,7 +480,7 @@ def run_pipeline(
         )
 
     logger.success("PI-METABOQC PIPELINE COMPLETED SUCCESSFULLY.")
-    return PipelineResult(
+    pipeline_result = PipelineResult(
         stage_tables=stage_tables,
         stage_results=stage_results,
         assessments=assessments,
@@ -437,4 +489,6 @@ def run_pipeline(
         report_input=report_input,
         output_dir=root_dir,
         report_generated=report_generated,
+        filtering_results=filtering_results,
     )
+    return pipeline_result

@@ -5,6 +5,6 @@ the staged pipeline. Candidate scorecards and imputation diagnostics belong to
 the separate :mod:`pimqc.plotting.imputation` package.
 """
 
-from .analysis import BayesianPCAImputer, MetaboIntImputer
+from .analysis import BayesianPCAImputer, MissingValueImputer
 
-__all__ = ["BayesianPCAImputer", "MetaboIntImputer"]
+__all__ = ["BayesianPCAImputer", "MissingValueImputer"]

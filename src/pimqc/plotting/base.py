@@ -2,7 +2,8 @@
 
 ``BasePlotter`` centralizes figure sizing, scoped styles, legend formatting,
 notebook rendering, vector-text cleanup, and file export for every plotter.
-Stage packages retain ownership of their scientific panels and dashboards.
+Stage packages retain ownership of their scientific panels and dashboards;
+all scientific inputs arrive through processor-free ``PlotPayload`` objects.
 """
 
 import io
@@ -21,6 +22,7 @@ import logging
 from loguru import logger
 
 from . import plot_utils as pu
+from .payloads import PlotPayload
 from .theme import scoped_plot_method
 from ..runtime import is_jupyter
 
@@ -38,8 +40,8 @@ class BasePlotter:
 
     FIG_SAVE_FORMAT = ["svg", "pdf"]  # or "svg"
     FIG_DISPLAY_FORMAT = "png"
-    # QA panels are consumed by the SVG report stitcher; PDFs are unnecessary
-    # intermediate duplicates and can be disabled centrally by subclasses.
+    # Standalone QA panels remain available independently of report grids;
+    # optional PDF duplicates can be enabled centrally by subclasses.
     QA_PANEL_SAVE_FORMAT = "svg"
     QA_LEGEND_SAVE_FORMAT = "svg"
     JUPYTER_PNG_DPI = 450
@@ -75,14 +77,14 @@ class BasePlotter:
 
     def __init__(
         self,
-        metabo_obj: object,
+        payload: PlotPayload,
         save_format: Optional[Union[str, list, tuple]] = None,
         display_format: Optional[str] = None,
     ) -> None:
-        """Initialize the plotter with scoped project styles.
+        """Initialize the plotter from one explicit plot payload.
 
         Args:
-            metabo_obj: A ``MetaboInt`` or derived object containing data.
+            payload: Processor-free matrices and resolved plot context.
             save_format: Optional output format or sequence of formats.
             display_format: Optional notebook display format.
         """
@@ -98,9 +100,13 @@ class BasePlotter:
             ],
         ]
 
-        # Load the data object and its resolved metadata used by every plotter.
-        self.obj = metabo_obj
-        self.attrs = metabo_obj.attrs
+        if not isinstance(payload, PlotPayload):
+            raise TypeError("Plotters require a PlotPayload instance.")
+
+        # Load only processor-free payload state used by every plotter.
+        self.payload = payload
+        self.obj = payload.primary_data
+        self.attrs = payload.attrs
         self.params = self.attrs
         self.default_save_fmt = save_format or self.FIG_SAVE_FORMAT
         self.default_display_fmt = display_format or self.FIG_DISPLAY_FORMAT
@@ -388,6 +394,9 @@ class BasePlotter:
         if ylabel:
             ax.set_ylabel(ylabel)
 
+        if self.VECTOR_AUTO_SCI_NOTATION:
+            pu.apply_smart_axis_notation(ax=ax, axis="xy")
+
         pu.change_weight(ax=ax, axis="xy")
         pu.change_fontsize(
             ax=ax,
@@ -402,9 +411,6 @@ class BasePlotter:
             ),
             axis="xy",
         )
-
-        if self.VECTOR_AUTO_SCI_NOTATION:
-            pu.apply_smart_axis_notation(ax=ax, axis="xy")
 
         ax.tick_params(
             axis="both",
@@ -517,7 +523,7 @@ class BasePlotter:
         legend_cols: int | None = None,
         max_item_rows: int | None = 6,
         **kwargs: object,
-    ) -> None:
+    ) -> object | None:
         """
         Format and position a standard single-group legend robustly.
 
@@ -550,7 +556,7 @@ class BasePlotter:
 
         # Terminate if no valid graphical elements are found
         if not handles:
-            return
+            return None
 
         # Merge global default styles with runtime parameter overrides
         legend_kwargs = getattr(self, "LEGEND_KWARGS", {}).copy()
@@ -587,6 +593,7 @@ class BasePlotter:
         )
         self._center_legend_title(legend)
         self._style_legend_artists(legend)
+        return legend
 
     @staticmethod
     def _style_legend_artists(legend: object | None) -> None:
@@ -743,7 +750,7 @@ class BasePlotter:
             """
             try:
                 ax.figure.canvas.draw()
-                renderer = ax.figure.canvas.get_renderer()
+                renderer = ax.figure._get_renderer()
                 return legend.get_window_extent(renderer).transformed(
                     ax.transAxes.inverted()
                 )
@@ -1108,6 +1115,7 @@ class BasePlotter:
                     # Output raw image MIME type to activate native VS Code
                     # toolbars
                     display(Image(data=img_data, width=width))
+
         else:
             # Native matplotlib figure pipeline via raw BytesIO memory buffers
             buf = io.BytesIO()
@@ -1151,6 +1159,70 @@ class BasePlotter:
 
                 # Output raw image MIME type to activate native VS Code toolbars
                 display(Image(data=img_data, width=width))
+
+    @staticmethod
+    def _dashboard_grid_shape(obj: object) -> tuple[int, int]:
+        """Infer the top-level patchwork grid shape from brick positions."""
+        bricks = getattr(obj, "bricks_dict", None)
+        if not bricks:
+            return (1, 1)
+
+        positions: list[tuple[float, float, float, float]] = []
+        for brick in bricks.values():
+            try:
+                x, y, brick_width, brick_height = brick.get_position().bounds
+            except (AttributeError, TypeError, ValueError):
+                continue
+            positions.append(
+                (
+                    float(x),
+                    float(y),
+                    float(brick_width),
+                    float(brick_height),
+                )
+            )
+
+        if not positions:
+            return (1, 1) if len(bricks) == 1 else (1, len(bricks))
+
+        def _unique(values: list[float], tolerance: float) -> int:
+            """Count coordinates while tolerating layout-decoration drift."""
+            unique: list[float] = []
+            for value in sorted(values):
+                if not unique or abs(value - unique[-1]) > tolerance:
+                    unique.append(value)
+            return len(unique)
+
+        widths = [width for _x, _y, width, _height in positions if width > 0]
+        heights = [height for _x, _y, _width, height in positions if height > 0]
+        x_tolerance = max(1e-3, min(widths, default=0.0) * 0.05)
+        y_tolerance = max(1e-3, min(heights, default=0.0) * 0.05)
+        rows = _unique(
+            [y for _x, y, _width, _height in positions],
+            y_tolerance,
+        )
+        columns = _unique(
+            [x for x, _y, _width, _height in positions],
+            x_tolerance,
+        )
+        return rows, columns
+
+    @classmethod
+    def resolve_dashboard_display_width(
+        cls,
+        obj: object,
+        width: Optional[Union[int, str]] = "auto",
+    ) -> Optional[Union[int, str]]:
+        """Resolve the standard inline width policy for a dashboard object.
+
+        ``width="auto"`` applies the shape-based 60/40/20% policy. Passing an
+        explicit pixel or percentage width remains supported for callers that
+        need a deliberate exception.
+        """
+        if width is not None and str(width).lower() != "auto":
+            return width
+        rows, columns = cls._dashboard_grid_shape(obj)
+        return pu.dashboard_display_width(rows, columns)
 
     @scoped_plot_method
     def save_and_close_fig(
@@ -1240,7 +1312,7 @@ class BasePlotter:
         show_plot: bool = True,
         save_format: Optional[str] = None,
         display_format: Optional[str] = None,
-        width: Optional[Union[int, str]] = "60%",
+        width: Optional[Union[int, str]] = "auto",
         transparent: bool = False,
     ) -> None:
         """
@@ -1257,11 +1329,14 @@ class BasePlotter:
         save_format (Optional[str]): Extension layout for physical file.
         display_format (str): Layout specification for notebook preview.
         width (Optional[Union[int, str]]): Notebook canvas bounding width.
+            ``"auto"`` selects 60%, 40%, or 20% from the dashboard grid
+            shape; an explicit value remains an override.
         transparent (bool): Alpha-channel background indicator.
 
         """
         actual_save_fmt = save_format or self.default_save_fmt
         actual_display_fmt = display_format or self.default_display_fmt
+        actual_width = self.resolve_dashboard_display_width(pw_obj, width)
 
         try:
             # CRITICAL OPTIMIZATION: Process notebook visualization first.
@@ -1272,7 +1347,7 @@ class BasePlotter:
                     obj=pw_obj,
                     is_patchwork=True,
                     display_format=actual_display_fmt,
-                    width=width,
+                    width=actual_width,
                     transparent=transparent,
                 )
         except Exception as e:

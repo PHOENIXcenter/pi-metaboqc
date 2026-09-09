@@ -3,7 +3,7 @@ Script purpose: Compare Python quantile normalization with the R reference.
 
 This bridge test sends the shared mock MS matrix through Bioconductor
 preprocessCore via rpy2, then compares that output with the pure Python
-MetaboIntNormalizer.calc_quantile_normalization() implementation. The test
+DataNormalizer.calc_quantile_normalization() implementation. The test
 accepts either near-identical residuals or high correlation to account for
 minor numerical differences between R and Python execution paths.
 """
@@ -17,7 +17,7 @@ from rpy2.robjects import pandas2ri
 from rpy2.robjects.conversion import localconverter
 from scipy.stats import pearsonr
 
-from pimqc.processing.normalization import MetaboIntNormalizer
+from pimqc.processing.normalization import DataNormalizer
 
 from .helpers import require_r_package
 
@@ -52,7 +52,7 @@ def test_quantile_equivalence(mock_ms_data: pd.DataFrame) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         # Exercise the numerical kernel without constructing a stage object.
-        df_py_norm = MetaboIntNormalizer.calc_quantile_normalization(df_raw)
+        df_py_norm = DataNormalizer.calc_quantile_normalization(df_raw)
 
     df_r_norm = run_r_quantile(df_raw)
 

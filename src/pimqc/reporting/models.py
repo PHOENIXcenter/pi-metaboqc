@@ -27,10 +27,10 @@ def _to_json_value(value: Any) -> Any:
         return {str(key): _to_json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_to_json_value(item) for item in value]
-    if hasattr(value, "item"):
-        return _to_json_value(value.item())
     if hasattr(value, "tolist"):
         return _to_json_value(value.tolist())
+    if hasattr(value, "item"):
+        return _to_json_value(value.item())
     raise TypeError(
         "Report inputs must be JSON-serializable; received "
         f"{type(value).__name__}."

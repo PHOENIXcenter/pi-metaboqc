@@ -17,7 +17,6 @@ from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
 
-from ...constants import DEFAULT_RANDOM_SEED
 from ...processing.correction.algorithms import _format_correction_method_label
 from .. import plot_utils as pu
 from ..sample_structure import plot_sample_structure_change_map
@@ -309,17 +308,9 @@ class CorrectionDashboardMixin:
             figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
             label="selected_correction_sample_structure",
         )
-        final_stage_df = list(selected_result["stage_dfs"].values())[-1]
         plot_sample_structure_change_map(
             ax=sample_structure,
-            raw_obj=self.corr,
-            transformed_obj=final_stage_df,
-            structure_metrics=selected_result.get(
-                "sample_structure_metrics", {}
-            ),
-            seed=int(
-                self.corr.attrs.get("global_seed", DEFAULT_RANDOM_SEED)
-            ),
+            diagnostics=selected_result.get("sample_structure", {}),
             title="Sample Structure Change Map",
             compact_style=True,
         )

@@ -12,10 +12,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from loguru import logger
 
-from ..core.model import MetaboInt
 from . import plot_utils as pu
 from .base import BasePlotter
 from .colors import build_categorical_palette
+from .payloads import DatasetPlotPayload
 
 
 class DatasetPlotter(BasePlotter):
@@ -25,10 +25,12 @@ class DatasetPlotter(BasePlotter):
     standardized formatting rules from :class:`BasePlotter`.
     """
 
-    def __init__(self, builder_obj: MetaboInt) -> None:
-        """Initialize with a built MetaboInt dataset object."""
-        super().__init__(metabo_obj=builder_obj)
-        self.engine = builder_obj
+    def __init__(self, payload: DatasetPlotPayload) -> None:
+        """Initialize from a dataset overview payload."""
+        if not isinstance(payload, DatasetPlotPayload):
+            raise TypeError("DatasetPlotter requires DatasetPlotPayload.")
+        super().__init__(payload=payload)
+        self.engine = payload.primary_data
 
     def _get_plot_metadata(self) -> dict[str, str]:
         """Helper to extract unified metadata for plotting functions."""
@@ -98,7 +100,7 @@ class DatasetPlotter(BasePlotter):
     def _get_barcode_df(self) -> pd.DataFrame:
         """Extracts and formats column metadata for barcode visualizations.
 
-        Retrieves the metadata embedded in the MetaboInt MultiIndex columns
+        Retrieves metadata from the payload's annotated dataframe columns
         using native plot metadata mappers, and ensures chronological sorting.
 
         Returns:

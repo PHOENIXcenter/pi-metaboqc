@@ -45,29 +45,31 @@ class PCAEngine:
 
     @staticmethod
     def extract_features(
-        metabo_obj: pd.DataFrame,
+        annotated_data: pd.DataFrame,
         sample_type: str,
         sample_name: str,
         actual_label: str,
         qc_label: str,
         scaling_method: str = "None",
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Prepare feature matrix and labels from a MetaboInt object.
+        """Prepare feature matrix and labels from an annotated dataframe.
 
         Applies JIT feature scaling and transient log transformations based
         on the current sample subset to prevent data leakage.
         """
 
         # Isolate target samples (Features as rows, Samples as columns)
-        sample_types = metabo_obj.columns.get_level_values(sample_type)
+        sample_types = annotated_data.columns.get_level_values(sample_type)
         valid_sample_mask = sample_types.isin([actual_label, qc_label])
-        subset_df = metabo_obj.loc[:, valid_sample_mask].astype(float)
+        subset_df = annotated_data.loc[:, valid_sample_mask].astype(float)
 
         # =====================================================================
         # State-Aware Transient Log Transformation
         # =====================================================================
-        is_logged = metabo_obj.attrs.get("is_logged", False)
-        norm_method = str(metabo_obj.attrs.get("norm_method", "None")).upper()
+        is_logged = annotated_data.attrs.get("is_logged", False)
+        norm_method = str(
+            annotated_data.attrs.get("norm_method", "None")
+        ).upper()
 
         # Apply transient log2 for variance stabilization if not done upstream
         if not is_logged and norm_method not in ["VSN", "QUANTILE"]:

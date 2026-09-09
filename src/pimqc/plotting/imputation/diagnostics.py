@@ -184,7 +184,7 @@ class ImputationDiagnosticsMixin:
             self._format_single_legend(
                 ax=ax,
                 group_title="Masked-value density reference",
-                loc="lower right",
+                loc="best",
                 bbox_to_anchor=None,
                 max_item_rows=6,
             )

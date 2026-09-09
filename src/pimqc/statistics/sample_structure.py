@@ -15,6 +15,7 @@ from scipy.stats import spearmanr
 from ..constants import DEFAULT_RANDOM_SEED
 from .metrics import (
     _extract_log2_target,
+    _role_columns,
     finite_or_nan,
     rank_loss_from_distances,
     robust_feature_zscore,
@@ -53,14 +54,18 @@ def calc_sample_structure_arrays(
         return empty
 
     if sample_cols is None:
-        try:
-            sample_cols = (
-                raw_obj._actual_sample.columns.intersection(log_raw.columns)
-                .intersection(log_transformed.columns)
-                .sort_values()
-            )
-        except AttributeError:
-            sample_cols = log_raw.columns.intersection(log_transformed.columns)
+        actual_columns = _role_columns(
+            raw_obj,
+            "Actual sample",
+            "Sample",
+        )
+        if actual_columns.empty:
+            actual_columns = log_raw.columns
+        sample_cols = (
+            actual_columns.intersection(log_raw.columns)
+            .intersection(log_transformed.columns)
+            .sort_values()
+        )
     else:
         sample_cols = (
             pd.Index(sample_cols)
@@ -229,6 +234,66 @@ def calc_sample_structure_preservation(
     scale_rel_delta_tol: float = 0.35,
 ) -> dict[str, float]:
     """Calculate label-free actual-sample structure preservation metrics."""
+    return calc_sample_structure_diagnostics(
+        raw_obj,
+        transformed_obj,
+        sample_cols,
+        max_features,
+        seed,
+        scale_log_ratio_tol,
+        scale_rel_delta_tol,
+    )["metrics"]
+
+
+def calc_sample_structure_diagnostics(
+    raw_obj: pd.DataFrame,
+    transformed_obj: pd.DataFrame,
+    sample_cols: pd.Index | None = None,
+    max_features: int | None = 5000,
+    seed: int = DEFAULT_RANDOM_SEED,
+    scale_log_ratio_tol: float = 0.25,
+    scale_rel_delta_tol: float = 0.35,
+) -> dict[str, object]:
+    """Compute scores and plot-ready sample coordinates in one distance pass.
+
+    Pairwise arrays are execution-only intermediates. Only the O(n) sample
+    table and scalar scores are retained for audit and standalone rendering.
+    """
+    geometry = calc_sample_structure_arrays(
+        raw_obj=raw_obj,
+        transformed_obj=transformed_obj,
+        sample_cols=sample_cols,
+        max_features=max_features,
+        seed=seed,
+    )["geometry"]
+    columns = {
+        "scale_shift": "sample_log2_distance_ratio",
+        "rank_rho": "sample_distance_rank_rho",
+        "local_trust": "sample_neighborhood_trustworthiness",
+    }
+    samples = pd.concat(
+        [
+            pd.to_numeric(
+                geometry.get(key, pd.Series(dtype=float)), errors="coerce"
+            ).rename(name)
+            for name, key in columns.items()
+        ],
+        axis=1,
+    ).dropna(subset=["scale_shift", "rank_rho"])
+    return {
+        "samples": samples,
+        "metrics": _summarize_sample_structure(
+            geometry, scale_log_ratio_tol, scale_rel_delta_tol
+        ),
+    }
+
+
+def _summarize_sample_structure(
+    geometry: dict[str, object],
+    scale_log_ratio_tol: float,
+    scale_rel_delta_tol: float,
+) -> dict[str, float]:
+    """Summarize precomputed geometry with the existing scoring formulas."""
     metrics = {
         "robust_distance_rank_loss": float("nan"),
         "robust_distance_relative_delta": float("nan"),
@@ -241,14 +306,7 @@ def calc_sample_structure_preservation(
         "sample_structure_composite_preservation": float("nan"),
     }
 
-    structure = calc_sample_structure_arrays(
-        raw_obj=raw_obj,
-        transformed_obj=transformed_obj,
-        sample_cols=sample_cols,
-        max_features=max_features,
-        seed=seed,
-    )
-    geom_metrics = structure["geometry"]
+    geom_metrics = geometry
 
     metrics["robust_distance_rank_loss"] = finite_or_nan(
         geom_metrics.get("rank_loss")

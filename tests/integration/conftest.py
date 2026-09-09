@@ -167,7 +167,7 @@ def synthetic_pipeline_data() -> tuple[
         intensity.iloc[intensity.index.get_loc(feature), drop_indices] = np.nan
 
     parameters: dict[str, object] = {
-        "MetaboInt": {
+        "Dataset": {
             "mode": "POS",
             "batch": "Batch",
             "sample_type": "Sample Type",
@@ -180,20 +180,18 @@ def synthetic_pipeline_data() -> tuple[
                 "Blank sample": "Blank",
             },
         },
-        "MetaboIntFilter": {
+        "FeatureFilter": {
             "mv_group_tol": 0.8,
             "mv_qc_tol": 0.8,
-            "mv_global_tol": 0.8,
-            "blank_qc_ratio": 0.8,
-            "blank_qc_tol": 0.8,
-            "rsd_qc_tol": 0.3,
+            "blank_qc_ratio_tol": 0.8,
             "qc_rsd_tol": 0.3,
         },
-        "MetaboIntCorrector": {"corr_method": "svr"},
-        "MetaboIntImputer": {"method": "probabilistic", "knn_neighbors": 3},
-        "MetaboIntNormalizer": {
-            "col_method": "median",
-            "row_method": "auto_scale",
+        "SignalCorrector": {"base_est": "QC-SVR"},
+        "MissingValueImputer": {
+            "mar_method": "Median",
+            "mnar_method": "Row-wise",
+            "knn_neighbors": 3,
         },
+        "DataNormalizer": {"norm_method": "Median"},
     }
     return metadata, intensity, parameters

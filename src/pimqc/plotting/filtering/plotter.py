@@ -6,9 +6,8 @@ separate modules and share state through ``FilteringPlotter``.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
-
 from ..base import BasePlotter
+from ..payloads import FilteringPlotPayload
 from .dashboards import FilteringDashboardMixin
 from .diagnostics import FilteringDiagnosticsMixin
 from .flowchart import FilteringFlowchartMixin
@@ -24,10 +23,11 @@ class FilteringPlotter(
 
     def __init__(
         self,
-        engine,
-        audit_tables: Mapping[str, Any] | None = None,
+        payload: FilteringPlotPayload,
     ) -> None:
-        """Initialize with a computed engine and explicit audit tables."""
-        super().__init__(metabo_obj=engine)
-        self.engine = engine
-        self.audit_tables = dict(audit_tables or {})
+        """Initialize from processor-free filtering plot inputs."""
+        if not isinstance(payload, FilteringPlotPayload):
+            raise TypeError("FilteringPlotter requires FilteringPlotPayload.")
+        super().__init__(payload=payload)
+        self.engine = payload.primary_data
+        self.audit_tables = dict(payload.audit_tables)

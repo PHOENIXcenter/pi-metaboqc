@@ -7,6 +7,7 @@ live in separate modules and share state through ``CorrectionPlotter``.
 from __future__ import annotations
 
 from ..base import BasePlotter
+from ..payloads import CorrectionPlotPayload
 from .dashboards import CorrectionDashboardMixin
 from .diagnostics import CorrectionDiagnosticsMixin
 from .internal_standards import CorrectionInternalStandardMixin
@@ -22,7 +23,9 @@ class CorrectionPlotter(
 ):
     """Plotting suite for correction evaluation and diagnostics."""
 
-    def __init__(self, corr_obj) -> None:
-        """Initialize with a computed correction stage."""
-        super().__init__(metabo_obj=corr_obj)
-        self.corr = corr_obj
+    def __init__(self, payload: CorrectionPlotPayload) -> None:
+        """Initialize from processor-free correction plot inputs."""
+        if not isinstance(payload, CorrectionPlotPayload):
+            raise TypeError("CorrectionPlotter requires CorrectionPlotPayload.")
+        super().__init__(payload=payload)
+        self.corr = payload.primary_data

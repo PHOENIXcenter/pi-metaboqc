@@ -1,11 +1,47 @@
 name: Publish Python to PyPI
 
 on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 jobs:
+  verify:
+    name: Test source and installed wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install native test dependencies
+      run: python -m pip install . pytest ruff build
+    - name: Check Python source
+      run: python -m ruff check src tests examples/run_pimqc.py --select E9,F,E501
+    - name: Run native regression suite
+      env:
+        MPLBACKEND: Agg
+      run: python -m pytest -q
+    - name: Build and install wheel without source checkout imports
+      run: |
+        python -m build
+        python -m pip install --force-reinstall --no-deps dist/*.whl
+        cd "$RUNNER_TEMP"
+        python -I -c "from importlib.metadata import version; from importlib.resources import files; import pimqc; from pimqc import run_pipeline; assert pimqc.__version__ == version('pi-metaboqc'); assert files('pimqc').joinpath('resources/demo/pipeline_parameters.toml').is_file(); assert files('pimqc').joinpath('templates/report_comprehensive.md.j2').is_file()"
+
   build-and-publish:
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: verify
     name: Build and publish Python distribution to PyPI
     runs-on: ubuntu-latest
     
@@ -22,7 +58,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.x"
+        python-version: "3.13"
 
     - name: Install build tools
       run: python -m pip install --upgrade pip build

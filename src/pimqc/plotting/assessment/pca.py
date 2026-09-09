@@ -40,7 +40,7 @@ class AssessmentPcaMixin:
 
         try:
             ax.figure.canvas.draw()
-            renderer = ax.figure.canvas.get_renderer()
+            renderer = ax.figure._get_renderer()
             bbox_patch = getattr(text_artist, "get_bbox_patch", lambda: None)()
             text_bbox = (
                 bbox_patch.get_window_extent(renderer=renderer)
@@ -166,7 +166,8 @@ class AssessmentPcaMixin:
             current_ax = ax
             fig = current_ax.figure
 
-        current_ax.set_position([0.0, 0.0, 1.0, 1.0])
+        if standalone:
+            current_ax.set_position([0.0, 0.0, 1.0, 1.0])
 
         present_batches = set(pca_df.index.get_level_values(batch))
         handles = [

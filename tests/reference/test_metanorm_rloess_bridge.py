@@ -232,11 +232,12 @@ def test_metanorm_rloess_bridge_on_bundled_project_data(
 ) -> None:
     """Compare workflow behavior on data without claiming exact equality."""
     meta_df, intensity_df, pipeline_params = real_project_data
-    metabo_obj = build_dataset(
+    dataset = build_dataset(
         meta_info=meta_df,
         int_df=intensity_df,
         pipeline_params=pipeline_params,
     )
+    metabo_obj = dataset.annotated_frame()
     finite_counts = metabo_obj.notna().sum(axis=1)
     subset = metabo_obj.loc[finite_counts.nlargest(8).index].astype(float)
 
@@ -309,11 +310,12 @@ def test_metanorm_qc_only_rloess_all_feature_qc_rsd_comparison(
     then aligns QC means across batches.
     """
     meta_df, intensity_df, pipeline_params = real_project_data
-    metabo_obj = build_dataset(
+    dataset = build_dataset(
         meta_info=meta_df,
         int_df=intensity_df,
         pipeline_params=pipeline_params,
     )
+    metabo_obj = dataset.annotated_frame()
     data = metabo_obj.astype(float)
 
     batch_name = metabo_obj.attrs["batch"]

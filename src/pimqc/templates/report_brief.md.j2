@@ -5,6 +5,7 @@
 {%- set feats = raw_params.get('features', {}) -%}
 {%- set samps = raw_params.get('samples', {}) -%}
 {%- set batch_info = raw_params.get('batches', {}) -%}
+{%- set batch_count = batch_info.get('batch_count') -%}
 
 {%- set lq_params = low_quality_feature_filtering.get('pipeline_params', {}) -%}
 {%- set lq_ret = lq_params.get('feature_retention', {}) -%}
@@ -30,7 +31,7 @@
 
 {%- set norm_params = normalization.get('pipeline_params', {}) -%}
 {%- set norm_strat = norm_params.get('strategies', {}) -%}
-{%- set norm_method = norm_strat.get('normalization_method', 'ROBUST_LOG_ONLY') | upper -%}
+{%- set norm_method = norm_strat.get('normalization_method', 'N/A') | upper -%}
 {%- set norm_selection = norm_params.get('selection', {}) -%}
 {%- set requested_norm_method = norm_selection.get('requested_method', norm_method) | upper -%}
 {%- set is_log = norm_strat.get('log_transform_active', False) %}
@@ -44,9 +45,9 @@
 
 ## 1. Global Pipeline Yield and Experimental Overview
 
-The analytical dataset, acquired in **{{ meta.get('mode', 'Unknown') }}** ionization mode, was processed through a standardized, high-throughput metabolomics quality control pipeline. The cohort consisted of **{{ samps.get('actual', 'N/A') }}** biological samples, **{{ samps.get('qc', 'N/A') }}** pooled quality-control (QC) samples, and **{{ samps.get('blank', 'N/A') }}** blanks{%- if batch_info.get('batch_count', 1) > 1 -%}, distributed across **{{ batch_info.get('batch_count') }}** analytical batches{%- endif -%}.
+The analytical dataset, acquired in **{{ meta.get('mode', 'Unknown') }}** ionization mode, was processed through a standardized, high-throughput metabolomics quality control pipeline. The cohort consisted of **{{ samps.get('actual', 'N/A') }}** biological samples, **{{ samps.get('qc', 'N/A') }}** pooled quality-control (QC) samples, and **{{ samps.get('blank', 'N/A') }}** blanks{%- if batch_count is number and batch_count > 1 -%}, distributed across **{{ batch_count }}** analytical batches{%- endif -%}.
 
-**Feature Retention Summary:**
+### Feature Retention Summary
 
 * **Initial Acquisition:** **{{ feats.get('total', 'N/A') }}** raw mass spectral features.
 * **Final High-Fidelity Matrix:** Following stringent topological missing-value screening, blank-ratio background elimination, and strict relative standard deviation (RSD) reproducibility evaluation, **{{ lq_final_total }}** genuine metabolic features (**{{ lq_final.get('mar_count', 'N/A') }}** missing-at-random (MAR) and **{{ lq_final.get('mnar_count', 'N/A') }}** missing-not-at-random (MNAR)) were successfully isolated for downstream statistical analysis.
@@ -72,7 +73,15 @@ Signal correction was applied, but QC RSD metrics are unavailable for this repor
 {%- if imp_status == 'Skipped' %}
 Subsequently, missing-value imputation was bypassed because no missing values were detected in the target analytical matrix; the matrix was propagated unchanged.
 {%- else %}
-Subsequently, structurally missing values were reconstructed. MNAR components were deterministically substituted via a **{{ imp_strat.get('mnar_method', 'N/A') }}** strategy, while MAR components were reconstructed using **{{ imp_selected_label }}**{% if imp_selection.get('is_auto') %} selected by AUTO benchmarking{% endif %} to preserve global structural fidelity. Low-abundance NRMSE evaluates masked observations from features whose median intensity is at or below the 25th percentile of all feature medians.
+Subsequently, missing values were reconstructed.
+{% if imp_params.get('feature_distribution', {}).get('mnar_count', 0) > 0 %}
+MNAR features were imputed using **{{ imp_strat.get('mnar_method', 'N/A') }}**; QRILC uses seeded sampling rather than deterministic constant substitution.
+{% endif %}
+{% if imp_params.get('feature_distribution', {}).get('mar_count', 0) > 0 %}
+MAR features were imputed using **{{ imp_selected_label }}**{% if imp_selection.get('is_auto') %} selected by AUTO benchmarking{% endif %}. Low-abundance NRMSE evaluates masked observations from features whose median intensity is at or below the 25th percentile of all feature medians.
+{% else %}
+MAR imputation and benchmarking were not required.
+{% endif %}
 {%- endif %}
 
 {% if is_auto_norm %}

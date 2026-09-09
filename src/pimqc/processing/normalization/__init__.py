@@ -5,6 +5,6 @@ and returns structured stage results. Normalization diagnostics and dashboard
 assembly are exposed from :mod:`pimqc.plotting.normalization`.
 """
 
-from .analysis import MetaboIntNormalizer
+from .analysis import DataNormalizer
 
-__all__ = ["MetaboIntNormalizer"]
+__all__ = ["DataNormalizer"]

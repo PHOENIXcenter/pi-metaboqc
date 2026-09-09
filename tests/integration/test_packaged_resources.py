@@ -10,8 +10,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from pimqc.core import MetaboInt
-from pimqc.dataset.builder import build_dataset
+from pimqc.core import MetaboDataset
+from pimqc import MetaboDatasetBuilder
+from pimqc.processing import DatasetAuditPayload
 from pimqc.io import load_pipeline_config
 from pimqc.reporting.utils import NarrativeStatsReporter
 
@@ -35,19 +36,24 @@ def test_demo_json_configuration_matches_toml() -> None:
 def test_build_dataset_with_bundled_project_data(
     real_project_data: tuple[pd.DataFrame, pd.DataFrame, dict[str, object]],
 ) -> None:
-    """Build a populated MetaboInt with every configured metadata level."""
+    """Build the explicit dataset with every configured metadata field."""
     metadata, intensity, parameters = real_project_data
 
-    dataset = build_dataset(
+    result = MetaboDatasetBuilder(
         meta_info=metadata,
         int_df=intensity,
         pipeline_params=parameters,
-    )
+    ).run_build()
+    dataset = result.data
 
-    assert isinstance(dataset, MetaboInt)
-    assert not dataset.empty
-    assert parameters["MetaboInt"]["batch"] in dataset.columns.names
-    assert parameters["MetaboInt"]["sample_type"] in dataset.columns.names
+    assert isinstance(dataset, MetaboDataset)
+    assert isinstance(result.audit, DatasetAuditPayload)
+    assert not dataset.intensity.empty
+    assert dataset.intensity.shape == intensity.shape
+    assert dataset.sample_ids.tolist() == intensity.columns.tolist()
+    assert parameters["Dataset"]["batch"] in dataset.sample_metadata
+    assert parameters["Dataset"]["sample_type"] in dataset.sample_metadata
+    assert not isinstance(dataset.intensity.columns, pd.MultiIndex)
 
 
 def test_report_templates_load_from_package_resources(tmp_path: Path) -> None:

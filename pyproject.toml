@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 # ==============================================================================
 [project]
 name = "pi-metaboqc"           # Distribution name used by PyPI and pip
-version = "1.3.1"              # Release version following PEP 440
+version = "1.4.0"              # Release version following PEP 440
 dynamic = ["readme"]           # README content is loaded from README.md
 
 # Maintainer information displayed in package metadata.
@@ -97,7 +97,7 @@ dependencies = [
     # --- Markdown & PDF Report Generation ---
     "Jinja2>=3.1.0",         # Templating for dynamic MD reports
     "tabulate>=0.10.0",      # Converts DataFrames to MD tables
-    "pypandoc[tinytex]>=1.11"# MD to PDF engine with automated LaTeX fallback
+    "pypandoc>=1.11"        # Uses explicitly provisioned report converters
 
 ]
 

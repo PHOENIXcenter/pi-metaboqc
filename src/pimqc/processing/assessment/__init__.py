@@ -5,11 +5,11 @@ Figure construction is kept separate under :mod:`pimqc.plotting.assessment`
 so numerical code does not also define presentation responsibilities.
 """
 
-from .analysis import AssessmentDiagnostics, MetaboIntAssessor
+from .analysis import AssessmentDiagnostics, QualityAssessor
 from .runner import AssessmentStageRunner
 
 __all__ = [
     "AssessmentDiagnostics",
     "AssessmentStageRunner",
-    "MetaboIntAssessor",
+    "QualityAssessor",
 ]

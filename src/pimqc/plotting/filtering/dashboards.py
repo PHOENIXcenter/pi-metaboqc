@@ -6,7 +6,6 @@ diagnostic panels and filtering flowchart defined in sibling modules.
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -38,33 +37,54 @@ class FilteringDashboardMixin:
 
         pw.clear()
 
-        # Initialize data copy and evaluate biological grouping status
+        # Initialize data copy and evaluate the three orthogonal layout states.
         df_curr = tracking_df.copy()
-        has_group_info = ("Max_Group_MV_Pct" in df_curr.columns) and (
-            df_curr["Max_Group_MV_Pct"].notna().any()
+        has_group_info = self.payload.biological_groups_available and (
+            "Max_Group_MV_Pct" in df_curr.columns
         )
 
-        # Build the universal Sample MV Stripplot Brick
-        layout_width = 12.0
-        ax_sample = pw.Brick(
-            figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
-            label="sample_mv",
+        sample_track = self.audit_tables.get("sample_tracking", pd.DataFrame())
+        sample_filter_status = self.payload.sample_filter_status
+        feature_mv_skipped = (
+            self.payload.stage_status == "skipped"
+            or not self.payload.missing_values_detected
         )
-        sample_track = self.audit_tables.get(
-            "sample_tracking", pd.DataFrame()
+
+        if feature_mv_skipped:
+            logger.info(
+                "Feature MV filtering was skipped; no dashboard is produced."
+            )
+            return None
+
+        has_sample_diagnostic = (
+            sample_filter_status == "completed" and not sample_track.empty
         )
-        sample_mv_tol = self.engine.attrs.get("sample_mv_tol", 0.5)
-        self._plot_sample_mv_stripplot(
-            sample_track, sample_mv_tol, ax=ax_sample, article_compact=True
-        )
+        layout_width = 12.0 if has_group_info or has_sample_diagnostic else 8.0
+        ax_sample = None
+        if has_sample_diagnostic:
+            ax_sample = pw.Brick(
+                figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
+                label="sample_mv",
+            )
+            self._plot_sample_mv_stripplot(
+                sample_track,
+                self.payload.sample_mv_tolerance,
+                ax=ax_sample,
+                article_compact=True,
+            )
 
         # Dynamic layout assembly based on biological grouping
         if has_group_info:
             # Layout A: With Groups (1+2 Top, 1+1+1 Bottom)
 
             # Flowchart ratio is 2 units wide to match the bottom 2 plots
+            flow_width = 8.0 if ax_sample is not None else 12.0
             ax_flow = pw.Brick(
-                figsize=pu.dashboard_brick_size(8.0, 4.0, layout_width),
+                figsize=pu.dashboard_brick_size(
+                    flow_width,
+                    4.0 if ax_sample is not None else 2.65,
+                    layout_width,
+                ),
                 label="flowchart",
             )
             self._plot_mv_filtering_flowchart(
@@ -136,16 +156,25 @@ class FilteringDashboardMixin:
 
             # Column-first topology binding to enforce strict vertical alignment
             # Prevents width stretching caused by the axis-off flowchart
-            col_left = ax_sample / ax_group_rescue
-            col_right = ax_flow / (ax_qc_rescue | ax_base_check)
-            return col_left | col_right
+            if ax_sample is not None:
+                col_left = ax_sample / ax_group_rescue
+                col_right = ax_flow / (ax_qc_rescue | ax_base_check)
+                return col_left | col_right
+            return ax_flow / (ax_group_rescue | ax_qc_rescue | ax_base_check)
 
         else:
-            # Layout B: No Groups (1 Full-width Top, 1+1+1 Bottom)
+            # Layout B: No Groups. Keep the QC-only flowchart at its canonical
+            # two-column width; do not stretch it when a Sample MV panel is
+            # available.
+            diagnostic_width = 6.0 if ax_sample is not None else 4.0
 
-            # Flowchart ratio is 3 units wide to span the entire top row
+            # The flowchart spans the available feature-only or combined row.
             ax_flow = pw.Brick(
-                figsize=pu.dashboard_brick_size(12.0, 4.0, layout_width),
+                figsize=pu.dashboard_brick_size(
+                    8.0,
+                    4.0 if ax_sample is not None else 2.65,
+                    layout_width,
+                ),
                 label="flowchart",
             )
             self._plot_mv_filtering_flowchart(
@@ -161,7 +190,11 @@ class FilteringDashboardMixin:
 
             # Subplot S2: QC Rescue Scatter (Acts as Step 1 here)
             ax_qc_rescue = pw.Brick(
-                figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
+                figsize=pu.dashboard_brick_size(
+                    diagnostic_width,
+                    4.0,
+                    layout_width,
+                ),
                 label="s2",
             )
             self._plot_qc_rescue_scatter(
@@ -178,7 +211,11 @@ class FilteringDashboardMixin:
 
             # Subplot S3: Base Threshold Check Histogram (Acts as Step 2 here)
             ax_base_check = pw.Brick(
-                figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
+                figsize=pu.dashboard_brick_size(
+                    diagnostic_width,
+                    4.0,
+                    layout_width,
+                ),
                 label="s3",
             )
             self._plot_cutoff_histogram(
@@ -192,17 +229,19 @@ class FilteringDashboardMixin:
                 "QC-level MV Check",
                 "QC-level MV (%)",
                 article_compact=True,
+                threshold_label="QC MV",
             )
 
-            # Row-first topology binding: Full width top over 3 equal bottom
-            row_bottom = ax_sample | ax_qc_rescue | ax_base_check
-            return ax_flow / row_bottom
+            if ax_sample is not None:
+                row_top = ax_sample | ax_flow
+                return row_top / (ax_qc_rescue | ax_base_check)
+            return ax_flow / (ax_qc_rescue | ax_base_check)
 
     # Manuscript-Only Filtering Dashboards
     def plot_high_mv_filter_article_dashboard(self) -> object | None:
         """Create a compact three-panel summary of high-MV feature screening.
 
-        Experimental: The manuscript-only layout retains the three decision diagnostics used
+        Experimental: The manuscript layout retains three decision diagnostics
         to classify group-rescued MNAR, QC-rescued MNAR, and MAR features. It
         is deliberately independent of the full Stage 1 dashboard so the
         standard report layout and its typography remain unchanged.
@@ -215,9 +254,7 @@ class FilteringDashboardMixin:
             )
             return None
 
-        tracking_df = self.audit_tables.get(
-            "stage1_tracking", pd.DataFrame()
-        )
+        tracking_df = self.audit_tables.get("stage1_tracking", pd.DataFrame())
         if tracking_df.empty:
             logger.warning(
                 "Stage 1 tracking data are unavailable for article export."
@@ -235,30 +272,11 @@ class FilteringDashboardMixin:
             )
             return None
 
-        sample_type = self.engine.attrs.get("sample_type", "Sample Type")
-        sample_dict = self.engine.attrs.get("sample_dict", {})
-        qc_label = sample_dict.get("QC sample", "QC")
-        qc_mask = (
-            self.engine.columns.get_level_values(sample_type) == qc_label
-            if sample_type in self.engine.columns.names
-            else np.zeros(self.engine.shape[1], dtype=bool)
-        )
-        mnar_int_threshold = None
-        if qc_mask.any():
-            mnar_intensity_pct = self.engine.attrs.get(
-                "mnar_intensity_pct", 0.1
-            )
-            raw_threshold = (
-                self.engine.loc[:, qc_mask]
-                .median(axis=1)
-                .quantile(mnar_intensity_pct)
-            )
-            mnar_int_threshold = np.log2(raw_threshold + 1)
-
-        active_base_tol = self.engine.attrs.get("mv_group_tol", 0.5)
-        mnar_group_mv_tol = self.engine.attrs.get("mnar_group_mv_tol", 0.8)
-        mnar_qc_mv_tol = self.engine.attrs.get("mnar_qc_mv_tol", 0.2)
-        mnar_intensity_pct = self.engine.attrs.get("mnar_intensity_pct", 0.1)
+        mnar_int_threshold = self.payload.mnar_intensity_threshold
+        active_base_tol = self.payload.active_base_tolerance
+        mnar_group_mv_tol = self.payload.mnar_group_mv_tolerance
+        mnar_qc_mv_tol = self.payload.mnar_qc_mv_tolerance
+        mnar_intensity_pct = self.payload.mnar_intensity_percentile
 
         pw.clear()
         # Patchworklib adds fixed label/legend padding. This width yields an
@@ -332,6 +350,12 @@ class FilteringDashboardMixin:
         has_blanks = blank_mean is not None and not blank_mean.empty
 
         idx_mar = self.audit_tables.get("idx_mar", pd.Index([]))
+        if self.audit_tables.get("quality_filter_mode") == "quality_only":
+            # Quality-only runs have no MAR labels.  The QC-RSD diagnostic
+            # still covers every feature that reached the quality stage.
+            qc_rsd_all = self.audit_tables.get("qc_rsd_all")
+            if qc_rsd_all is not None:
+                idx_mar = qc_rsd_all.index
 
         # Topology A: 1x3 Grid (Blank samples exist)
         if has_blanks:
@@ -376,7 +400,7 @@ class FilteringDashboardMixin:
         """
         Create a compact three-panel summary of low-quality feature filtering.
 
-        Experimental: The QC-RSD panel deliberately reuses the MAR-only distribution used by
+        Experimental: The QC-RSD panel reuses the MAR-only distribution used by
         the filtering engine. MNAR features remain absent from this diagnostic
         because they are exempt from the QC-RSD reproducibility filter.
 
@@ -391,6 +415,10 @@ class FilteringDashboardMixin:
 
         blank_mean = self.audit_tables.get("blank_mean")
         idx_mar = self.audit_tables.get("idx_mar", pd.Index([]))
+        if self.audit_tables.get("quality_filter_mode") == "quality_only":
+            qc_rsd_all = self.audit_tables.get("qc_rsd_all")
+            if qc_rsd_all is not None:
+                idx_mar = qc_rsd_all.index
         if blank_mean is None or blank_mean.empty or len(idx_mar) == 0:
             logger.warning(
                 "Blank/QC and MAR QC-RSD inputs are required for the "

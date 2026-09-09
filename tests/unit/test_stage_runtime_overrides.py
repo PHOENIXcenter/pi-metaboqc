@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from pimqc.processing import DatasetAuditPayload
 from pimqc.processing.stage import StageResult, StageRunner
 
 
@@ -13,12 +14,12 @@ class _Processor:
 
     def __init__(self) -> None:
         """Initialize a processor with the pipeline-resolved setting."""
-        self.attrs = {"method": "from_pipeline"}
+        self.config = {"method": "from_pipeline"}
 
     @cached_property
     def configured_method(self) -> str:
         """Expose the currently configured method through a cache."""
-        return self.attrs["method"]
+        return self.config["method"]
 
 
 class _Runner(StageRunner[_Processor, str]):
@@ -26,7 +27,10 @@ class _Runner(StageRunner[_Processor, str]):
 
     def compute(self) -> StageResult[str]:
         """Return the processor setting after runtime resolution."""
-        return StageResult(data=self.processor.configured_method)
+        return StageResult(
+            data=self.processor.configured_method,
+            audit=DatasetAuditPayload(),
+        )
 
     def export(self, result: StageResult[str]) -> None:
         """Avoid filesystem side effects in the lifecycle unit test."""
@@ -56,7 +60,7 @@ def test_runtime_override_wins_over_pipeline_value_and_clears_cache() -> None:
     ).run()
 
     assert result.data == "from_notebook"
-    assert processor.attrs["method"] == "from_notebook"
+    assert processor.config["method"] == "from_notebook"
 
 
 def test_runtime_override_rejects_unknown_configuration_key(
@@ -87,9 +91,10 @@ def test_compute_failure_does_not_create_output_directory(
     assert not output_dir.exists()
 
 
-def test_runner_records_explicit_render_context() -> None:
-    """Expose the lifecycle processor through the structured stage result."""
+def test_runner_does_not_attach_processor_to_stage_result() -> None:
+    """Keep live lifecycle processors outside the structured result."""
     processor = _Processor()
     result = _Runner(processor, output_dir=None).run()
 
-    assert result.render_context["processor"] is processor
+    assert not hasattr(result, "render_context")
+    assert result.data == "from_pipeline"

@@ -4,6 +4,80 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) for versioning.
 
+The 1.4.0 notes also document the framework-neutral boundaries introduced to make a future workflow-plugin or LLM-skill integration possible without adding Rachis, QIIME 2, or skill-runtime dependencies to the scientific core. These boundaries are intentional integration contracts, not a bundled plugin or skill implementation.
+
+## [1.4.0] - 2026-09-09
+
+> **Breaking architecture release:** 1.4.0 replaces the pandas-subclass-based `MetaboInt` model with an explicit, composition-based data model. It also establishes typed and serializable stage boundaries for native Python, workflow-plugin, and LLM-skill integrations. Code written against the former `MetaboInt` API must migrate to `MetaboDataset` and the new stage contracts.
+
+> **Integration rationale:** Relative to the v1.3.1 release, the v1.4.0 changes deliberately stabilize the data, stage, audit, plot-payload, and serialization boundaries needed by possible Rachis/QIIME 2 plugin and LLM-skill adapters. The adapters remain separate projects and are not required for native `pimqc` execution.
+
+### Added
+
+- **[Dataset actor]** Promoted `MetaboDatasetBuilder` to the recommended root-level construction actor. Its timed `run_build()` method uses the common compute/export/render lifecycle and returns `StageResult[MetaboDataset]` with `DatasetAuditPayload`; `compute_build()` prepares the same data and audit in memory.
+- **[Data model]** Added `MetaboDataset`, `DatasetSchema`, `ProcessingContext`, and `SampleRoleLabels` as explicit containers for the intensity matrix, sample metadata, feature metadata, schema, and processing context.
+- **[Stage contracts]** Added typed `AuditPayload` implementations for dataset construction, quality assessment, sample missingness filtering, feature missingness filtering, feature-quality filtering, correction, imputation, and normalization. Every action returns its data product and typed audit through `StageResult`.
+- **[Independent filtering]** Added `SampleMissingValueFilter`, `FeatureMissingValueFilter`, `FeatureQualityFilter`, and `FilteringOrchestrator` so the three filtering actions can run and be audited independently or be composed by the native pipeline.
+- **[Plotting contracts]** Added detached plot-payload snapshots and public audit renderers so plots can be reproduced without a live processor or a recalculation of scientific diagnostics.
+- **[QA comparison]** Added audit-driven patchworklib cross-stage QA dashboards for RSD, PCA, QC/batch correlation, and outliers. Each grid has a final independent legend brick, complete statistical outlier categories, data-dependent IS/ORF entries, consistent batch markers, and a half-brick-height correlation colorbar.
+- **[Serialization]** Added a versioned, checksummed, non-pickle directory artifact format for `MetaboDataset`, typed `AuditPayload`, and `PlotPayload` roots. Manifests record schema identity, members, sizes, and SHA-256 checksums; strict reads also reject unlisted files.
+- **[Native API reference]** Added a v1.4 reference covering public imports, explicit dataset construction, stage configuration, independent filtering, plotting payloads, serialization, reporting, and the migration boundary from v1.3.1.
+- **[Integration contracts]** Added framework-neutral object and serialization boundaries so future workflow-plugin and LLM-skill adapters can consume data products, typed audits, and plot-ready diagnostics without reconstructing hidden pandas state or importing execution-only caches.
+
+### Changed
+
+- **[Dataset entry point]** Migrated the native pipeline and tutorial to `MetaboDatasetBuilder.run_build()`, including report metrics from the builder's audit. The pipeline no longer assembles the raw dataset audit itself. `build_dataset()` remains a thin, data-only compatibility wrapper; raw CSV and acquisition-overview filenames are unchanged.
+- **[Architecture]** Migrated processors, pipeline orchestration, dataset construction, plotting, reporting, and tests to use ordinary pandas objects inside `MetaboDataset` rather than inherited DataFrame state.
+- **[Configuration]** Apply the same validated configuration schema and precedence rules to file loading, direct processor construction, and run-time overrides. Unknown and removed configuration fields now fail at the public boundary.
+- **[Diagnostics]** Compute sample-structure coordinates and scores before plotting and retain normalization QC variance/structure diagnostics for processor-free redraws. Final imputation structure diagnostics describe the completed matrix and remain distinct from masked reconstruction benchmarks.
+- **[Audit storage]** Store correction candidates/predictions and normalization selection passports once in their plot payloads; audit properties retain convenient read access without duplicate serialization.
+- **[Report QA]** Pass an ordered mapping of explicit QA audits to the patchworklib renderer instead of reading and stitching intermediate SVG files. Existing report asset keys and filenames are retained; the legacy SVG compositor remains disabled for reference during the transition.
+- **[Reporting]** Build comprehensive and brief narratives from `ReportInput`, validate local image references and Markdown table captions before export, and retain optional HTML/PDF generation as a report-layer concern.
+- **[Report layout]** Tuned the print stylesheet for A4 output with stable margins, typography, image aspect-ratio limits, table sizing, repeated table headers, and pagination guards while preserving portable Markdown layout.
+- **[Filtering artifacts]** Grouped sample- and feature-level missingness outputs under one Step 02 artifact directory while retaining their independent `StageResult` and typed Audit contracts.
+- **[Runtime timing]** Applied execution-time logging consistently to every complete stage lifecycle, including the independent filtering actions and normalization.
+- **[Runtime identity]** Report the installed `pi-metaboqc` version at the start of native pipeline, CLI, and interactive-notebook execution, and retain the same version in `ReportInput` metadata.
+- **[Tutorial]** Restored the optional IPython autoreload development utility, standardized tutorial filesystem assembly on `os.path.join`, and expanded stage documentation around data products, typed audits, skipped actions, QA interpretation, and plugin/skill hand-off boundaries.
+
+### Fixed
+
+- **[Filtering]** Corrected sample tracking to use schema-defined sample IDs and propagated the executed upstream sample threshold into the combined missingness audit.
+- **[Correction]** Preserved floating-point output matrices through skipped imputation, retained AUTO requests across repeated runs, removed training-prediction substitution for unavailable OOF evaluation, adapted QC-RLSC folds to available QC counts, and recorded validation availability, effective folds, coverage, and evaluation basis. AUTO selection records individual candidate failures and continues evaluating viable methods.
+- **[Imputation]** Normalized mechanism labels, rejected unknown labels and incomplete target outputs, distinguished MNAR-only execution from MAR benchmarking, and recorded pooled fallback fills. Metrics reflect completed execution even when queried before running.
+- **[Normalization]** Separated request configuration from execution metadata so repeated AUTO runs remain AUTO and early metric access cannot freeze pending values. Explicit random seeds propagate to the output dataset context.
+- **[Plotting payloads]** Detached nested array snapshots and moved correction QC-RSD and normalization RLE/significance calculations ahead of rendering.
+- **[Annotation layout]** Included opaque annotation background padding in candidate-size calculations instead of adding it only to the reported final rectangle; the annotation boundary regression passes in the local Python 3.10 native suite.
+- **[Reporting]** Supported array-valued report metadata, removed missing dashboard references and inaccurate MAR/MNAR narratives in degraded reports, and checked export status in CLI and tutorial callers. Retained WeasyPrint, XeLaTeX, and HTML fallback without automatically downloading or installing dependencies.
+- **[Reporting]** Removed isolated PDF dashboard headings, kept captions attached to their figures, and verified both comprehensive and brief reports with real WeasyPrint rendering for demo and no-missing datasets.
+- **[Pipeline]** Made filtering results explicit dataclass state and included sample filtering in the stage-results mapping.
+- **[Configuration]** Validated constructor and runtime settings consistently with file configuration, including method casing, thresholds, worker counts, explicit joblib batch sizes, and numeric SVR gamma.
+- **[Documentation]** Synchronized the native API reference and README with the current execution contracts and report dependency/fallback behavior.
+- **[Testing]** Repaired source-quality gates and added native regression and isolated installed-wheel checks before release publication. Push, pull-request, and manual validation runs do not publish packages; publishing remains restricted to published Release events.
+- **[Testing]** Performed local PDF checks for A4 page bounds, replacement glyphs, caption numbering, image references, and rendered-page visual inspection.
+- **[Test discovery]** Restricted default pytest discovery to unit, integration, and quality suites so optional reference configuration does not import R/rpy2 during native testing. Removed the global reference-marker exclusion; cross-language checks remain explicitly selectable with `pytest tests/reference`.
+- **[Package validation]** Replaced the hardcoded release-version assertion in the installed-wheel check with a comparison against distribution metadata, avoiding workflow edits for each version increment.
+- **[Validation]** Passed all 231 default native tests on Windows with Python 3.10.21, together with Ruff, dependency-consistency, and installed-wheel import/resource checks. The maintainer also confirmed all 10 R/rpy2 reference tests across eight bridge scripts passed in the Windows Python 3.13.13 `metaboqc` environment. These local results do not establish a successful remote CI or PyPI publication.
+- **[Assessment context]** Added an explicit assessment context-update boundary and cache invalidation so framework adapters can restore stage and log-scale semantics before scale-sensitive QA is calculated, without resetting configured correlation, scaling, or outlier settings.
+- **[Saved diagnostics]** Prevented plot-only redraws from recomputing sample distances, structure-preservation scores, normalization QC diagnostics, or method-selection evidence.
+- **[Report assets]** Kept the four cross-stage QA dashboard names stable while avoiding stale or duplicated per-stage SVG composition during final report generation.
+- **[Imputation]** Fixed AUTO MAR candidate evaluation crashes when KNNImputer received a feature with all values missing in an isolated QC or sample subset. The implementation now preserves feature dimensions and index alignment across supported scikit-learn versions, restores observed values, and applies a conservative log-space fallback for all-missing features.
+- **[QA dashboard fallback]** Reworked the no-actionable-outlier-bar assessment dashboard as a native patchworklib 2 x 2 composition: heatmap/PCA and RSD/outlier bricks are first assembled into two horizontal rows and then stacked vertically without automatic brick stretching; the heatmap body remains square, the RSD plot uses the same effective content width as the heatmap, and the complete outlier scatter legend is mounted in the right-hand lane of its own brick using the PCA-style grouped-legend layout instead of a standalone legend brick.
+- **[Extreme-data visualization]** Hid outlier barplots that contain no actionable information; placed fixed-width sample-correlation batch annotation strips flush against the heatmap with tick labels outside the strips and no crossing tick marks; centered short sample and batch labels, wrapped longer labels only at safe separators without splitting words or identifiers, and applied the same renderer-aware policy to inter-batch heatmaps; applied one shared fontsize rule to scientific offset text and logarithmic ticks; resolved Blank/QC axes independently with display margins so zero-valued markers remain fully visible and extreme blank intensities no longer compress the QC range.
+
+### Removed
+
+- **[Legacy data model]** Removed `MetaboInt` and its related compatibility adapters. This release does not provide a backward-compatibility wrapper for the former DataFrame-subclass API.
+- **[Implicit state]** Removed cross-stage contracts based on `DataFrame.attrs`, shared mutable processor statistics, and other hidden in-memory state.
+- **[Legacy result contracts]** Removed generic `StageResult` metrics, candidates, metadata, and audit-table dictionaries together with `LegacyAuditPayload`. Consumers must use each stage's typed audit fields through `result.audit`.
+
+### Breaking Changes
+
+- Public processing inputs and outputs now use `MetaboDataset` and typed `StageResult`/`AuditPayload` contracts.
+- Custom plotting code must construct or consume the corresponding plot payload instead of reading mutable processor internals.
+- `StageResult` is an in-memory composition boundary rather than a serialized artifact root. Persist `result.data` and `result.audit`; the audit already owns its plot payload.
+- Serialized 1.4 dataset, Audit, and plot-payload artifacts use the new versioned directory format and are not interchangeable with ad hoc or pickled files from earlier releases.
+- Removed and misspelled configuration fields are rejected instead of being translated or ignored.
+
 ## [1.3.1] - 2026-08-19
 
 ### Fixed

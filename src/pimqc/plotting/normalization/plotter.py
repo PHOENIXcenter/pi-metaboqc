@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from ..base import BasePlotter
 from .. import plot_utils as pu
+from ..payloads import NormalizationPlotPayload
 from .dashboards import NormalizationDashboardMixin
 from .diagnostics import NormalizationDiagnosticsMixin
 from .scorecards import NormalizationScorecardMixin
@@ -21,11 +22,15 @@ class NormalizationPlotter(
 ):
     """Plotting suite for normalization evaluation and selection."""
 
-    def __init__(self, raw_obj, norm_obj) -> None:
-        """Initialize with pre- and post-normalization matrices."""
-        super().__init__(metabo_obj=norm_obj)
-        self.raw = raw_obj
-        self.norm = norm_obj
+    def __init__(self, payload: NormalizationPlotPayload) -> None:
+        """Initialize from processor-free normalization plot inputs."""
+        if not isinstance(payload, NormalizationPlotPayload):
+            raise TypeError(
+                "NormalizationPlotter requires NormalizationPlotPayload."
+            )
+        super().__init__(payload=payload)
+        self.raw = payload.raw_data.annotated_frame()
+        self.norm = payload.normalized_data.annotated_frame()
         self.stages = [("Before Norm", self.raw), ("After Norm", self.norm)]
         self.pal = {
             "Before Norm": pu.NEUTRAL_COLOR,

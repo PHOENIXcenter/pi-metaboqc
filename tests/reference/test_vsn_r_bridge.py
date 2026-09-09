@@ -2,7 +2,7 @@
 Script purpose: Compare Python VSN normalization with the R Bioconductor path.
 
 This bridge test executes vsn2 through rpy2 and compares the transformed matrix
-with MetaboIntNormalizer.calc_vsn_normalization(). Because the Python
+with DataNormalizer.calc_vsn_normalization(). Because the Python
 implementation may apply a constant alignment shift, the assertion focuses on
 Pearson correlation, which captures structural equivalence while remaining
 invariant to additive offsets.
@@ -17,7 +17,7 @@ from rpy2.robjects import pandas2ri
 from rpy2.robjects.conversion import localconverter
 from scipy.stats import pearsonr
 
-from pimqc.processing.normalization import MetaboIntNormalizer
+from pimqc.processing.normalization import DataNormalizer
 
 from .helpers import require_r_package
 
@@ -57,7 +57,7 @@ def test_vsn_equivalence(mock_ms_data: pd.DataFrame) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         # Keep the transformed matrix; metadata is not part of this comparison.
-        df_py_norm, _ = MetaboIntNormalizer.calc_vsn_normalization(df_raw)
+        df_py_norm, _ = DataNormalizer.calc_vsn_normalization(df_raw)
 
     df_r_norm = run_r_vsn(df_raw)
 

@@ -350,11 +350,17 @@ class FilteringDiagnosticsMixin:
             f"QC intensity <= {pu.format_percentile_label(mnar_intensity_pct)}"
         )
 
+        has_group_info = (
+            "Min_Group_MV_Pct" in df_plot.columns
+            and df_plot["Min_Group_MV_Pct"].notna().any()
+        )
+
         def _determine_status(row: pd.Series) -> str:
             if "QC" in row["Stage1_Status"]:
                 return "MNAR (QC)"
             elif (
-                (row["QC_MV_Pct"] > mnar_qc_mv_tol * 100)
+                has_group_info
+                and (row["QC_MV_Pct"] > mnar_qc_mv_tol * 100)
                 and (mnar_int_threshold is not None)
                 and (row["Log2_Intensity"] <= mnar_int_threshold)
             ):
@@ -365,7 +371,6 @@ class FilteringDiagnosticsMixin:
         df_plot["Step_Status"] = df_plot.apply(_determine_status, axis=1)
         df_plot = df_plot.sort_values(by="Step_Status", ascending=False)
 
-        has_group_info = "Min_Group_MV_Pct" in df_plot.columns
         if has_group_info:
             raw_sizes = (
                 df_plot["Min_Group_MV_Pct"].fillna(0).to_numpy(dtype=float)
@@ -484,17 +489,6 @@ class FilteringDiagnosticsMixin:
             mlines.Line2D(
                 [],
                 [],
-                color=color_blocked,
-                marker="v",
-                linestyle="",
-                label="Blocked",
-                markeredgecolor="k",
-                markersize=pu.DEFAULT_LEGEND_MARKER_SIZE,
-                markeredgewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
-            ),
-            mlines.Line2D(
-                [],
-                [],
                 color=color_pending,
                 marker="o",
                 linestyle="",
@@ -504,6 +498,22 @@ class FilteringDiagnosticsMixin:
                 markeredgewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
             ),
         ]
+
+        if has_group_info:
+            handles.insert(
+                2,
+                mlines.Line2D(
+                    [],
+                    [],
+                    color=color_blocked,
+                    marker="v",
+                    linestyle="",
+                    label="Blocked",
+                    markeredgecolor="k",
+                    markersize=pu.DEFAULT_LEGEND_MARKER_SIZE,
+                    markeredgewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
+                ),
+            )
 
         group_titles = ["Status"]
 
@@ -604,6 +614,7 @@ class FilteringDiagnosticsMixin:
         title: str,
         x_label: str,
         article_compact: bool = False,
+        threshold_label: str = "Min group MV",
     ) -> None:
         """Generic histogram using explicit bar patches for vector editing."""
         if df.empty:
@@ -686,7 +697,7 @@ class FilteringDiagnosticsMixin:
         al.annotate_reference_line(
             ax=ax,
             value=tol * 100,
-            text=f"Min group MV = {tol * 100:.0f}%",
+            text=f"{threshold_label} = {tol * 100:.0f}%",
             orientation="vertical",
             occupancy_artists=list(ax.patches),
         )
@@ -723,7 +734,11 @@ class FilteringDiagnosticsMixin:
         ]
         step_labels = [
             "Raw\nData",
-            "High-MV\nCheck",
+            (
+                "High-MV\nSkipped"
+                if stats.get("feature_mv_status") == "skipped"
+                else "High-MV\nCheck"
+            ),
             "QC/Blank\nCheck",
             "QC RSD\nCheck",
         ]
@@ -745,14 +760,27 @@ class FilteringDiagnosticsMixin:
         idx_mnar = stats.get("idx_mnar", pd.Index([]))
         idx_dropped_blank = stats.get("idx_dropped_blank", pd.Index([]))
         idx_dropped_rsd = stats.get("idx_dropped_rsd", pd.Index([]))
+        quality_only = stats.get("quality_filter_mode") == "quality_only"
 
-        mar_base = len(idx_mar)
-        mnar_base = len(idx_mnar)
-
-        blank_drop_mar = len(idx_dropped_blank.intersection(idx_mar))
-        blank_drop_mnar = len(idx_dropped_blank.intersection(idx_mnar))
-        rsd_drop_mar = len(idx_dropped_rsd.intersection(idx_mar))
-        rsd_drop_mnar = len(idx_dropped_rsd.intersection(idx_mnar))
+        # In an independent quality action no MAR/MNAR labels exist.  Render
+        # one explicit quality-only series instead of presenting all input
+        # features as synthetic MAR.
+        if quality_only:
+            mar_base = int(stats.get("quality_pre_stage2_count", 0))
+            mnar_base = 0
+            blank_drop_mar = len(idx_dropped_blank)
+            blank_drop_mnar = 0
+            rsd_drop_mar = len(idx_dropped_rsd)
+            rsd_drop_mnar = 0
+            quality_label = "Quality-only"
+        else:
+            mar_base = len(idx_mar)
+            mnar_base = len(idx_mnar)
+            blank_drop_mar = len(idx_dropped_blank.intersection(idx_mar))
+            blank_drop_mnar = len(idx_dropped_blank.intersection(idx_mnar))
+            rsd_drop_mar = len(idx_dropped_rsd.intersection(idx_mar))
+            rsd_drop_mnar = len(idx_dropped_rsd.intersection(idx_mnar))
+            quality_label = "MAR"
 
         mar_all = np.array(
             [
@@ -794,7 +822,7 @@ class FilteringDiagnosticsMixin:
                 x,
                 mar_counts,
                 bottom=current_bottom,
-                label="MAR",
+                label=quality_label,
                 color=color_mar,
                 edgecolor="k",
                 width=width,
@@ -888,32 +916,48 @@ class FilteringDiagnosticsMixin:
         qc_mean = self.audit_tables.get("qc_mean")
 
         idx_mnar = pd.Index(self.audit_tables.get("idx_mnar", []))
+        quality_only = (
+            self.audit_tables.get("quality_filter_mode") == "quality_only"
+        )
 
-        if blank_mean is None or qc_mean is None or blank_mean.empty:
+        if (
+            blank_mean is None
+            or qc_mean is None
+            or blank_mean.empty
+            or qc_mean.empty
+        ):
             return None if ax is None else ax
 
-        # Prepare data frame for plotting (treat missing blanks as 0)
-        blank_safe = blank_mean.fillna(0).astype(float)
+        # Prepare data frame for plotting (treat missing blanks as 0). Convert
+        # explicitly before filling so pandas does not silently downcast an
+        # object series (a behavior deprecated in recent pandas releases).
+        blank_safe = pd.to_numeric(blank_mean, errors="coerce")
+        qc_values = pd.to_numeric(qc_mean, errors="coerce")
 
         df_plot = pd.DataFrame(
             {
-                "QC": np.log2(qc_mean.astype(float) + 1),
-                "Blank": np.log2(blank_safe + 1),
+                "QC": np.log2(qc_values + 1),
+                "Blank": np.log2(blank_safe.fillna(0.0) + 1),
             }
-        )
+        ).replace([np.inf, -np.inf], np.nan).dropna(subset=["QC", "Blank"])
+        if df_plot.empty:
+            return None if ax is None else ax
 
-        df_plot["Feature Type"] = "MAR"
+        df_plot["Feature Type"] = "UNCLASSIFIED" if quality_only else "MAR"
         valid_mnar = idx_mnar.intersection(df_plot.index)
         if not valid_mnar.empty:
             df_plot.loc[valid_mnar, "Feature Type"] = "MNAR"
 
         # Use blank_safe for ratios to match the filtering engine.
         # NaN <= 0.2 evaluates to False, falsely flagging them as Filtered.
-        blank_qc_ratio_tol = self.engine.attrs.get("blank_qc_ratio_tol", 0.2)
-        qc_safe = qc_mean.replace(0, np.finfo(float).eps).astype(float)
+        blank_qc_ratio_tol = self.payload.blank_qc_ratio_tolerance
+        qc_safe = qc_values.replace(0, np.finfo(float).eps)
+        ratio = blank_safe / qc_safe
 
         df_plot["Status"] = np.where(
-            blank_safe / qc_safe <= blank_qc_ratio_tol, "Retained", "Filtered"
+            ratio.reindex(df_plot.index) <= blank_qc_ratio_tol,
+            "Retained",
+            "Filtered",
         )
 
         # Sort DataFrame so MNAR points remain visible on top.
@@ -942,7 +986,11 @@ class FilteringDiagnosticsMixin:
                 "Filtered": pu.PRIMARY_ACCENT_COLOR,
             },
             style="Feature Type",
-            markers={"MAR": "o", "MNAR": "X"},
+            markers={
+                "MAR": "o",
+                "MNAR": "X",
+                "UNCLASSIFIED": "o",
+            },
             s=(
                 pu.DEFAULT_COMPACT_SCATTER_MARKER_AREA
                 if article_compact
@@ -952,14 +1000,40 @@ class FilteringDiagnosticsMixin:
             linewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
         )
 
-        lims = [
-            np.min([current_ax.get_xlim(), current_ax.get_ylim()]),
-            np.max([current_ax.get_xlim(), current_ax.get_ylim()]),
-        ]
-        x_line = np.linspace(max(0, lims[0]), lims[1], 200)
+        # X and Y use the same log2 intensity units but represent different
+        # quantities.  Resolve their limits independently; using the union
+        # of both ranges can expand the QC axis to match one extreme Blank
+        # value and make the panel mostly empty.
+        x_values = df_plot["QC"].to_numpy(dtype=float)
+        y_values = df_plot["Blank"].to_numpy(dtype=float)
+
+        def _data_limits(values: np.ndarray) -> tuple[float, float]:
+            value_min = float(np.nanmin(values))
+            value_max = float(np.nanmax(values))
+            span = max(value_max - value_min, 1.0)
+            padding = max(span * 0.05, 0.5)
+            # A display margin may extend slightly below the non-negative
+            # log2 domain.  Keeping the lower limit exactly at zero clips
+            # half of every marker whose Blank or QC mean is zero.
+            return value_min - padding, value_max + padding
+
+        x_limits = _data_limits(x_values)
+        y_limits = _data_limits(y_values)
+        current_ax.set_xlim(*x_limits)
+        current_ax.set_ylim(*y_limits)
+        # The visual margin can be negative, but the cutoff relationship is
+        # defined only for non-negative log2(mean + 1) intensities.
+        x_line = np.linspace(max(0.0, x_limits[0]), x_limits[1], 200)
+        y_line = np.log2(
+            ((2**x_line - 1) * blank_qc_ratio_tol) + 1
+        )
+        if np.isfinite(y_line).any() and np.nanmax(y_line) > y_limits[1]:
+            current_ax.set_ylim(
+                y_limits[0], max(y_limits[1], float(np.nanmax(y_line)) + 0.5)
+            )
         current_ax.plot(
             x_line,
-            np.log2(((2**x_line - 1) * blank_qc_ratio_tol) + 1),
+            y_line,
             color="k",
             linestyle="--",
             linewidth=pu.DEFAULT_GUIDE_LINEWIDTH,
@@ -1090,7 +1164,10 @@ class FilteringDiagnosticsMixin:
             fig = current_ax.figure
         pu.mark_preserve_alpha(current_ax)
 
-        qc_rsd_tol = self.engine.attrs.get("qc_rsd_tol", 0.3)
+        qc_rsd_tol = self.payload.qc_rsd_tolerance
+        quality_only = (
+            self.audit_tables.get("quality_filter_mode") == "quality_only"
+        )
         mar_rsd = qc_rsd_all.loc[
             qc_rsd_all.index.intersection(idx_mar)
         ].dropna()
@@ -1125,7 +1202,11 @@ class FilteringDiagnosticsMixin:
                 facecolor=mar_color,
                 edgecolor="k",
                 linewidth=pu.DEFAULT_AXIS_LINEWIDTH,
-                label="MAR features",
+                label=(
+                    "Quality-only input features"
+                    if quality_only
+                    else "MAR features"
+                ),
             ),
         ]
 

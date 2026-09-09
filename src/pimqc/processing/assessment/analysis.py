@@ -1,11 +1,12 @@
-"""Stage-wise quality-assessment calculations for MetaboInt datasets.
+"""Stage-wise quality-assessment calculations for metabolomics datasets.
 
-MetaboIntAssessor computes QC and batch consistency, RSD distributions, PCA
+QualityAssessor computes QC and batch consistency, RSD distributions, PCA
 structure, multivariate outliers, and internal-standard or reference-feature
 flags. It materializes reusable assessment metrics and tables for raw data and
 for each processed stage before their visual summaries are generated.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, Dict, Optional, Union
@@ -16,9 +17,11 @@ from loguru import logger
 
 from ...config import resolve_stage_config
 from ...constants import DEFAULT_RANDOM_SEED
-from ...core import model
+from ...core import DatasetProcessor, MetaboDataset
+from ...plotting.payloads import AssessmentPlotPayload, snapshot_dataset
 from ...runtime import log_execution_time
 from ...statistics import pca as pca_utils
+from ..audit import AssessQualityAuditPayload
 from ..stage import StageResult
 
 
@@ -48,11 +51,9 @@ class AssessmentDiagnostics:
     outlier_reference_data: pd.DataFrame | None = None
 
 
-class MetaboIntAssessor(model.MetaboInt):
+class QualityAssessor(DatasetProcessor):
     """Data quality assessment computational class for metabolomics."""
 
-    # Register "stats" for pandas metadata propagation
-    _metadata = ["attrs", "stats"]
     _RUNTIME_CONFIG_KEYS = frozenset(
         {
             "corr_method",
@@ -64,37 +65,31 @@ class MetaboIntAssessor(model.MetaboInt):
 
     def __init__(
         self,
-        *args: object,
+        data: MetaboDataset,
         pipeline_params: Optional[Dict[str, Any]] = None,
         corr_method: Optional[str] = None,
         scaling_method: Optional[str] = None,
         is_outlier_threshold: Optional[Union[float, int]] = None,
         orf_outlier_threshold: Optional[Union[float, int]] = None,
-        **kwargs: object,
     ) -> None:
         """Initialize the data quality assessment class.
 
         Args:
-            *args: Variable arguments passed to pandas DataFrame.
+            data: Explicit dataset to assess.
             pipeline_params: Global configuration dictionary.
             corr_method: Method for correlation (e.g., 'Spearman').
             scaling_method: Scaling method for PCA (e.g., 'Pareto-scaling').
             is_outlier_threshold: Threshold for Internal Standard outliers.
             orf_outlier_threshold: Threshold for Outlier Reference Features.
-            **kwargs: Extra arguments passed to pandas DataFrame.
         """
-        super().__init__(*args, pipeline_params=pipeline_params, **kwargs)
-
-        # Initialize local state cache for heavy computational results
-        if not hasattr(self, "stats"):
-            self.stats = {}
+        super().__init__(data)
 
         configs = resolve_stage_config(
             pipeline_params,
-            "MetaboIntAssessor",
+            "QualityAssessor",
             {
                 "corr_method": "Spearman",
-                "scaling_method": "Pareto-scaling",
+                "scaling_method": "Auto-scaling",
                 "is_outlier_threshold": 0.75,
                 "orf_outlier_threshold": 0.5,
             },
@@ -107,12 +102,7 @@ class MetaboIntAssessor(model.MetaboInt):
         )
 
         # Flatten strictly into lifecycle attributes (SSOT)
-        self.attrs.update(configs)
-
-    @property
-    def _constructor(self) -> type["MetaboIntAssessor"]:
-        """Override constructor to return MetaboIntAssessor."""
-        return MetaboIntAssessor
+        self.config.update(configs)
 
     # =========================================================================
     # Cached Statistical Calculations
@@ -124,8 +114,8 @@ class MetaboIntAssessor(model.MetaboInt):
         Calculates and natively caches the QC sample correlation matrix.
         Relies on internal instance state to avoid unhashable DataFrame args.
         """
-        method = self.attrs.get("corr_method", "Spearman")
-        qc_data = self._qc
+        method = self.config.get("corr_method", "Spearman")
+        qc_data = self.qc_data
 
         if qc_data.empty:
             return pd.DataFrame()
@@ -140,8 +130,8 @@ class MetaboIntAssessor(model.MetaboInt):
         if corr_mat.empty:
             return pd.DataFrame()
 
-        batch = self.attrs.get("batch", "Batch")
-        batches = self._qc.columns.get_level_values(batch)
+        batch = self.config.get("batch", "Batch")
+        batches = self.qc_data.columns.get_level_values(batch)
 
         # Compress rows and columns sequentially to extract medians
         batch_corr = corr_mat.groupby(batches).median()
@@ -154,8 +144,8 @@ class MetaboIntAssessor(model.MetaboInt):
     @cached_property
     def rsd_distribution(self) -> dict[str, dict[str, int]]:
         """Calculates and caches the RSD distribution for QA reporting."""
-        sample_type = self.attrs.get("sample_type", "Sample Type")
-        actual_label = self.attrs.get("sample_dict", {}).get(
+        sample_type = self.config.get("sample_type", "Sample Type")
+        actual_label = self.config.get("sample_dict", {}).get(
             "Actual sample", "Sample"
         )
 
@@ -168,7 +158,7 @@ class MetaboIntAssessor(model.MetaboInt):
             # State-Aware Pseudo-linearization (The Magic Trick)
             # Restore exponential distribution to calculate meaningful RSD
             # =================================================================
-            if self.attrs.get("is_logged", False):
+            if self.config.get("is_logged", False):
                 # Use exp2 to reverse both robust_log and approximate VSN glog.
                 # Since RSD(C*X) == RSD(X), the constants don't affect the
                 # ratio.
@@ -192,31 +182,31 @@ class MetaboIntAssessor(model.MetaboInt):
             return {label: int(dist_dict.get(label, 0)) for label in labels}
 
         actual_sample_mask = (
-            self.columns.get_level_values(sample_type) == actual_label
+            self.frame.columns.get_level_values(sample_type) == actual_label
         )
 
         return {
-            "qc": _get_dist(self._qc),
-            "actual": _get_dist(self.loc[:, actual_sample_mask]),
+            "qc": _get_dist(self.qc_data),
+            "actual": _get_dist(self.frame.loc[:, actual_sample_mask]),
         }
 
     @cached_property
     def pca_res(self) -> dict[str, Any]:
         """Execute PCA workflow, outlier detection, and diagnostic metrics."""
-        sample_type = self.attrs.get("sample_type", "Sample Type")
-        sample_name = self.attrs.get("sample_name", "Sample Name")
-        batch = self.attrs.get("batch", "Batch")
+        sample_type = self.config.get("sample_type", "Sample Type")
+        sample_name = self.config.get("sample_name", "Sample Name")
+        batch = self.config.get("batch", "Batch")
 
-        sample_dict = self.attrs.get("sample_dict", {})
+        sample_dict = self.config.get("sample_dict", {})
         qc_label = sample_dict.get("QC sample", "QC")
         actual_label = sample_dict.get("Actual sample", "Sample")
 
         # Extract scaling method from Assessor configurations
-        s_method = self.attrs.get("scaling_method", "Pareto-scaling")
+        s_method = self.config.get("scaling_method", "Pareto-scaling")
 
         # Automatically extract features from internal state with JIT scaling
         features, labels = pca_utils.PCAEngine.extract_features(
-            metabo_obj=self,
+            annotated_data=self.frame,
             sample_type=sample_type,
             sample_name=sample_name,
             actual_label=actual_label,
@@ -225,7 +215,7 @@ class MetaboIntAssessor(model.MetaboInt):
         )
 
         # Initialize PCA engine with strict statistical bounds
-        _seed = self.attrs.get("global_seed", DEFAULT_RANDOM_SEED)
+        _seed = self.config.get("global_seed", DEFAULT_RANDOM_SEED)
         engine = pca_utils.PCAEngine(
             n_components=2, alpha=0.05, od_method="box", global_seed=_seed
         )
@@ -293,26 +283,30 @@ class MetaboIntAssessor(model.MetaboInt):
         """
         feat_type_lower = feat_type.lower()
         feat_type_upper = feat_type.upper()
-        valid_feats = getattr(self, f"valid_{feat_type_lower}", [])
+        valid_feats = (
+            self.valid_internal_standards
+            if feat_type_lower == "is"
+            else self.valid_outlier_reference_features
+        )
 
         if not valid_feats:
             return pd.DataFrame()
 
         # Extract subset intensity matrix using the inherited method
-        df_ref = self.int_order_info(feat_type=feat_type)
-        bound_type = self.attrs.get("boundary", "IQR")
+        df_ref = self.intensity_order_info(feature_type=feat_type)
+        bound_type = self.config.get("boundary", "IQR")
 
         # Dynamically retrieve threshold with type-specific default fallbacks
         default_thresh = 0.75 if feat_type_lower == "is" else 0.5
         threshold_key = f"{feat_type_lower}_outlier_threshold"
-        raw_threshold = self.attrs.get(threshold_key, default_thresh)
+        raw_threshold = self.config.get(threshold_key, default_thresh)
 
         # Evaluate boundaries per individual reference feature
         res_dict = {}
         for feat in valid_feats:
             # Perfectly leveraging your inherited static method
             solid, lower, upper = self.calculate_boundaries(
-                x=df_ref[feat].values, boundary_type=bound_type
+                values=df_ref[feat].values, boundary_type=bound_type
             )
             res_dict[f"Outliers ({feat})"] = (df_ref[feat] < lower) | (
                 df_ref[feat] > upper
@@ -352,29 +346,27 @@ class MetaboIntAssessor(model.MetaboInt):
         self,
     ) -> StageResult[AssessmentDiagnostics]:
         """Compute QA diagnostics without writing files or rendering figures."""
-        if self.empty:
+        if self.frame.empty:
             logger.warning(
                 "Empty matrix detected. Terminating QA assessment execution."
             )
             return StageResult(
                 data=AssessmentDiagnostics(),
-                metrics={},
-                candidates=pd.DataFrame(),
-                metadata={"skipped": True},
+                audit=AssessQualityAuditPayload(skipped=True),
             )
 
-        sample_type = self.attrs.get("sample_type", "Sample Type")
-        batch = self.attrs.get("batch", "Batch")
-        inject_order = self.attrs.get("inject_order", "Inject Order")
-        sample_name = self.attrs.get("sample_name", "Sample Name")
+        sample_type = self.config.get("sample_type", "Sample Type")
+        batch = self.config.get("batch", "Batch")
+        inject_order = self.config.get("inject_order", "Inject Order")
+        sample_name = self.config.get("sample_name", "Sample Name")
 
-        sample_dict = self.attrs.get("sample_dict", {})
+        sample_dict = self.config.get("sample_dict", {})
         qc_label = sample_dict.get("QC sample", "QC")
         actual_label = sample_dict.get("Actual sample", "Sample")
 
-        corr_method = self.attrs.get("corr_method", "Spearman")
-        bound_type = self.attrs.get("boundary", "IQR")
-        qc_data = self._qc
+        corr_method = self.config.get("corr_method", "Spearman")
+        bound_type = self.config.get("boundary", "IQR")
+        qc_data = self.qc_data
 
         corr_mat = self.qc_corr_matrix
         batch_corr = self.batch_qc_corr_matrix
@@ -438,8 +430,8 @@ class MetaboIntAssessor(model.MetaboInt):
                 .astype(bool)
             )
 
-        valid_is = tuple(self.valid_is)
-        valid_orf = tuple(self.valid_orf)
+        valid_is = tuple(self.valid_internal_standards)
+        valid_orf = tuple(self.valid_outlier_reference_features)
         diagnostics = AssessmentDiagnostics(
             qc_correlation=corr_mat,
             batch_qc_correlation=batch_corr,
@@ -451,10 +443,14 @@ class MetaboIntAssessor(model.MetaboInt):
             internal_standard_flags=is_flags,
             outlier_reference_flags=orf_flags,
             internal_standard_data=(
-                self.int_order_info(feat_type="IS") if valid_is else None
+                self.intensity_order_info(feature_type="IS")
+                if valid_is
+                else None
             ),
             outlier_reference_data=(
-                self.int_order_info(feat_type="ORF") if valid_orf else None
+                self.intensity_order_info(feature_type="ORF")
+                if valid_orf
+                else None
             ),
         )
         qc_mask = np.triu(
@@ -463,22 +459,35 @@ class MetaboIntAssessor(model.MetaboInt):
         )
         return StageResult(
             data=diagnostics,
-            metrics=self.assessment_metrics,
-            candidates=outliers_export,
-            metadata={
-                "skipped": False,
-                "sample_type": sample_type,
-                "batch": batch,
-                "inject_order": inject_order,
-                "qc_label": qc_label,
-                "actual_label": actual_label,
-                "correlation_method": corr_method,
-                "boundary_type": bound_type,
-                "qc_batches": qc_data.columns.get_level_values(batch).unique(),
-                "qc_mask": qc_mask,
-                "valid_is": valid_is,
-                "valid_orf": valid_orf,
-            },
+            audit=AssessQualityAuditPayload(
+                metric_values=self.assessment_metrics,
+                outliers=outliers_export,
+                qc_correlation=corr_mat,
+                batch_qc_correlation=batch_corr,
+                pca_results=pca_result,
+                rsd_distribution=rsd_data,
+                internal_standard_flags=is_flags,
+                outlier_reference_flags=orf_flags,
+                internal_standard_data=diagnostics.internal_standard_data,
+                outlier_reference_data=diagnostics.outlier_reference_data,
+                skipped=False,
+                sample_type_column=sample_type,
+                sample_name_column=sample_name,
+                batch_column=batch,
+                injection_order_column=inject_order,
+                qc_label=qc_label,
+                actual_label=actual_label,
+                correlation_method=corr_method,
+                boundary_type=bound_type,
+                qc_batches=qc_data.columns.get_level_values(batch).unique(),
+                qc_correlation_mask=qc_mask,
+                internal_standard_ids=valid_is,
+                outlier_reference_ids=valid_orf,
+                plot_payload=AssessmentPlotPayload(
+                    data=snapshot_dataset(self.dataset),
+                    is_multi_batch=bool(self.dataset.is_multi_batch),
+                ),
+            ),
         )
 
     @log_execution_time
@@ -486,6 +495,7 @@ class MetaboIntAssessor(model.MetaboInt):
         self,
         output_dir: str | None = None,
         legend_mode: str = "external",
+        context_updates: Mapping[str, object] | None = None,
         **runtime_overrides: object,
     ) -> StageResult[AssessmentDiagnostics]:
         """Compute, export, and render QA diagnostics through a stage runner.
@@ -498,9 +508,21 @@ class MetaboIntAssessor(model.MetaboInt):
         """
         from .runner import AssessmentStageRunner
 
+        if context_updates:
+            self.dataset = self.dataset.with_intensity(
+                self.dataset.intensity,
+                context_updates=dict(context_updates),
+            )
+            self.frame = self.dataset.annotated_frame()
+            self.config.update(self.dataset.settings())
+            # Assessment properties are cached on the processor.  A context
+            # update changes the scale/stage semantics used by PCA and RSD,
+            # so none of those cached values may survive the update.
+            self._invalidate_cached_properties()
+
         # Preserve the previous empty-input behavior: validate and compute, but
         # do not create an otherwise empty artifact directory.
-        effective_output_dir = None if self.empty else output_dir
+        effective_output_dir = None if self.frame.empty else output_dir
         return AssessmentStageRunner(
             self,
             effective_output_dir,
@@ -519,7 +541,7 @@ class MetaboIntAssessor(model.MetaboInt):
         import numpy as np
 
         metrics = {
-            "method": self.attrs.get("corr_method", "Spearman"),
+            "method": self.config.get("corr_method", "Spearman"),
             "sample_level": {},
             "batch_level": {"is_multi_batch": False},
         }
@@ -580,14 +602,14 @@ class MetaboIntAssessor(model.MetaboInt):
         Aggregates partitioned correlation medians, PCA variance, outlier
         counts, and RSD distribution.
         """
-        if self.empty:
+        if self.frame.empty:
             return {}
 
-        sample_type = self.attrs.get("sample_type", "Sample Type")
-        batch = self.attrs.get("batch", "Batch")
-        sample_name = self.attrs.get("sample_name", "Sample Name")
+        sample_type = self.config.get("sample_type", "Sample Type")
+        batch = self.config.get("batch", "Batch")
+        sample_name = self.config.get("sample_name", "Sample Name")
 
-        sample_dict = self.attrs.get("sample_dict", {})
+        sample_dict = self.config.get("sample_dict", {})
         actual_label = sample_dict.get("Actual sample", "Sample")
 
         metrics = {
@@ -598,7 +620,7 @@ class MetaboIntAssessor(model.MetaboInt):
         }
 
         # Pooled QC Correlation Metrics
-        qc_data = self._qc
+        qc_data = self.qc_data
         if not qc_data.empty:
             corr_mat = self.qc_corr_matrix
             batch_corr = self.batch_qc_corr_matrix
@@ -610,7 +632,7 @@ class MetaboIntAssessor(model.MetaboInt):
                 qc_batch_labels=qc_batch_labels,
             )
         else:
-            metrics["correlation"]["method"] = self.attrs.get(
+            metrics["correlation"]["method"] = self.config.get(
                 "corr_method", "Spearman"
             )
 
@@ -623,7 +645,7 @@ class MetaboIntAssessor(model.MetaboInt):
                 return float(val) if pd.notna(val) else None
 
             metrics["pca"] = {
-                "scaling_method": self.attrs.get(
+                "scaling_method": self.config.get(
                     "scaling_method", "Auto-scaling"
                 ),
                 "pc1_variance": float(res["pca_variance"]["PC1"]),
@@ -668,9 +690,9 @@ class MetaboIntAssessor(model.MetaboInt):
             if not is_df.empty:
                 is_out_mask = is_df["IS_Outlier_Flag"]
 
-                valid_is = getattr(self, "valid_is", [])
+                valid_is = self.valid_internal_standards
                 total_is = len(valid_is)
-                is_raw_threshold = self.attrs.get("is_outlier_threshold", 0.75)
+                is_raw_threshold = self.config.get("is_outlier_threshold", 0.75)
 
                 if isinstance(is_raw_threshold, float) and (
                     0.0 <= is_raw_threshold <= 1.0
@@ -706,9 +728,11 @@ class MetaboIntAssessor(model.MetaboInt):
             if not orf_df.empty:
                 orf_out_mask = orf_df["ORF_Outlier_Flag"]
 
-                valid_orf = getattr(self, "valid_orf", [])
+                valid_orf = self.valid_outlier_reference_features
                 total_orf = len(valid_orf)
-                orf_raw_threshold = self.attrs.get("orf_outlier_threshold", 0.5)
+                orf_raw_threshold = self.config.get(
+                    "orf_outlier_threshold", 0.5
+                )
 
                 if isinstance(orf_raw_threshold, float) and (
                     0.0 <= orf_raw_threshold <= 1.0

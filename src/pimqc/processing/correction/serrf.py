@@ -95,7 +95,9 @@ class SERRFCorrector:
         valid_qc = ~np.isnan(y_qc) & (y_qc > 0)
 
         if valid_qc.sum() < self.cv_folds:
-            return feat_idx, y_all, y_all
+            unavailable_oof = y_all.copy()
+            unavailable_oof[is_qc] = np.nan
+            return feat_idx, y_all, unavailable_oof
 
         x_qc_valid = x_current[is_qc][valid_qc]
         y_qc_valid = y_qc[valid_qc]

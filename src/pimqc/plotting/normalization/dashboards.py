@@ -158,9 +158,7 @@ class NormalizationDashboardMixin:
 
         pw.clear()
 
-        auto_summary = self.norm.attrs.get("selection", {}).get(
-            "candidate_results"
-        )
+        auto_summary = self.payload.selection.get("candidate_results")
         is_auto = bool(auto_summary)
 
         if is_auto:
@@ -236,13 +234,24 @@ class NormalizationDashboardMixin:
             return row1 / row2
 
         layout_width = 8.0
+        target_width = pu.TWO_BY_TWO_DASHBOARD_TARGET_WIDTH_IN
         ax_qc_alignment = pw.Brick(
-            figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
+            figsize=pu.dashboard_brick_size(
+                4.0,
+                4.0,
+                layout_width,
+                target_width=target_width,
+            ),
             label="QC_Alignment",
         )
         self._plot_qc_rle_boxplot(ax=ax_qc_alignment, article_compact=True)
         ax_qc_variance = pw.Brick(
-            figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
+            figsize=pu.dashboard_brick_size(
+                4.0,
+                4.0,
+                layout_width,
+                target_width=target_width,
+            ),
             label="QC_Variance",
         )
         self._plot_qc_variance_stabilization(
@@ -251,14 +260,24 @@ class NormalizationDashboardMixin:
         row1 = ax_qc_alignment | ax_qc_variance
 
         ax_qc_structure = pw.Brick(
-            figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
+            figsize=pu.dashboard_brick_size(
+                4.0,
+                4.0,
+                layout_width,
+                target_width=target_width,
+            ),
             label="QC_Structure",
         )
         self._plot_qc_structure_improvement(
             ax=ax_qc_structure, article_compact=True
         )
         ax_sample_structure = pw.Brick(
-            figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
+            figsize=pu.dashboard_brick_size(
+                4.0,
+                4.0,
+                layout_width,
+                target_width=target_width,
+            ),
             label="Sample_Structure",
         )
         self._plot_sample_structure_preservation(
@@ -281,9 +300,7 @@ class NormalizationDashboardMixin:
             )
             return None
 
-        auto_summary = self.norm.attrs.get("selection", {}).get(
-            "candidate_results"
-        )
+        auto_summary = self.payload.selection.get("candidate_results")
         if not auto_summary:
             return None
 

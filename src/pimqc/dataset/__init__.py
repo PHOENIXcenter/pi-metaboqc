@@ -1,10 +1,9 @@
 """Public dataset-construction and input-validation API.
 
-The package validates input tables, constructs the core ``MetaboInt`` matrix,
-and records acquisition metadata required by downstream processing. Dataset
-figures are intentionally exposed from :mod:`pimqc.plotting.dataset`.
+Expose the dataset builder and convenience construction function without
+coupling input validation to downstream correction or visualization.
 """
 
-from .builder import MetaboIntBuilder, build_dataset
+from .builder import MetaboDatasetBuilder, build_dataset
 
-__all__ = ["MetaboIntBuilder", "build_dataset"]
+__all__ = ["MetaboDatasetBuilder", "build_dataset"]

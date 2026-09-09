@@ -6,25 +6,49 @@ logging, progress, and hardware diagnostics are enabled only through ``init``.
 """
 
 import multiprocessing
-from importlib.metadata import PackageNotFoundError, version
 
 from loguru import logger
 
+from ._version import __version__
 from .constants import DEFAULT_RANDOM_SEED
 
-# Core Data Structure
-from .core import MetaboInt
+# Core Data Structures
+from .core import (
+    DatasetSchema,
+    DatasetProcessor,
+    MetaboDataset,
+    ProcessingContext,
+    SampleRoleLabels,
+)
 
 # Data Ingestion & Pipeline Management
-from .dataset.builder import build_dataset
+from .dataset.builder import MetaboDatasetBuilder, build_dataset
 from .pipeline import PipelineResult, run_pipeline
+from .processing.audit import (
+    AssessQualityAuditPayload,
+    AuditPayload,
+    CorrectionAuditPayload,
+    DatasetAuditPayload,
+    ImputationAuditPayload,
+    MissingValueFilterAuditPayload,
+    NormalizationAuditPayload,
+    QualityFilterAuditPayload,
+)
 
 # Processing Modules (Actors)
-from .processing.assessment import MetaboIntAssessor
-from .processing.correction import MetaboIntCorrector
-from .processing.filtering import MetaboIntFilter
-from .processing.imputation import MetaboIntImputer
-from .processing.normalization import MetaboIntNormalizer
+from .processing.assessment import QualityAssessor
+from .processing.correction import SignalCorrector
+from .processing.filtering import (
+    FeatureFilter,
+    FeatureMissingValueFilter,
+    FeatureQualityFilter,
+    FilteringOrchestrator,
+    FilteringRunResult,
+    SampleMissingValueFilter,
+)
+from .processing.imputation import MissingValueImputer
+from .processing.normalization import DataNormalizer
+from .processing.stage import StageResult
 from .runtime import (
     configure_joblib_cpu_limit,
     configure_logging,
@@ -32,24 +56,38 @@ from .runtime import (
     set_progress_enabled,
 )
 
-# Package Version
-try:
-    __version__ = version("pi-metaboqc")
-except PackageNotFoundError:
-    __version__ = "0+unknown"
-
 # Define public API
 __all__ = [
-    "MetaboInt",
-    "MetaboIntAssessor",
-    "MetaboIntCorrector",
-    "MetaboIntImputer",
-    "MetaboIntNormalizer",
-    "MetaboIntFilter",
+    "MetaboDataset",
+    "DatasetProcessor",
+    "DatasetSchema",
+    "ProcessingContext",
+    "SampleRoleLabels",
+    "AuditPayload",
+    "DatasetAuditPayload",
+    "AssessQualityAuditPayload",
+    "MissingValueFilterAuditPayload",
+    "CorrectionAuditPayload",
+    "QualityFilterAuditPayload",
+    "ImputationAuditPayload",
+    "NormalizationAuditPayload",
+    "StageResult",
+    "QualityAssessor",
+    "SignalCorrector",
+    "MissingValueImputer",
+    "DataNormalizer",
+    "FeatureFilter",
+    "SampleMissingValueFilter",
+    "FeatureMissingValueFilter",
+    "FeatureQualityFilter",
+    "FilteringOrchestrator",
+    "FilteringRunResult",
+    "MetaboDatasetBuilder",
     "build_dataset",
     "PipelineResult",
     "run_pipeline",
     "DEFAULT_RANDOM_SEED",
+    "__version__",
 ]
 
 _IS_INITIALIZED = False

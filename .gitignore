@@ -130,6 +130,7 @@ desktop.ini
 # AI-assistant artifacts, scratch scripts, and downloaded caches
 /.codex_artifacts/
 /.codex_tmp_*
+.codex-test-*
 /.agents/
 /.gemini/
 /.claude/
@@ -137,3 +138,4 @@ desktop.ini
 
 # Local data files that should not be public
 examples/tutorial_output/
+/output/pdf/release_validation/

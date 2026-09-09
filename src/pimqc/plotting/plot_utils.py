@@ -69,6 +69,46 @@ ACS_DOUBLE_COLUMN_WIDTH_IN = 17.8 / 2.54
 ARTICLE_PANEL_HEIGHT_IN = 1.75
 ARTICLE_COMPACT_SCALE = 0.92
 DASHBOARD_TARGET_WIDTH_IN = ACS_DOUBLE_COLUMN_WIDTH_IN * 0.92
+# A 2 x 2 dashboard is intentionally about two thirds as wide as the standard
+# three- or four-column dashboard.  This controls the exported SVG/PDF
+# geometry; the matching notebook preview ratio is defined below.
+TWO_BY_TWO_DASHBOARD_TARGET_WIDTH_IN = DASHBOARD_TARGET_WIDTH_IN * 2.0 / 3.0
+
+# Jupyter/VS Code dashboard previews use a percentage of the notebook content
+# width.  The values describe the display container only; SVG/PDF exports keep
+# their publication-oriented physical dimensions.  ``20%`` is one third of
+# the standard ``60%`` preview width and is reserved for a genuinely single
+# panel dashboard.
+DEFAULT_DASHBOARD_DISPLAY_WIDTH = "60%"
+TWO_BY_TWO_DASHBOARD_DISPLAY_WIDTH = "40%"
+SINGLE_PANEL_DASHBOARD_DISPLAY_WIDTH = "20%"
+
+# The report heatmap colorbar is emitted as a compact sidecar SVG.  Its tight
+# export height is intentionally about half of one heatmap brick: this keeps
+# the colorbar readable while preventing it from visually competing with a
+# heatmap when it is placed in the spare slot of a 2 x 4 grid or beside a
+# 2 x 3 grid.
+CORRELATION_COLORBAR_LEGEND_WIDTH_IN = 0.95
+CORRELATION_COLORBAR_LEGEND_HEIGHT_IN = 1.10
+
+
+def dashboard_display_width(rows: int, columns: int) -> str:
+    """Return the compact notebook width for a dashboard grid shape.
+
+    Most dashboards are deliberately kept at 60% so text remains legible in
+    a notebook.  Two-by-two layouts (the usual fixed-method composition) use
+    40%, while a single top-level panel uses one third of the standard width.
+    The function is intentionally shape-based rather than method-based so new
+    dashboards inherit the same policy automatically.
+    """
+    if rows <= 0 or columns <= 0:
+        raise ValueError("dashboard grid dimensions must be positive")
+    if rows == 1 and columns == 1:
+        return SINGLE_PANEL_DASHBOARD_DISPLAY_WIDTH
+    if rows == 2 and columns == 2:
+        return TWO_BY_TWO_DASHBOARD_DISPLAY_WIDTH
+    return DEFAULT_DASHBOARD_DISPLAY_WIDTH
+
 
 # Marker areas are expressed in points squared. Keeping these separate from
 # font sizes makes compact dashboards legible without inflating legend keys.
@@ -716,10 +756,12 @@ def change_fontsize(
     """Change the fontsize of axis ticks, labels, and title."""
     if axis in ("x", "xy"):
         ax.xaxis.label.set_fontsize(axis_label_fontsize)
+        ax.xaxis.get_offset_text().set_fontsize(axis_ticks_fontsize)
         for tick in ax.get_xticklabels():
             tick.set_fontsize(axis_ticks_fontsize)
     if axis in ("y", "xy"):
         ax.yaxis.label.set_fontsize(axis_label_fontsize)
+        ax.yaxis.get_offset_text().set_fontsize(axis_ticks_fontsize)
         for tick in ax.get_yticklabels():
             tick.set_fontsize(axis_ticks_fontsize)
     ax.title.set_fontsize(title_fontsize)
@@ -735,10 +777,12 @@ def change_weight(
     """Change the font weight of axis ticks, labels, and title."""
     if axis in ("x", "xy"):
         ax.xaxis.label.set_weight(axis_label_weight)
+        ax.xaxis.get_offset_text().set_weight(axis_ticks_weight)
         for tick in ax.get_xticklabels():
             tick.set_weight(axis_ticks_weight)
     if axis in ("y", "xy"):
         ax.yaxis.label.set_weight(axis_label_weight)
+        ax.yaxis.get_offset_text().set_weight(axis_ticks_weight)
         for tick in ax.get_yticklabels():
             tick.set_weight(axis_ticks_weight)
     ax.title.set_weight(title_weight)
@@ -779,7 +823,7 @@ def rotate_xticks_if_overlapping(
 
     try:
         ax.figure.canvas.draw()
-        renderer = ax.figure.canvas.get_renderer()
+        renderer = ax.figure._get_renderer()
         boxes = [
             label.get_window_extent(renderer=renderer)
             for label in labels
@@ -813,11 +857,107 @@ def axis_size_inches(ax: plt.Axes) -> tuple[float, float]:
     return max(bbox.width * fig_w, 1e-6), max(bbox.height * fig_h, 1e-6)
 
 
-def index_to_tick_labels(index: pd.Index) -> list[str]:
-    """Convert regular or MultiIndex labels into display strings."""
+def index_to_tick_labels(
+    index: pd.Index,
+    preferred_levels: tuple[str, ...] = (),
+) -> list[str]:
+    """Convert index labels while omitting redundant metadata levels."""
     if isinstance(index, pd.MultiIndex):
+        levels = [level for level in preferred_levels if level in index.names]
+        if levels:
+            label_frame = index.to_frame(index=False)
+            return [
+                "-".join(str(value) for value in row)
+                for row in label_frame[levels].itertuples(
+                    index=False, name=None
+                )
+            ]
         return ["-".join(map(str, item)) for item in index.to_list()]
     return [str(item) for item in index]
+
+
+def _text_width_pixels(
+    figure: plt.Figure,
+    value: str,
+    fontsize: float,
+    renderer: object,
+) -> float:
+    """Measure one unrotated text value with the active figure renderer."""
+    artist = Text(0.0, 0.0, str(value), fontsize=fontsize)
+    artist.set_figure(figure)
+    return float(artist.get_window_extent(renderer=renderer).width)
+
+
+def _figure_renderer(figure: plt.Figure) -> object:
+    """Return a renderer for ordinary and lightweight Matplotlib canvases."""
+    canvas = figure.canvas
+    try:
+        canvas.draw()
+        return canvas.get_renderer()
+    except (AttributeError, RuntimeError):
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+        canvas = FigureCanvasAgg(figure)
+        canvas.draw()
+        return canvas.get_renderer()
+
+
+def wrap_tick_label(
+    label_text: str,
+    *,
+    figure: plt.Figure,
+    max_width_pixels: float,
+    fontsize: float = DEFAULT_AXIS_TICK_FONTSIZE,
+) -> str:
+    """Wrap a tick label at whitespace or safe identifier separators.
+
+    Continuous alphanumeric tokens are never split.  Hyphens, underscores,
+    slashes, and whitespace remain attached to the preceding token so sample
+    identifiers retain their semantic boundaries in multi-line labels.
+    """
+    if max_width_pixels <= 0.0:
+        raise ValueError("max_width_pixels must be positive")
+
+    renderer = _figure_renderer(figure)
+    wrapped_lines: list[str] = []
+    for source_line in str(label_text).splitlines() or [""]:
+        segments = re.split(r"(?<=[\s_/\-])", source_line)
+        segments = [segment for segment in segments if segment]
+        if not segments:
+            wrapped_lines.append("")
+            continue
+
+        line = ""
+        for segment in segments:
+            candidate = f"{line}{segment}"
+            if line and _text_width_pixels(
+                figure, candidate.rstrip(), fontsize, renderer
+            ) > max_width_pixels:
+                wrapped_lines.append(line.rstrip())
+                line = segment.lstrip()
+            else:
+                line = candidate
+        wrapped_lines.append(line.rstrip())
+    return "\n".join(wrapped_lines)
+
+
+def wrap_tick_labels(
+    labels: list[str],
+    *,
+    figure: plt.Figure,
+    max_width_pixels: float,
+    fontsize: float = DEFAULT_AXIS_TICK_FONTSIZE,
+) -> list[str]:
+    """Apply :func:`wrap_tick_label` to a sequence of tick labels."""
+    return [
+        wrap_tick_label(
+            label,
+            figure=figure,
+            max_width_pixels=max_width_pixels,
+            fontsize=fontsize,
+        )
+        for label in labels
+    ]
 
 
 def compact_tick_label(label_text: str, max_chars: int | None = None) -> str:

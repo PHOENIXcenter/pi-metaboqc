@@ -6,5 +6,12 @@ owned by :mod:`pimqc.processing.assessment`.
 """
 
 from .plotter import AssessmentPlotter
+from .rendering import render_assessment
+from .comparison import plot_assessment_comparison, render_assessment_comparison
 
-__all__ = ["AssessmentPlotter"]
+__all__ = [
+    "AssessmentPlotter",
+    "render_assessment",
+    "render_assessment_comparison",
+    "plot_assessment_comparison",
+]

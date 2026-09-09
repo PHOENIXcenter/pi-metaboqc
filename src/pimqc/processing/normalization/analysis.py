@@ -1,13 +1,12 @@
 """Normalization transformations, candidate evaluation, and selection.
 
-MetaboIntNormalizer applies robust-log, TIC, median, PQN, MDFC, quantile, or
+DataNormalizer applies robust-log, TIC, median, PQN, MDFC, quantile, or
 VSN transformations and evaluates AUTO candidates with QC RLE, variance,
 structure, and sample-preservation metrics. It exports the selected normalized
 matrix and its traceable candidate metrics for downstream reporting.
 """
 
 import os
-from functools import cached_property
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -21,8 +20,8 @@ from scipy.spatial.distance import pdist
 
 from ...config import resolve_stage_config
 from ...constants import DEFAULT_RANDOM_SEED
-from ...core import model
-from ...runtime import joblib_execution_context
+from ...core import DatasetProcessor, MetaboDataset
+from ...runtime import joblib_execution_context, log_execution_time
 from ...statistics import metrics as su
 from ...statistics import sample_structure as structure_stats
 from ...statistics import selection as selection_utils
@@ -85,10 +84,9 @@ def _numba_vsn_nll(params: np.ndarray, fit_data: np.ndarray) -> float:
 # =============================================================================
 # Normalization Processor
 # =============================================================================
-class MetaboIntNormalizer(model.MetaboInt):
+class DataNormalizer(DatasetProcessor):
     """Normalization engine for global sample-wise preprocessing."""
 
-    _metadata = ["attrs", "stats"]
     _RUNTIME_CONFIG_KEYS = frozenset({"norm_method", "global_seed", "n_jobs"})
     _AUTO_CANDIDATES = (
         "ROBUST_LOG_ONLY",
@@ -135,33 +133,38 @@ class MetaboIntNormalizer(model.MetaboInt):
 
     def __init__(
         self,
-        *args: object,
+        data: MetaboDataset,
         pipeline_params: Optional[Dict[str, Any]] = None,
         norm_method: Optional[str] = None,
-        **kwargs: object,
+        global_seed: Optional[int] = None,
+        n_jobs: Optional[int] = None,
     ) -> None:
-        """Initialize MetaboIntNormalizer with parameters and metadata.
+        """Initialize the data normalization engine.
 
         Args:
-            *args: Variable length arguments passed to DataFrame.
+            data: Explicit dataset to normalize.
             pipeline_params: Global configuration dictionary from TOML.
             norm_method: Normalization method (e.g., 'Auto', 'VSN', 'Quantile').
-            **kwargs: Keyword arguments passed to DataFrame constructor.
         """
-        super().__init__(*args, pipeline_params=pipeline_params, **kwargs)
+        super().__init__(data)
 
         norm_configs = resolve_stage_config(
             pipeline_params,
-            "MetaboIntNormalizer",
-            {"norm_method": "Auto"},
-            {"norm_method": norm_method},
+            "DataNormalizer",
+            {
+                "norm_method": "Auto",
+                "global_seed": self.config.get(
+                    "global_seed", DEFAULT_RANDOM_SEED
+                ),
+                "n_jobs": self.config.get("n_jobs", -1),
+            },
+            {
+                "norm_method": norm_method,
+                "global_seed": global_seed,
+                "n_jobs": n_jobs,
+            },
         )
-        self.attrs.update(norm_configs)
-
-    @property
-    def _constructor(self) -> type["MetaboIntNormalizer"]:
-        """Override pandas constructor to return current subclass type."""
-        return MetaboIntNormalizer
+        self.config.update(norm_configs)
 
     # =========================================================================
     # Lightweight Auto-normalization Metrics
@@ -390,10 +393,15 @@ class MetaboIntNormalizer(model.MetaboInt):
             stats_df["qc_dispersion"].median()
         )
 
-        rho_val = stats.spearmanr(
-            stats_df["mean_intensity"].to_numpy(dtype=float),
-            stats_df["qc_dispersion"].to_numpy(dtype=float),
-        )[0]
+        rho_val = (
+            stats.spearmanr(
+                stats_df["mean_intensity"].to_numpy(dtype=float),
+                stats_df["qc_dispersion"].to_numpy(dtype=float),
+            )[0]
+            if stats_df["mean_intensity"].nunique() > 1
+            and stats_df["qc_dispersion"].nunique() > 1
+            else float("nan")
+        )
         metrics["mean_variance_abs_rho"] = abs(su.finite_or_nan(rho_val))
 
         slope_df = stats_df[stats_df["qc_dispersion"] > 0].copy()
@@ -417,22 +425,22 @@ class MetaboIntNormalizer(model.MetaboInt):
 
     def _sample_structure_preservation_metrics(
         self,
-        norm_obj: model.MetaboInt,
+        norm_obj: pd.DataFrame,
         max_features: Optional[int] = 5000,
     ) -> dict[str, float]:
         """Quantify local sample structure preservation without labels."""
         return structure_stats.calc_sample_structure_preservation(
-            raw_obj=self,
+            raw_obj=self.frame,
             transformed_obj=norm_obj,
             max_features=max_features,
-            seed=int(self.attrs.get("global_seed", DEFAULT_RANDOM_SEED)),
+            seed=int(self.config.get("global_seed", DEFAULT_RANDOM_SEED)),
             scale_log_ratio_tol=self._SAMPLE_SCALE_LOG_RATIO_TOL,
             scale_rel_delta_tol=self._SAMPLE_SCALE_REL_DELTA_TOL,
         )
 
     def calc_auto_norm_candidate_results(
         self,
-        norm_obj: model.MetaboInt,
+        norm_obj: pd.DataFrame,
     ) -> dict[str, float]:
         """Calculate component scores for Auto normalization."""
         metrics = {
@@ -467,7 +475,7 @@ class MetaboIntNormalizer(model.MetaboInt):
 
         # Candidate outputs retain their delivered scale for export, while
         # AUTO scoring compares all candidates through one log-like view.
-        log_raw = su._extract_log2_target(self)
+        log_raw = su._extract_log2_target(self.frame)
         log_norm = su._extract_log2_target(norm_obj)
         if (
             log_raw is None
@@ -481,8 +489,17 @@ class MetaboIntNormalizer(model.MetaboInt):
         if log_raw.empty or log_norm.empty:
             return metrics
 
+        sample_type = self.dataset.schema.sample_type
+        qc_label = self.dataset.schema.roles.qc
+        raw_qc_mask = (
+            self.frame.columns.get_level_values(sample_type) == qc_label
+        )
+        norm_qc_mask = (
+            norm_obj.columns.get_level_values(sample_type) == qc_label
+        )
         qc_cols = (
-            self._qc.columns.intersection(norm_obj._qc.columns)
+            self.frame.columns[raw_qc_mask]
+            .intersection(norm_obj.columns[norm_qc_mask])
             .intersection(log_raw.columns)
             .intersection(log_norm.columns)
         )
@@ -584,17 +601,13 @@ class MetaboIntNormalizer(model.MetaboInt):
                 log_raw,
                 qc_cols=qc_cols,
                 max_features=5000,
-                seed=int(
-                    self.attrs.get("global_seed", DEFAULT_RANDOM_SEED)
-                ),
+                seed=int(self.config.get("global_seed", DEFAULT_RANDOM_SEED)),
             )
             qc_structure_after = self._calc_qc_structure_values(
                 log_norm,
                 qc_cols=qc_cols,
                 max_features=5000,
-                seed=int(
-                    self.attrs.get("global_seed", DEFAULT_RANDOM_SEED)
-                ),
+                seed=int(self.config.get("global_seed", DEFAULT_RANDOM_SEED)),
             )
             metrics["qc_structure_distance_before"] = qc_structure_before[
                 "qc_centroid_distance_median"
@@ -1113,8 +1126,8 @@ class MetaboIntNormalizer(model.MetaboInt):
     # =========================================================================
     def _extract_ordered_target_matrix(self) -> pd.DataFrame:
         """Return QC and biological samples in the original injection order."""
-        df_target = pd.concat([self._qc, self._actual_sample], axis=1)
-        ordered_cols = self.columns.intersection(df_target.columns)
+        df_target = pd.concat([self.qc_data, self.actual_data], axis=1)
+        ordered_cols = self.frame.columns.intersection(df_target.columns)
         df_target = df_target[ordered_cols].copy()
 
         if df_target.empty:
@@ -1150,11 +1163,11 @@ class MetaboIntNormalizer(model.MetaboInt):
             elif method == "MEDIAN":
                 df_norm = self.calc_median_normalization(df_norm)
             elif method == "PQN":
-                qc_cols = self._qc.columns
+                qc_cols = self.qc_data.columns
                 df_norm = self.calc_pqn_normalization(df_norm, qc_cols)
             elif method == "MDFC":
-                qc_cols = self._qc.columns
-                n_cores = self.attrs.get("n_jobs", -1)
+                qc_cols = self.qc_data.columns
+                n_cores = self.config.get("n_jobs", -1)
                 df_norm = self.calc_mdfc_normalization(
                     df_norm, qc_cols=qc_cols, n_jobs=n_cores
                 )
@@ -1197,11 +1210,12 @@ class MetaboIntNormalizer(model.MetaboInt):
         self,
         df_norm: pd.DataFrame,
         meta_stamps: dict[str, Any],
-    ) -> "MetaboIntNormalizer":
+    ) -> pd.DataFrame:
         """
         Create a finalized normalized object and clear stale scaling stamps.
         """
-        clean_obj = self._constructor(df_norm).__finalize__(self)
+        clean_obj = pd.DataFrame(df_norm).copy(deep=True)
+        clean_obj.attrs.update(self.config)
         clean_obj.attrs.update(meta_stamps)
 
         clean_obj.attrs.pop("is_scaled", None)
@@ -1210,7 +1224,7 @@ class MetaboIntNormalizer(model.MetaboInt):
 
     def _select_auto_normalization(
         self, df_target: pd.DataFrame
-    ) -> "MetaboIntNormalizer":
+    ) -> pd.DataFrame:
         """
         Evaluate fixed strategies and select the best normalization method.
         """
@@ -1320,16 +1334,14 @@ class MetaboIntNormalizer(model.MetaboInt):
                     "is_auto": True,
                     "selected_score": selected_score,
                     "selection_margin": selected_margin,
-                    "candidate_results": auto_summary.to_dict(
-                        orient="records"
-                    ),
+                    "candidate_results": auto_summary.to_dict(orient="records"),
                 },
             }
         )
 
         return self._finalize_normalized_object(df_norm, meta_stamps)
 
-    def apply_normalization(self) -> "MetaboIntNormalizer":
+    def apply_normalization(self) -> pd.DataFrame:
         """Execute normalization workflow to generate a Clean_Dataset.
 
         Implements different execution orders:
@@ -1340,7 +1352,7 @@ class MetaboIntNormalizer(model.MetaboInt):
         """
         df_target = self._extract_ordered_target_matrix()
         method = NORMALIZATION_METHODS.canonicalize(
-            self.attrs.get("norm_method", "ROBUST_LOG_ONLY")
+            self.config.get("norm_method", "ROBUST_LOG_ONLY")
             or "ROBUST_LOG_ONLY",
             strict=False,
         )
@@ -1365,16 +1377,18 @@ class MetaboIntNormalizer(model.MetaboInt):
         }
         return self._finalize_normalized_object(df_norm, meta_stamps)
 
-    @cached_property
+    @property
     def normalization_metrics(self) -> Dict[str, Any]:
         """Extracts configuration and QA metrics from the workflow."""
-        curr_stage = self.attrs.get("pipeline_stage", "Unknown")
+        execution = {
+            **self.config,
+            **getattr(self, "_normalization_output_attrs", {}),
+        }
+        curr_stage = execution.get("pipeline_stage", "Unknown")
 
-        selection = self.attrs.get("selection")
+        selection = execution.get("selection")
         if selection is None:
-            requested_method = self.attrs.get(
-                "norm_method", "ROBUST_LOG_ONLY"
-            )
+            requested_method = self.config.get("norm_method", "ROBUST_LOG_ONLY")
             selection = {
                 "requested_method": requested_method,
                 "selected_method": requested_method,
@@ -1388,30 +1402,31 @@ class MetaboIntNormalizer(model.MetaboInt):
         metrics = {
             "current_stage": curr_stage,
             "strategies": {
-                "normalization_method": self.attrs.get(
+                "normalization_method": execution.get(
                     "norm_method", "ROBUST_LOG_ONLY"
                 ),
-                "normalization_applied": self.attrs.get(
+                "normalization_applied": execution.get(
                     "normalization_applied", False
                 ),
-                "log_transform_active": self.attrs.get("is_logged", False),
+                "log_transform_active": execution.get("is_logged", False),
             },
             "selection": selection,
         }
 
-        if self.attrs.get("norm_method", "ROBUST_LOG_ONLY").upper() == "VSN":
+        if execution.get("norm_method", "ROBUST_LOG_ONLY").upper() == "VSN":
             metrics["vsn_parameters"] = {
-                "vsn_scale": self.attrs.get("vsn_scale", float("nan")),
-                "vsn_shift": self.attrs.get("vsn_shift", float("nan")),
+                "vsn_scale": execution.get("vsn_scale", float("nan")),
+                "vsn_shift": execution.get("vsn_shift", float("nan")),
             }
 
         return metrics
 
+    @log_execution_time
     def run_normalization(
         self,
         output_dir: str | None = None,
         **runtime_overrides: object,
-    ) -> StageResult["MetaboIntNormalizer"]:
+    ) -> StageResult[MetaboDataset]:
         """Return the structured normalization stage result.
 
         ``norm_method``, ``global_seed``, or ``n_jobs`` supplied here take

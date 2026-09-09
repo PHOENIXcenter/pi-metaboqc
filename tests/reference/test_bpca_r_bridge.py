@@ -18,7 +18,7 @@ from rpy2.robjects.conversion import localconverter
 from scipy.stats import spearmanr
 
 from pimqc.constants import DEFAULT_RANDOM_SEED
-from pimqc.processing.imputation import MetaboIntImputer
+from pimqc.processing.imputation import MissingValueImputer
 
 from .helpers import relative_mae, require_r_package
 
@@ -111,7 +111,7 @@ def test_bpca_matches_pcamethods_matrix_structure() -> None:
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        py_df = MetaboIntImputer.impute_by_bpca(
+        py_df = MissingValueImputer.impute_by_bpca(
             masked_df, n_components=2, max_iter=100, threshold=1e-4
         )
     r_df = run_r_bpca(masked_df, n_components=2, max_iter=100, threshold=1e-4)

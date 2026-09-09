@@ -21,6 +21,24 @@ from .. import plot_utils as pu
 class AssessmentOutlierMixin:
     """Render RSD and multivariate outlier panels and legends."""
 
+    def _reference_features_available(
+        self,
+        flags: pd.Series | None,
+        feature_attr: str,
+    ) -> bool:
+        """Return whether a validated reference-feature channel exists."""
+        source_obj = getattr(
+            getattr(self, "payload", None),
+            "primary_dataset",
+            None,
+        )
+        if source_obj is None:
+            return flags is not None
+        try:
+            return bool(getattr(source_obj, feature_attr))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+
     def plot_rsd_standalone_legend(
         self,
         qc_label: str,
@@ -217,6 +235,7 @@ class AssessmentOutlierMixin:
         annotate_thresholds: bool = False,
         legend_mode: str = "local",
         title_mode: str = "full",
+        complete_legend_categories: bool = False,
     ) -> plt.Figure:
         """Plot SD-OD diagnostic scatter with multi-dimensional overlays."""
         legend_mode = self._validate_legend_mode(legend_mode)
@@ -224,16 +243,16 @@ class AssessmentOutlierMixin:
         accent_alpha = pu.get_equivalent_hex(pu.PRIMARY_ACCENT_COLOR, alpha=0.5)
 
         custom_pal = {
-            "Normal": "tab:gray",
-            "Strong Outlier": accent_alpha,
-            "Orthogonal Outlier": accent_alpha,
             "Extreme Outlier": accent_solid,
+            "Orthogonal Outlier": accent_alpha,
+            "Strong Outlier": accent_alpha,
+            "Normal": "tab:gray",
         }
         custom_markers = {
-            "Normal": "o",
-            "Strong Outlier": "^",
-            "Orthogonal Outlier": "s",
             "Extreme Outlier": "X",
+            "Orthogonal Outlier": "s",
+            "Strong Outlier": "^",
+            "Normal": "o",
         }
 
         if ax is None:
@@ -325,6 +344,70 @@ class AssessmentOutlierMixin:
 
         if show_legend and legend_mode == "local":
             handles, labels = current_ax.get_legend_handles_labels()
+            if complete_legend_categories:
+                handles_by_label = dict(zip(labels, handles))
+                handles = []
+                labels = []
+                for label in custom_pal:
+                    handle = handles_by_label.get(label)
+                    if handle is None:
+                        handle = mlines.Line2D(
+                            [],
+                            [],
+                            color=custom_pal[label],
+                            marker=custom_markers[label],
+                            linestyle="none",
+                            markersize=pu.DEFAULT_LEGEND_MARKER_SIZE,
+                            markeredgecolor="k",
+                            markeredgewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
+                            label=label,
+                        )
+                    handles.append(handle)
+                    labels.append(label)
+
+                reference_styles = (
+                    (
+                        "IS Outlier",
+                        is_flags,
+                        "valid_internal_standards",
+                        pu.PRIMARY_ACCENT_COLOR,
+                        "--",
+                    ),
+                    (
+                        "ORF Outlier",
+                        orf_flags,
+                        "valid_outlier_reference_features",
+                        "tab:orange",
+                        "-.",
+                    ),
+                )
+                for (
+                    reference_label,
+                    reference_flags,
+                    feature_attr,
+                    edgecolor,
+                    linestyle,
+                ) in reference_styles:
+                    handle = handles_by_label.get(reference_label)
+                    if handle is None and self._reference_features_available(
+                        reference_flags,
+                        feature_attr,
+                    ):
+                        handle = mlines.Line2D(
+                            [],
+                            [],
+                            color="none",
+                            marker="o",
+                            markerfacecolor="none",
+                            markeredgecolor=edgecolor,
+                            markersize=pu.DEFAULT_LEGEND_MARKER_SIZE,
+                            markeredgewidth=pu.DEFAULT_GUIDE_LINEWIDTH,
+                            linestyle=linestyle,
+                            label=reference_label,
+                        )
+                    if handle is not None:
+                        handles.append(handle)
+                        labels.append(reference_label)
             dummy_cat = mlines.Line2D([], [], color="none", label="Category")
             full_handles = [dummy_cat] + handles
             full_labels = ["Category"] + labels
@@ -372,6 +455,62 @@ class AssessmentOutlierMixin:
             )
         return fig
 
+    def _prepare_stat_outlier_rows(
+        self,
+        outliers_df: pd.DataFrame,
+        sample_type: str,
+        actual_label: str,
+        show_normal: bool,
+        is_flags: pd.Series | None,
+        orf_flags: pd.Series | None,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        """Return rows with actionable statistical or reference outliers."""
+        sample_types = outliers_df.index.get_level_values(sample_type)
+        out_df = outliers_df[sample_types == actual_label].copy()
+        if out_df.empty:
+            return out_df, pd.Series(dtype=object)
+
+        def _get_category(row: pd.Series) -> str:
+            spe = row[("SPE-DModX", "Outliers (SPE-DModX)")]
+            ht2 = row[("HT2", "Outliers (HT2)")]
+            if spe and ht2:
+                return "Extreme Outlier"
+            if spe:
+                return "Orthogonal Outlier"
+            if ht2:
+                return "Strong Outlier"
+            return "Normal"
+
+        cats = out_df.apply(_get_category, axis=1)
+        if not show_normal:
+            outlier_mask = cats != "Normal"
+            if is_flags is not None:
+                outlier_mask |= is_flags.reindex(out_df.index).fillna(False)
+            if orf_flags is not None:
+                outlier_mask |= orf_flags.reindex(out_df.index).fillna(False)
+            out_df = out_df[outlier_mask].copy()
+            cats = cats[outlier_mask].copy()
+        return out_df, cats
+
+    def _has_stat_outlier_bar_data(
+        self,
+        outliers_df: pd.DataFrame,
+        sample_type: str,
+        actual_label: str,
+        is_flags: pd.Series | None = None,
+        orf_flags: pd.Series | None = None,
+    ) -> bool:
+        """Return whether the integrated outlier barplot has information."""
+        out_df, _ = self._prepare_stat_outlier_rows(
+            outliers_df,
+            sample_type,
+            actual_label,
+            False,
+            is_flags,
+            orf_flags,
+        )
+        return not out_df.empty
+
     def _plot_stat_outliers_bar(
         self,
         outliers_df: pd.DataFrame,
@@ -390,40 +529,14 @@ class AssessmentOutlierMixin:
         show_legend: bool = True,
     ) -> plt.Figure | None:
         """Plot outlier results with symmetrical reference flag encodings."""
-        sample_types = outliers_df.index.get_level_values(sample_type)
-        mask = sample_types == actual_label
-        out_df = outliers_df[mask].copy()
-
-        if out_df.empty:
-            return None
-
-        def _get_category(row: pd.Series) -> str:
-            spe = row[("SPE-DModX", "Outliers (SPE-DModX)")]
-            ht2 = row[("HT2", "Outliers (HT2)")]
-            if spe and ht2:
-                return "Extreme Outlier"
-            elif spe:
-                return "Orthogonal Outlier"
-            elif ht2:
-                return "Strong Outlier"
-            return "Normal"
-
-        cats = out_df.apply(_get_category, axis=1)
-
-        if not show_normal:
-            outlier_mask = cats != "Normal"
-
-            if is_flags is not None:
-                is_sub_mask = is_flags.loc[out_df.index].fillna(False).values
-                outlier_mask = outlier_mask | is_sub_mask
-
-            if orf_flags is not None:
-                orf_sub_mask = orf_flags.loc[out_df.index].fillna(False).values
-                outlier_mask = outlier_mask | orf_sub_mask
-
-            out_df = out_df[outlier_mask].copy()
-            cats = cats[outlier_mask].copy()
-
+        out_df, cats = self._prepare_stat_outlier_rows(
+            outliers_df,
+            sample_type,
+            actual_label,
+            show_normal,
+            is_flags,
+            orf_flags,
+        )
         if out_df.empty:
             return None
 
@@ -439,12 +552,12 @@ class AssessmentOutlierMixin:
 
         # Symmetrically fetch reference flags with strict length checks
         if is_flags is not None:
-            is_sub = is_flags.loc[out_df.index].fillna(False).values
+            is_sub = is_flags.reindex(out_df.index).fillna(False).values
         else:
             is_sub = np.zeros(len(out_df), dtype=bool)
 
         if orf_flags is not None:
-            orf_sub = orf_flags.loc[out_df.index].fillna(False).values
+            orf_sub = orf_flags.reindex(out_df.index).fillna(False).values
         else:
             orf_sub = np.zeros(len(out_df), dtype=bool)
 
@@ -674,6 +787,8 @@ class AssessmentOutlierMixin:
         complete_categories: bool = False,
         include_bar_diagnostics: bool = True,
         include_thresholds: bool = True,
+        has_is_features: bool | None = None,
+        has_orf_features: bool | None = None,
     ) -> plt.Figure | plt.Axes:
         """Create a comprehensive unified legend for all outlier diagnostics."""
         standalone = ax is None
@@ -706,28 +821,16 @@ class AssessmentOutlierMixin:
             "Normal": {"color": gray_col, "marker": "o", "hatch": ""},
         }
 
-        def _reference_features_available(
-            flags: pd.Series | None, feature_attr: str
-        ) -> bool:
-            """
-            Return whether a reference-feature channel exists for this QA run.
-
-            A boolean flag series can be present even when every sample is
-            normal. The assessor's validated feature list is the authoritative
-            availability check, so configured-but-invalid feature names do not
-            create misleading legend entries.
-
-            """
-            source_obj = getattr(self, "obj", None)
-            if source_obj is None:
-                return flags is not None
-            try:
-                return bool(getattr(source_obj, feature_attr))
-            except (AttributeError, KeyError, TypeError, ValueError):
-                return False
-
-        has_is_features = _reference_features_available(is_flags, "valid_is")
-        has_orf_features = _reference_features_available(orf_flags, "valid_orf")
+        if has_is_features is None:
+            has_is_features = self._reference_features_available(
+                is_flags,
+                "valid_internal_standards",
+            )
+        if has_orf_features is None:
+            has_orf_features = self._reference_features_available(
+                orf_flags,
+                "valid_outlier_reference_features",
+            )
 
         present_categories = set(metrics_df["Category"].unique())
         legend_handles, legend_labels = [], []

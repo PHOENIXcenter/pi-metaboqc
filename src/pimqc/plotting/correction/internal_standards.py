@@ -16,7 +16,7 @@ from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
 
-from ...core import model
+from ...core import MetaboDataset
 from .. import plot_utils as pu
 
 FitPredictCallable = Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
@@ -30,6 +30,26 @@ CorrectionModel = (
 
 class CorrectionInternalStandardMixin:
     """Render internal-standard correction diagnostics."""
+
+    @staticmethod
+    def _intensity_order_info(
+        frame: pd.DataFrame,
+        features: list[str] | tuple[str, ...],
+    ) -> pd.DataFrame:
+        """Build an injection-order view from an annotated dataframe."""
+        sample_type = frame.attrs.get("sample_type", "Sample Type")
+        injection_order = frame.attrs.get("inject_order", "Inject Order")
+        roles = frame.attrs.get("sample_dict", {})
+        valid_labels = {
+            roles.get("Actual sample", "Sample"),
+            roles.get("QC sample", "QC"),
+        }
+        present = [feature for feature in features if feature in frame.index]
+        values = frame.loc[present].transpose()
+        mask = values.index.get_level_values(sample_type).isin(valid_labels)
+        values = values.loc[mask].reset_index([sample_type, injection_order])
+        values[injection_order] = values[injection_order].astype(int)
+        return values.sort_values([sample_type, injection_order])
 
     def _plot_standalone_is_legend(
         self,
@@ -143,8 +163,8 @@ class CorrectionInternalStandardMixin:
 
     def _get_is_shared_ylim(
         self,
-        stage_dfs: dict[str, model.MetaboInt],
-        pred_df: model.MetaboInt | None,
+        stage_dfs: dict[str, pd.DataFrame],
+        pred_df: pd.DataFrame | None,
         feat: str,
         boundary: str,
     ) -> tuple[float, float] | None:
@@ -152,11 +172,9 @@ class CorrectionInternalStandardMixin:
         Calculate one y-axis range for one internal standard across stages.
         """
         y_values: list[float] = []
-        boundary_helper = model.MetaboInt()
-
         for df in stage_dfs.values():
             try:
-                plot_data = df.int_order_info(feat_type="IS").reset_index()
+                plot_data = self._intensity_order_info(df, [feat]).reset_index()
             except Exception:
                 continue
 
@@ -171,7 +189,7 @@ class CorrectionInternalStandardMixin:
             y_values.extend(finite_values.astype(float).tolist())
 
             try:
-                boundaries = boundary_helper.calculate_boundaries(
+                boundaries = MetaboDataset.calculate_boundaries(
                     finite_values, boundary
                 )
             except Exception:
@@ -184,7 +202,9 @@ class CorrectionInternalStandardMixin:
 
         if pred_df is not None:
             try:
-                pred_info = pred_df.int_order_info(feat_type="IS").reset_index()
+                pred_info = self._intensity_order_info(
+                    pred_df, [feat]
+                ).reset_index()
             except Exception:
                 pred_info = pd.DataFrame()
 
@@ -250,8 +270,8 @@ class CorrectionInternalStandardMixin:
 
     def plot_is_int_order_scatter(
         self,
-        stage_dfs: dict[str, model.MetaboInt],
-        pred_df: model.MetaboInt | None,
+        stage_dfs: dict[str, pd.DataFrame],
+        pred_df: pd.DataFrame | None,
         valid: list[str],
         sample_type: str,
         batch: str,
@@ -308,8 +328,8 @@ class CorrectionInternalStandardMixin:
 
                 # Overlay prediction lines strictly for the Original stage
                 if stage_name == "Original" and has_baseline:
-                    pred_info = pred_df.int_order_info(
-                        feat_type="IS"
+                    pred_info = self._intensity_order_info(
+                        pred_df, [feat]
                     ).reset_index()
 
                     for batch_id in pred_info[batch].unique():
@@ -362,7 +382,7 @@ class CorrectionInternalStandardMixin:
 
     def plot_single_is_scatter(
         self,
-        df: model.MetaboInt,
+        df: pd.DataFrame,
         feat: str,
         sample_type: str,
         batch: str,
@@ -382,7 +402,7 @@ class CorrectionInternalStandardMixin:
             current_ax = ax
             fig = current_ax.figure
 
-        plot_data = df.int_order_info(feat_type="IS").reset_index()
+        plot_data = self._intensity_order_info(df, [feat]).reset_index()
         plot_data[sample_type] = pd.Categorical(
             plot_data[sample_type],
             categories=[actual_label, qc_label],
@@ -406,7 +426,7 @@ class CorrectionInternalStandardMixin:
         )
 
         solid_line, lower_limit, upper_limit = (
-            model.MetaboInt().calculate_boundaries(plot_data[feat], boundary)
+            MetaboDataset.calculate_boundaries(plot_data[feat], boundary)
         )
         for y, linestyle in zip(
             [solid_line, lower_limit, upper_limit], ["-", "--", "--"]
@@ -437,8 +457,8 @@ class CorrectionInternalStandardMixin:
 
     def plot_pred_baseline_is(
         self,
-        raw: model.MetaboInt,
-        pred: model.MetaboInt | None,
+        raw: pd.DataFrame,
+        pred: pd.DataFrame | None,
         valid: list[str],
         sample_type: str,
         batch: str,
@@ -465,11 +485,11 @@ class CorrectionInternalStandardMixin:
         pred_info = None
         global_model_methods = {"SERRF", "RUV-III", "WAVEICA 2.0"}
         if pred is not None and method.upper() not in global_model_methods:
-            pred_info = pred.int_order_info(feat_type="IS").reset_index()
+            pred_info = self._intensity_order_info(pred, valid).reset_index()
 
         for n, feat in enumerate(valid):
             ax = pw.Brick(figsize=panel_size, label=f"pred_base_is_{n}")
-            plot_data = raw.int_order_info(feat_type="IS").reset_index()
+            plot_data = self._intensity_order_info(raw, valid).reset_index()
 
             plot_data[sample_type] = pd.Categorical(
                 plot_data[sample_type],

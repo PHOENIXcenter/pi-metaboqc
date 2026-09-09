@@ -1,4 +1,4 @@
-"""Regression tests for side-effect-free runtime and dataframe finalization."""
+"""Regression tests for side-effect-free, composition-based runtime behavior."""
 
 import subprocess
 import sys
@@ -12,41 +12,59 @@ import numpy as np
 import pandas as pd
 
 from pimqc.constants import DEFAULT_RANDOM_SEED
-from pimqc.core import MetaboInt
-from pimqc.processing.assessment import MetaboIntAssessor
-from pimqc.processing.correction import MetaboIntCorrector
-from pimqc.processing.filtering import MetaboIntFilter
-from pimqc.processing.imputation import MetaboIntImputer
-from pimqc.processing.normalization import MetaboIntNormalizer
+from pimqc.core import MetaboDataset
+from pimqc.dataset import MetaboDatasetBuilder
+from pimqc.pipeline import run_pipeline
+from pimqc.plotting.base import BasePlotter
+from pimqc.plotting import plot_utils as pu
+from pimqc.plotting.payloads import AssessmentPlotPayload, snapshot_dataset
+from pimqc.processing.assessment import QualityAssessor
+from pimqc.processing.correction import SignalCorrector
+from pimqc.processing.filtering import (
+    FeatureFilter,
+    FeatureMissingValueFilter,
+    FeatureQualityFilter,
+    SampleMissingValueFilter,
+)
+from pimqc.processing.imputation import MissingValueImputer
+from pimqc.processing.normalization import DataNormalizer
+from pimqc.processing import DatasetAuditPayload
 from pimqc.processing.stage import StageResult
 
 
-def _minimal_metabo_frame() -> MetaboInt:
-    columns = pd.MultiIndex.from_tuples(
+def _minimal_dataset(*, missing: bool = False) -> MetaboDataset:
+    intensity = pd.DataFrame(
         [
-            ("S1", "QC", "B1", 1),
-            ("S2", "Sample", "B1", 2),
+            [np.nan if missing else 1.0, 2.0, 2.0, 4.0],
+            [4.0, 4.0, 4.0, 4.0],
         ],
-        names=["Sample Name", "Sample Type", "Batch", "Inject Order"],
+        index=pd.Index(["F1", "F2"], name="Metabolite"),
+        columns=pd.Index(["QC1", "QC2", "S1", "S2"], name="Sample Name"),
     )
-    return MetaboInt(
-        [[1.0, 2.0], [3.0, 4.0]],
-        index=["F1", "F2"],
-        columns=columns,
+    metadata = pd.DataFrame(
+        {
+            "Sample Type": ["QC", "QC", "Sample", "Sample"],
+            "Batch": ["B1"] * 4,
+            "Inject Order": [1, 2, 3, 4],
+        },
+        index=intensity.columns,
     )
+    feature_metadata = pd.DataFrame(
+        {"missingness_type": ["MAR", "MAR"]},
+        index=intensity.index,
+    )
+    return MetaboDataset.from_tables(intensity, metadata, feature_metadata)
 
 
-def test_metaboint_construction_does_not_reset_numpy_global_rng() -> None:
-    """Constructing pandas subclasses must not alter application RNG state."""
-    # This test intentionally exercises NumPy's legacy global RNG to ensure
-    # MetaboInt construction does not mutate host-application state.
+def test_dataset_construction_does_not_reset_numpy_global_rng() -> None:
+    """Constructing the domain model must not alter application RNG state."""
     np.random.seed(DEFAULT_RANDOM_SEED)
     expected_first = np.random.random()
     expected_second = np.random.random()
 
     np.random.seed(DEFAULT_RANDOM_SEED)
     assert np.random.random() == expected_first
-    _minimal_metabo_frame()
+    _minimal_dataset()
     assert np.random.random() == expected_second
 
 
@@ -56,8 +74,13 @@ def test_visualizer_construction_does_not_patch_matplotlib_globals() -> None:
 
     original_axes_init = matplotlib.axes.Axes.__init__
     original_font_type = mpl.rcParams["pdf.fonttype"]
-    frame = _minimal_metabo_frame()
-    AssessmentPlotter(frame)
+    dataset = _minimal_dataset()
+    AssessmentPlotter(
+        AssessmentPlotPayload(
+            data=snapshot_dataset(dataset),
+            is_multi_batch=False,
+        )
+    )
 
     assert matplotlib.axes.Axes.__init__ is original_axes_init
     assert mpl.rcParams["pdf.fonttype"] == original_font_type
@@ -68,7 +91,9 @@ def test_vector_save_keeps_svg_text_editable(tmp_path: Path) -> None:
     from pimqc.plotting.assessment import AssessmentPlotter
 
     original_svg_fonttype = mpl.rcParams["svg.fonttype"]
-    visualizer = AssessmentPlotter(_minimal_metabo_frame())
+    visualizer = AssessmentPlotter(
+        AssessmentPlotPayload(snapshot_dataset(_minimal_dataset()), False)
+    )
     figure, axis = plt.subplots()
     axis.set_title("Editable title")
     axis.set_xlabel("Selectable x label")
@@ -90,16 +115,16 @@ def test_vector_save_keeps_svg_text_editable(tmp_path: Path) -> None:
     assert mpl.rcParams["svg.fonttype"] == original_svg_fonttype
 
 
-def test_patchwork_save_keeps_svg_and_pdf_text_editable(
-    tmp_path: Path,
-) -> None:
+def test_patchwork_save_keeps_svg_and_pdf_text_editable(tmp_path: Path) -> None:
     """Preserve text elements and Unicode maps in dashboard vector exports."""
     import patchworklib as pw
 
     from pimqc.plotting.assessment import AssessmentPlotter
 
     pw.clear()
-    visualizer = AssessmentPlotter(_minimal_metabo_frame())
+    visualizer = AssessmentPlotter(
+        AssessmentPlotPayload(snapshot_dataset(_minimal_dataset()), False)
+    )
     brick = pw.Brick(figsize=(3.0, 2.0), label="editable_vector_brick")
     brick.set_title("Editable dashboard title")
     brick.set_xlabel("Selectable dashboard label")
@@ -122,95 +147,143 @@ def test_patchwork_save_keeps_svg_and_pdf_text_editable(
     assert b"/ToUnicode" in pdf_bytes
 
 
-def test_subclasses_share_metaboint_finalization_policy() -> None:
-    """Stage subclasses preserve attrs and stats through pandas operations."""
-    source = _minimal_metabo_frame()
-    source.attrs["custom_state"] = {"values": [1, 2]}
-    source.stats["audit"] = {"retained": 2}
+def test_dashboard_display_width_follows_grid_shape() -> None:
+    """Use 60/40/20% inline widths without changing export dimensions."""
+    import patchworklib as pw
 
-    stage_types = (
-        MetaboIntAssessor,
-        MetaboIntCorrector,
-        MetaboIntFilter,
-        MetaboIntImputer,
-        MetaboIntNormalizer,
+    def make_bricks(count: int) -> list[object]:
+        return [
+            pw.Brick(figsize=(2.0, 2.0), label=f"width_{count}_{index}")
+            for index in range(count)
+        ]
+
+    pw.clear()
+    single = make_bricks(1)[0]
+    assert BasePlotter._dashboard_grid_shape(single) == (1, 1)
+    assert (
+        BasePlotter.resolve_dashboard_display_width(single)
+        == pu.SINGLE_PANEL_DASHBOARD_DISPLAY_WIDTH
     )
+
+    pw.clear()
+    two_by_two_bricks = make_bricks(4)
+    two_by_two = (two_by_two_bricks[0] | two_by_two_bricks[1]) / (
+        two_by_two_bricks[2] | two_by_two_bricks[3]
+    )
+    assert BasePlotter._dashboard_grid_shape(two_by_two) == (2, 2)
+    assert (
+        BasePlotter.resolve_dashboard_display_width(two_by_two)
+        == pu.TWO_BY_TWO_DASHBOARD_DISPLAY_WIDTH
+    )
+
+    pw.clear()
+    three_columns = make_bricks(3)
+    three_column_dashboard = (
+        three_columns[0] | three_columns[1] | three_columns[2]
+    )
+    assert BasePlotter._dashboard_grid_shape(three_column_dashboard) == (1, 3)
+    assert (
+        BasePlotter.resolve_dashboard_display_width(three_column_dashboard)
+        == pu.DEFAULT_DASHBOARD_DISPLAY_WIDTH
+    )
+    assert (
+        BasePlotter.resolve_dashboard_display_width(two_by_two, width="75%")
+        == "75%"
+    )
+
+
+def test_save_and_show_pw_passes_resolved_width_to_notebook_renderer() -> None:
+    """Apply the grid policy at the actual Patchwork display boundary."""
+    import patchworklib as pw
+    from pimqc.plotting.assessment import AssessmentPlotter
+
+    pw.clear()
+    bricks = [
+        pw.Brick(figsize=(2.0, 2.0), label=f"render_width_{index}")
+        for index in range(4)
+    ]
+    dashboard = (bricks[0] | bricks[1]) / (bricks[2] | bricks[3])
+    visualizer = AssessmentPlotter(
+        AssessmentPlotPayload(snapshot_dataset(_minimal_dataset()), False)
+    )
+
+    with (
+        patch("pimqc.plotting.base.is_jupyter", return_value=True),
+        patch.object(visualizer, "_render_jupyter_display") as render,
+    ):
+        visualizer.save_and_show_pw(dashboard, file_path=None)
+
+    assert render.call_args.kwargs["width"] == "40%"
+
+
+def test_stage_processors_use_composition_not_dataframe_inheritance() -> None:
+    """Keep every numerical engine outside the pandas type hierarchy."""
+    source = _minimal_dataset()
+    stage_types = (
+        QualityAssessor,
+        SignalCorrector,
+        FeatureFilter,
+        MissingValueImputer,
+        DataNormalizer,
+    )
+
     for stage_type in stage_types:
         stage = stage_type(source)
-        sliced = stage.iloc[:, :1]
-        assert sliced.attrs["custom_state"] == {"values": [1, 2]}
-        assert sliced.stats["audit"] == {"retained": 2}
-        assert sliced.attrs is not stage.attrs
-        assert sliced.stats is not stage.stats
+        assert not isinstance(stage, pd.DataFrame)
+        assert pd.DataFrame not in stage_type.__mro__
+        assert type(stage.frame) is pd.DataFrame
+        assert type(stage.dataset) is MetaboDataset
+        stage.frame.iloc[0, 0] = -1
+        assert source.intensity.iloc[0, 0] == 1.0
 
 
-def test_derived_metaboint_preserves_attrs() -> None:
-    """Pandas-derived objects keep custom labels and seeds by default."""
-    source = _minimal_metabo_frame()
-    source.attrs["sample_dict"] = {
-        "Actual sample": "Biological",
-        "Blank sample": "Solvent",
-        "QC sample": "Pooled QC",
-    }
-    source.attrs["global_seed"] = 73
-
-    derived = MetaboInt(source)
-
-    assert derived.attrs["sample_dict"] == source.attrs["sample_dict"]
-    assert derived.attrs["global_seed"] == 73
-
-    fresh = MetaboInt([[2]], index=["f"], columns=["s"])
-    fresh.attrs["sample_dict"]["QC sample"] = "QC altered"
-    assert source.attrs["sample_dict"]["QC sample"] == "Pooled QC"
-
-
-def test_inplace_dataframe_mutation_invalidates_derived_cache() -> None:
-    """Do not retain QC subsets after their source columns are removed."""
-    source = _minimal_metabo_frame()
-    assert source._qc.columns.get_level_values("Sample Name").tolist() == [
-        "S1"
-    ]
-
-    source.drop(columns=[("S1", "QC", "B1", 1)], inplace=True)
-
-    assert source._qc.empty
-
-
-def test_stage_result_keeps_data_metrics_and_candidates_separate() -> None:
-    """The stage contract separates transformation output from audit data."""
-    frame = _minimal_metabo_frame()
-    result = StageResult(
-        data=frame,
-        metrics={"score": 0.8},
-        candidates=[{"method": "A"}],
+def test_complete_stage_actions_apply_execution_timing() -> None:
+    """Time every complete lifecycle without wrapping calculation helpers."""
+    stage_actions = (
+        MetaboDatasetBuilder.run_build,
+        QualityAssessor.run_assessment,
+        SampleMissingValueFilter.run_filter_samples_by_missingness,
+        FeatureMissingValueFilter.run_filter_features_by_missingness,
+        FeatureQualityFilter.run_filter_features_by_quality,
+        SignalCorrector.run_signal_correction,
+        MissingValueImputer.run_imputation,
+        DataNormalizer.run_normalization,
+        run_pipeline,
     )
-    assert result.data is frame
-    assert result.metrics["score"] == 0.8
-    assert result.candidates == [{"method": "A"}]
+
+    assert all(hasattr(action, "__wrapped__") for action in stage_actions)
+    assert not hasattr(FeatureFilter.classify_missing_types, "__wrapped__")
+
+
+def test_correction_helpers_read_composed_dataset_roles() -> None:
+    """Resolve QC and control features without subclass-only attributes."""
+    processor = SignalCorrector(_minimal_dataset())
+
+    correlation = processor._prepare_serrf_correlation_matrix()
+    controls = processor._prepare_ruv_control_features()
+
+    assert correlation is not None
+    assert correlation.shape == (2, 2)
+    assert set(controls) == {"F1", "F2"}
+
+
+def test_stage_result_keeps_data_and_typed_audit_separate() -> None:
+    """The stage contract separates transformation output from audit data."""
+    dataset = _minimal_dataset()
+    result = StageResult(
+        data=dataset,
+        audit=DatasetAuditPayload(metric_values={"score": 0.8}),
+    )
+    assert result.data is dataset
+    assert result.audit.metrics["score"] == 0.8
 
 
 def test_auto_imputation_keeps_request_and_selection_separate() -> None:
     """Preserve AUTO in report metrics after selecting a MAR candidate."""
-    columns = pd.MultiIndex.from_tuples(
-        [
-            ("QC1", "QC", "B1", 1),
-            ("QC2", "QC", "B1", 2),
-            ("S1", "Sample", "B1", 3),
-            ("S2", "Sample", "B1", 4),
-        ],
-        names=["Sample Name", "Sample Type", "Batch", "Inject Order"],
-    )
-    source = MetaboInt(
-        [[np.nan, 2.0, 2.0, 4.0], [4.0, 4.0, 4.0, 4.0]],
-        index=["F1", "F2"],
-        columns=columns,
-    )
-    source.attrs["idx_mar"] = ["F1"]
-    source.attrs["idx_mnar"] = []
-    imputer = MetaboIntImputer(
-        source,
+    imputer = MissingValueImputer(
+        _minimal_dataset(missing=True),
         mar_method="Auto",
-        mnar_method="row-wise",
+        mnar_method="Row-wise",
     )
     selected_metrics = {
         "NRMSE_Low": 0.1,
@@ -220,7 +293,9 @@ def test_auto_imputation_keeps_request_and_selection_separate() -> None:
         "Wasserstein_Total": 0.2,
         "Wasserstein_Normalized": 0.1,
     }
-    candidate_cache = {"LLS": (selected_metrics, np.array([1.0]), np.array([1.0]))}
+    candidate_cache = {
+        "LLS": (selected_metrics, np.array([1.0]), np.array([1.0]))
+    }
 
     with (
         patch.object(
@@ -236,19 +311,24 @@ def test_auto_imputation_keeps_request_and_selection_separate() -> None:
     ):
         result = imputer.transform_imputation()
 
-    selection = result.metrics["selection"]
+    selection = result.audit.metrics["selection"]
     assert selection["requested_method"] == "Auto"
     assert selection["selected_method"] == "LLS"
     assert selection["is_auto"] is True
     candidate_result = next(
         candidate
-        for candidate in result.metrics["selection"]["candidate_results"]
+        for candidate in selection["candidate_results"]
         if candidate["method"] == "LLS"
     )
     assert candidate_result["jsd_total"] == 0.1
     assert candidate_result["wasserstein_normalized"] == 0.1
-    assert result.metadata["requested_method"] == "Auto"
-    assert result.metadata["is_auto"] is True
+    assert result.audit.metrics["feature_distribution"] == {
+        "mar_count": 2,
+        "mnar_count": 0,
+    }
+    assert result.audit.requested_method == "Auto"
+    assert result.audit.is_auto is True
+    assert type(result.data) is MetaboDataset
 
 
 def test_import_does_not_replace_subprocess_popen() -> None:

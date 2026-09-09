@@ -67,9 +67,7 @@ class NormalizationScorecardMixin:
     ) -> object | None:
         """Plot Auto normalization weighted score components as stacked bars."""
         if auto_summary is None:
-            auto_summary = self.norm.attrs.get("selection", {}).get(
-                "candidate_results"
-            )
+            auto_summary = self.payload.selection.get("candidate_results")
         if not auto_summary:
             return None
 
@@ -86,7 +84,7 @@ class NormalizationScorecardMixin:
         score_cols, label_map, color_map = (
             self._normalization_score_component_style()
         )
-        contribution_weights = self.norm._AUTO_SCORE_COMPONENT_WEIGHTS
+        contribution_weights = self.payload.score_component_weights
         for col in ["overall_score", *score_cols]:
             summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce")
 
@@ -157,9 +155,7 @@ class NormalizationScorecardMixin:
     ) -> plt.Axes | None:
         """Plot candidate-level sample-structure preservation scores."""
         if auto_summary is None:
-            auto_summary = self.norm.attrs.get("selection", {}).get(
-                "candidate_results"
-            )
+            auto_summary = self.payload.selection.get("candidate_results")
         if not auto_summary:
             return None
 

@@ -6,14 +6,15 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pandas as pd
 
+from pimqc.core import MetaboDataset
 from pimqc.processing.assessment import (
     AssessmentDiagnostics,
     AssessmentStageRunner,
-    MetaboIntAssessor,
+    QualityAssessor,
 )
 
 
-def _prepared_assessor() -> tuple[MetaboIntAssessor, pd.DataFrame]:
+def _prepared_assessor() -> tuple[QualityAssessor, pd.DataFrame]:
     """Build an assessor with deterministic cached diagnostic calculations."""
     columns = pd.MultiIndex.from_tuples(
         [
@@ -24,11 +25,18 @@ def _prepared_assessor() -> tuple[MetaboIntAssessor, pd.DataFrame]:
         ],
         names=["Sample Name", "Sample Type", "Batch", "Inject Order"],
     )
-    assessor = MetaboIntAssessor(
+    intensity = pd.DataFrame(
         [[10.0, 11.0, 9.0, 12.0], [20.0, 19.0, 22.0, 21.0]],
-        index=["F1", "F2"],
-        columns=columns,
+        index=pd.Index(["F1", "F2"], name="Metabolite"),
+        columns=pd.Index(["QC1", "QC2", "S1", "S2"], name="Sample Name"),
     )
+    metadata = columns.to_frame(index=False).set_index("Sample Name")
+    dataset = MetaboDataset.from_tables(
+        intensity,
+        metadata,
+        feature_metadata=pd.DataFrame(index=intensity.index),
+    )
+    assessor = QualityAssessor(dataset)
 
     qc_columns = columns[:2]
     correlation = pd.DataFrame(
@@ -96,14 +104,14 @@ def test_assessment_compute_only_has_no_artifact_side_effects() -> None:
     with (
         patch.object(pd.DataFrame, "to_csv") as to_csv,
         patch(
-            "pimqc.processing.assessment.runner.AssessmentPlotter"
+            "pimqc.plotting.assessment.rendering.AssessmentPlotter"
         ) as visualizer,
     ):
         result = AssessmentStageRunner(assessor, output_dir=None).run()
 
     assert isinstance(result.data, AssessmentDiagnostics)
     pd.testing.assert_frame_equal(result.data.outliers, expected_outliers)
-    assert result.metrics == {"status": "prepared"}
+    assert result.audit.metrics == {"status": "prepared"}
     to_csv.assert_not_called()
     visualizer.assert_not_called()
 
@@ -115,23 +123,47 @@ def test_run_without_output_returns_complete_stage_result() -> None:
     with (
         patch.object(pd.DataFrame, "to_csv") as to_csv,
         patch(
-            "pimqc.processing.assessment.runner.AssessmentPlotter"
+            "pimqc.plotting.assessment.rendering.AssessmentPlotter"
         ) as visualizer,
     ):
         result = assessor.run_assessment()
 
     assert isinstance(result.data, AssessmentDiagnostics)
-    pd.testing.assert_frame_equal(result.candidates, expected_outliers)
-    assert result.metrics == {"status": "prepared"}
-    assert result.metadata["skipped"] is False
+    pd.testing.assert_frame_equal(result.audit.outliers, expected_outliers)
+    assert result.audit.metrics == {"status": "prepared"}
+    assert result.audit.skipped is False
     to_csv.assert_not_called()
+    visualizer.assert_not_called()
+
+
+def test_run_assessment_accepts_explicit_context_updates() -> None:
+    """Context updates are applied before scale-sensitive diagnostics run."""
+    assessor, _ = _prepared_assessor()
+
+    with patch(
+        "pimqc.plotting.assessment.rendering.AssessmentPlotter"
+    ) as visualizer:
+        result = assessor.run_assessment(
+            context_updates={
+                "pipeline_stage": "Normalization",
+                "is_logged": True,
+                "log_base": "2",
+            }
+        )
+
+    assert result.audit.plot_payload.data.context.pipeline_stage == (
+        "Normalization"
+    )
+    assert result.audit.plot_payload.data.context.is_logged is True
+    assert assessor.config["pipeline_stage"] == "Normalization"
+    assert assessor.config["is_logged"] is True
     visualizer.assert_not_called()
 
 
 def test_assessment_export_preserves_diagnostic_filename(
     tmp_path: Path,
 ) -> None:
-    """The runner keeps the established QA CSV name and serialization options."""
+    """Keep the established QA CSV name and serialization options."""
     assessor, _ = _prepared_assessor()
     runner = AssessmentStageRunner(assessor, output_dir=tmp_path)
     runner.render = Mock()
@@ -153,14 +185,13 @@ def test_assessment_render_preserves_panel_and_dashboard_names(
     assessor, _ = _prepared_assessor()
     runner = AssessmentStageRunner(assessor, output_dir=tmp_path)
     result = runner.compute()
-    result.render_context["processor"] = assessor
     visualizer = Mock()
     visualizer.QA_PANEL_SAVE_FORMAT = "svg"
     visualizer.QA_LEGEND_SAVE_FORMAT = "svg"
     visualizer._validate_legend_mode.return_value = "external"
 
     with patch(
-        "pimqc.processing.assessment.runner.AssessmentPlotter",
+        "pimqc.plotting.assessment.rendering.AssessmentPlotter",
         return_value=visualizer,
     ):
         runner.render(result)
@@ -191,7 +222,11 @@ def test_empty_run_assessment_does_not_create_output_dir(
     tmp_path: Path,
 ) -> None:
     """The public runner avoids empty artifacts for an empty assessment."""
-    assessor = MetaboIntAssessor(pd.DataFrame())
+    empty_dataset = MetaboDataset.from_tables(
+        pd.DataFrame(),
+        pd.DataFrame(columns=["Sample Type", "Batch", "Inject Order"]),
+    )
+    assessor = QualityAssessor(empty_dataset)
     output_dir = tmp_path / "not-created"
 
     result = assessor.run_assessment(
@@ -200,7 +235,7 @@ def test_empty_run_assessment_does_not_create_output_dir(
     )
 
     assert isinstance(result.data, AssessmentDiagnostics)
-    assert result.metadata["skipped"] is True
-    assert result.metrics == {}
-    assert assessor.attrs["corr_method"] == "Pearson"
+    assert result.audit.skipped is True
+    assert result.audit.metrics == {}
+    assert assessor.config["corr_method"] == "Pearson"
     assert not output_dir.exists()

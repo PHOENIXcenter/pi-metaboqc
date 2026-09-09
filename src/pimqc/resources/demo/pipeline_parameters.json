@@ -1,5 +1,5 @@
 {
-  "MetaboInt": {
+  "Dataset": {
     "mode": "ESI+",
     "sample_name": "Sample Name",
     "sample_type": "Sample Type",
@@ -40,13 +40,13 @@
       "QC sample": "QC"
     }
   },
-  "MetaboIntAssessor": {
+  "QualityAssessor": {
     "corr_method": "Spearman",
     "scaling_method": "Auto-scaling",
     "is_outlier_threshold": 0.5,
     "orf_outlier_threshold": 0.5
   },
-  "MetaboIntFilter": {
+  "FeatureFilter": {
     "sample_mv_tol": 0.5,
     "mv_global_tol": 0.7,
     "mv_qc_tol": 0.3,
@@ -57,7 +57,7 @@
     "blank_qc_ratio_tol": 0.2,
     "qc_rsd_tol": 0.3
   },
-  "MetaboIntCorrector": {
+  "SignalCorrector": {
     "base_est": "Auto",
     "loess_span": 0.5,
     "loess_degree": 1,
@@ -85,9 +85,10 @@
     "waveica_max_iter": 1000,
     "regression_backend": "loky",
     "regression_batch_size": "auto",
-    "cv_folds": 3
+    "cv_folds": 3,
+    "n_jobs": -1
   },
-  "MetaboIntImputer": {
+  "MissingValueImputer": {
     "mnar_method": "QRILC",
     "mnar_fraction": 0.5,
     "mar_method": "Auto",
@@ -98,7 +99,8 @@
     "bpca_tol": 0.0001,
     "sim_mask_ratio": 0.05
   },
-  "MetaboIntNormalizer": {
-    "norm_method": "Auto"
+  "DataNormalizer": {
+    "norm_method": "Auto",
+    "n_jobs": -1
   }
 }

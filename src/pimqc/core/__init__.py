@@ -1,10 +1,21 @@
-"""Core domain data structures shared by every pipeline stage.
+"""Core composition-based data models and processing primitives.
 
-The package exposes MetaboInt, the metadata-preserving dataframe subclass used
-to carry matrices, sample labels, feature annotations, metrics, and processing
-state through the pi-metaboqc workflow.
+Expose independent intensity/metadata containers, their schema and context,
+and the shared processor base used by scientific stages.
 """
 
-from .model import MetaboInt
+from .dataset import (
+    DatasetSchema,
+    MetaboDataset,
+    ProcessingContext,
+    SampleRoleLabels,
+)
+from .processor import DatasetProcessor
 
-__all__ = ["MetaboInt"]
+__all__ = [
+    "DatasetSchema",
+    "MetaboDataset",
+    "DatasetProcessor",
+    "ProcessingContext",
+    "SampleRoleLabels",
+]

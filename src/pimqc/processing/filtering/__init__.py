@@ -1,10 +1,23 @@
-"""Public feature- and sample-filtering computation API.
+"""Public independent filtering stages and their orchestration API.
 
-The package implements missing-value and low-quality filtering decisions and
-their structured stage execution. Filtering dashboards and diagnostic panels
-are provided independently by :mod:`pimqc.plotting.filtering`.
+Expose sample missingness, feature missingness, and feature quality boundaries,
+plus the orchestrator that combines their independent typed results.
 """
 
-from .analysis import MetaboIntFilter
+from .analysis import FeatureFilter
+from .stages import (
+    FeatureMissingValueFilter,
+    FeatureQualityFilter,
+    FilteringOrchestrator,
+    FilteringRunResult,
+    SampleMissingValueFilter,
+)
 
-__all__ = ["MetaboIntFilter"]
+__all__ = [
+    "FeatureFilter",
+    "FeatureMissingValueFilter",
+    "FeatureQualityFilter",
+    "FilteringOrchestrator",
+    "FilteringRunResult",
+    "SampleMissingValueFilter",
+]

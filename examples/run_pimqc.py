@@ -3,13 +3,13 @@
 """
 Automated Orchestration CLI for pi-metaboqc Pipeline.
 
-This script provides a standardized command-line interface (CLI) to 
+This script provides a standardized command-line interface (CLI) to
 execute the full metabolomics quality control workflow in a non-interactive,
-headless terminal environment. 
+headless terminal environment.
 
 Usage:
     python run_pimqc.py [-m META] [-i INTENSITY] [-c CONFIG] [-o OUTDIR] [-q]
-    
+
     # 1. Run with default demo data
     python run_pimqc.py
 
@@ -44,7 +44,7 @@ mpl.use("Agg")
 
 # Import internal modules after backend initialization
 import pimqc
-from pimqc.io import ensure_directory, load_pipeline_config
+from pimqc.io import load_pipeline_config
 from pimqc.pipeline import run_pipeline
 
 
@@ -100,7 +100,7 @@ def parse_arguments() -> argparse.Namespace:
         "-q",
         "--quiet",
         action="store_true",
-        help="Enable silent mode: suppress all console log outputs.",
+        help="Suppress progress and non-error console logs.",
     )
 
     return parser.parse_args()
@@ -110,26 +110,28 @@ def main() -> None:
     """
     Main execution function orchestrating data ingestion and pipeline flow.
     """
-    # 1. Parse configuration arguments
+    # 1. Parse command-line inputs before initializing optional runtime
+    # diagnostics. Argument defaults point to the packaged demonstration data.
     args = parse_arguments()
 
-    # 2. Setup Silent Mode (just show error logger)
+    # 2. Configure logging, progress reporting, and hardware checks. Report the
+    # installed package version before loading data or running any stage.
     if args.quiet:
         pimqc.init(check_hardware=False, log_level="ERROR", show_progress=False)
     else:
         pimqc.init(check_hardware=True, log_level="INFO", show_progress=True)
     logger.info(f"pimqc.__version__: {pimqc.__version__}")
 
-    # 3. Path Normalization (The 'clean_xx' convention)
+    # 3. Normalize user-supplied paths.
     # -------------------------------------------------------------------------
-    # We transform all input paths into clean, absolute physical paths.
-    # This eliminates redundant '..' segments and ensures elegant logging.
+    # Absolute paths remove redundant '..' segments, make log messages
+    # unambiguous, and keep report assets rooted in one output workspace.
     clean_meta = os.path.abspath(args.meta)
     clean_intensity = os.path.abspath(args.intensity)
     clean_config = os.path.abspath(args.config)
     clean_outdir = os.path.abspath(args.outdir)
 
-    # 4. Professional Execution Header
+    # 4. Log an execution header before any filesystem or data access.
     logger.info("=" * 79)
     logger.info("Starting pi-metaboqc Automated Quality Control Pipeline")
     logger.info("-" * 79)
@@ -139,24 +141,16 @@ def main() -> None:
     logger.info(f">>> Output Dir : {clean_outdir}")
     logger.info("=" * 79)
 
-    # 5. Workspace Initialization
-    try:
-        # Safely create or verify the target output directory mount
-        ensure_directory(clean_outdir)
-    except Exception as e:
-        logger.error(f"Failed to initialize output workspace: {e}")
-        sys.exit(1)
-
-    # 6. Data & Parameter Ingestion
+    # 6. Load validated configuration and aligned input tables.
     try:
         logger.info("Ingesting configuration and raw data matrices...")
 
         params = load_pipeline_config(config_path=clean_config)
 
-        # Ingest metadata (Sample info, Batch, Injection Order)
+        # Metadata describes sample identity, roles, batch, and injection order.
         meta_df = pd.read_csv(clean_meta, header=[0])
 
-        # Ingest the feature intensity peak table (Feature IDs as index)
+        # The intensity table uses feature identifiers as its row index.
         int_df = pd.read_csv(clean_intensity, index_col=[0], header=[0])
 
     except FileNotFoundError as fnf_err:
@@ -167,25 +161,39 @@ def main() -> None:
         logger.error(f"Data ingestion failed: {e}")
         sys.exit(1)
 
-    # 7. Pipeline Orchestration
+    # 7. Execute the complete native orchestration path.
     try:
         logger.info("Triggering algorithmic core. Processing...")
 
-        # Execute the unified runner and retain its structured in-memory result.
-        # Data Builder -> MV-related Filtering -> Correction
-        # -> Quality-related Filtering -> Imputation -> Normalization
-        # -> Report Generation
+        # MetaboDatasetBuilder constructs the raw dataset and typed Audit.
+        # The runner then performs independent sample and
+        # feature missingness filtering, signal correction, feature-quality
+        # filtering, imputation, normalization, QA, and report generation.
+        # Its PipelineResult retains the final MetaboDataset, every typed
+        # StageResult/Audit, cross-stage QA metrics, and report metadata.
 
         pipeline_result = run_pipeline(
-            meta_df=meta_df, int_df=int_df, params=params, output_dir=clean_outdir
+            meta_df=meta_df,
+            int_df=int_df,
+            params=params,
+            output_dir=clean_outdir,
         )
 
+        if not pipeline_result.report_generated:
+            logger.error(
+                "Scientific processing completed, but report export failed. "
+                f"Stage outputs remain available at {clean_outdir}."
+            )
+            sys.exit(2)
+
         logger.success("=" * 79)
-        logger.success("Execution successful! Audit reports generated successfully.")
+        logger.success(
+            "Execution successful! Audit reports generated successfully."
+        )
         logger.success(
             "Final normalized matrix: "
-            f"{pipeline_result.data.shape[0]} features x "
-            f"{pipeline_result.data.shape[1]} samples."
+            f"{pipeline_result.data.intensity.shape[0]} features x "
+            f"{pipeline_result.data.intensity.shape[1]} samples."
         )
         logger.success(f"   --> {clean_outdir}")
         logger.success("=" * 79)

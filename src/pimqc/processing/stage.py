@@ -1,20 +1,23 @@
 """Define the common compute, export, and render stage lifecycle.
 
-``StageResult`` carries computed data together with metrics, candidate audits,
-and stage metadata. ``StageRunner`` executes calculations first and performs
-filesystem and visualization work only when an output directory is supplied.
+``StageResult`` carries computed data and one typed audit. ``StageRunner``
+executes calculations first and performs filesystem and payload-driven
+visualization work only when an output directory is supplied.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Generic, Mapping, TypeVar
+from typing import Any, Generic, Mapping, TypeVar, cast
 
 from ..io import ensure_directory
+from ..config.resolution import validate_stage_values
+from .audit import AuditPayload
 
 DataT = TypeVar("DataT")
 ProcessorT = TypeVar("ProcessorT")
+AuditT = TypeVar("AuditT", bound=AuditPayload)
 
 
 def validate_runtime_overrides(
@@ -45,7 +48,12 @@ def validate_runtime_overrides(
                 f"{type(processor).__name__}: {unknown_text}. "
                 f"Supported options: {supported}."
             )
-    return overrides
+    engine = getattr(processor, "_engine", processor)
+    section = type(engine).__name__
+    merged = validate_stage_values(
+        section, {**getattr(processor, "config", {}), **overrides}
+    )
+    return {key: merged[key] for key in overrides}
 
 
 def apply_runtime_overrides(
@@ -71,13 +79,13 @@ def apply_runtime_overrides(
     if not overrides:
         return {}
 
-    attrs = getattr(processor, "attrs", None)
-    if attrs is None:
+    config = getattr(processor, "config", None)
+    if config is None:
         raise TypeError(
-            "Stage processors must expose an 'attrs' mapping for runtime "
+            "Stage processors must expose a 'config' mapping for runtime "
             "configuration."
         )
-    attrs.update(overrides)
+    config.update(overrides)
 
     invalidate = getattr(processor, "_invalidate_cached_properties", None)
     if callable(invalidate):
@@ -92,20 +100,28 @@ def apply_runtime_overrides(
 
 @dataclass
 class StageResult(Generic[DataT]):
-    """Carry computed data and its audit information between stage phases.
+    """Carry one data result and one typed audit between stage phases.
 
-    ``render_context`` is execution-local and deliberately separate from the
-    portable result fields. It makes visualization dependencies explicit
-    without implying that live processor objects belong in a future exchange
-    or serialization schema.
+    Plotting inputs belong to the typed audit payload and never reference the
+    live processor.
     """
 
     data: DataT
-    metrics: Mapping[str, Any] = field(default_factory=dict)
-    candidates: Any = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-    render_context: dict[str, Any] = field(default_factory=dict, repr=False)
-    audit_tables: dict[str, Any] = field(default_factory=dict)
+    audit: AuditPayload
+
+    def __post_init__(self) -> None:
+        """Reject values that do not implement the typed audit contract."""
+        if not isinstance(self.audit, AuditPayload):
+            raise TypeError("audit must be an AuditPayload instance.")
+
+    def require_audit(self, audit_type: type[AuditT]) -> AuditT:
+        """Return the audit narrowed to an expected stage-specific type."""
+        if not isinstance(self.audit, audit_type):
+            raise TypeError(
+                f"Expected {audit_type.__name__}, received "
+                f"{type(self.audit).__name__}."
+            )
+        return cast(AuditT, self.audit)
 
 
 class StageRunner(ABC, Generic[ProcessorT, DataT]):
@@ -154,7 +170,6 @@ class StageRunner(ABC, Generic[ProcessorT, DataT]):
         # Complete all calculations before permitting filesystem or plotting
         # side effects, so callers can run a computation-only lifecycle.
         result = self.compute()
-        result.render_context.setdefault("processor", self.processor)
         if self.output_dir is not None:
             self.output_dir = ensure_directory(self.output_dir)
             # Export before rendering because dashboards may refer to the

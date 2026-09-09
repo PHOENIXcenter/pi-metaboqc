@@ -6,14 +6,14 @@ reference validation and specialized analysis workflows.
 """
 
 from .algorithms import _numba_loess_robust, _select_loess_span_oof
-from .analysis import MetaboIntCorrector
+from .analysis import SignalCorrector
 from .regression import RegressionCorrector
 from .ruv import RUVCorrector
 from .serrf import SERRFCorrector
 from .waveica import WaveICA2Corrector
 
 __all__ = [
-    "MetaboIntCorrector",
+    "SignalCorrector",
     "RegressionCorrector",
     "RUVCorrector",
     "SERRFCorrector",

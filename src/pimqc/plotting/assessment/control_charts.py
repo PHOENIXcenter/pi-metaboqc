@@ -10,7 +10,7 @@ import matplotlib.lines as mlines
 import pandas as pd
 import seaborn as sns
 
-from ...core import model
+from ...core import MetaboDataset
 from .. import plot_utils as pu
 
 
@@ -90,8 +90,8 @@ class AssessmentControlChartMixin:
                 markers=self.style_map,
             )
 
-            solid, lower, upper = model.MetaboInt.calculate_boundaries(
-                x=ref_data[feat].values, boundary_type=bound_type
+            solid, lower, upper = MetaboDataset.calculate_boundaries(
+                values=ref_data[feat].values, boundary_type=bound_type
             )
 
             is_out = (plot_df[feat] < lower) | (plot_df[feat] > upper)

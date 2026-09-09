@@ -328,6 +328,22 @@ def calc_distribution_distance_metrics(
 # =============================================================================
 # Target Data Extraction for Imputation and Normalization
 # =============================================================================
+def _role_columns(
+    obj: pd.DataFrame,
+    role_key: str,
+    default_label: str,
+) -> pd.Index:
+    """Resolve sample columns for one role from annotated-frame metadata."""
+    sample_type = obj.attrs.get("sample_type", "Sample Type")
+    if not isinstance(obj.columns, pd.MultiIndex):
+        return pd.Index([])
+    if sample_type not in obj.columns.names:
+        return pd.Index([])
+    label = obj.attrs.get("sample_dict", {}).get(role_key, default_label)
+    mask = obj.columns.get_level_values(sample_type) == label
+    return obj.columns[mask]
+
+
 def _extract_log2_target(
     obj: pd.DataFrame | None, auto_log_for_vis: bool = True
 ) -> pd.DataFrame | None:
@@ -340,10 +356,8 @@ def _extract_log2_target(
     if obj is None:
         return None
 
-    try:
-        target_cols = obj.columns.difference(obj._blank.columns)
-    except (AttributeError, KeyError):
-        target_cols = obj.columns
+    blank_cols = _role_columns(obj, "Blank sample", "Blank")
+    target_cols = obj.columns.difference(blank_cols)
     data = obj[target_cols].astype(float)
 
     is_logged = obj.attrs.get("is_logged", False)

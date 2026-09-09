@@ -1,10 +1,7 @@
 """Dataset construction and validation from metadata and intensity tables.
 
-MetaboIntBuilder reconciles sample identifiers, validates required metadata,
-normalizes acquisition order, detects available QC, blank, internal-standard,
-and reference-feature channels, then returns an annotated MetaboInt object.
-It records audit information and exports construction diagnostics for the first
-pipeline stage.
+Align sample identities, validate acquisition metadata, and create the explicit
+dataset and typed construction audit consumed by native processing stages.
 """
 
 import os
@@ -15,15 +12,26 @@ from loguru import logger
 from typing import Optional, Dict, Any
 
 from ..io import ensure_directory
+from ..config import validate_pipeline_params
+from ..plotting.payloads import DatasetPlotPayload, snapshot_dataset
+from ..processing.audit import DatasetAuditPayload
+from ..processing.stage import StageResult
 from ..runtime import log_execution_time
-from ..core.model import MetaboInt
+from ..core.dataset import (
+    DatasetSchema,
+    MetaboDataset,
+    ProcessingContext,
+    SampleRoleLabels,
+)
 
 
-class MetaboIntBuilder:
-    """
-    Builder class responsible for data integrity checks, metadata
-    alignment, and the construction of the core MetaboInt object.
-    Driven completely by the pipeline TOML configuration.
+class MetaboDatasetBuilder:
+    """Validate input tables and run the dataset-construction stage.
+
+    ``run_build`` returns the aligned ``MetaboDataset`` and its typed audit
+    through ``StageResult``, matching the other processing actors. Supplying
+    an output directory also exports the raw table and acquisition overview.
+    Configuration comes from the validated pipeline ``Dataset`` section.
     """
 
     def __init__(
@@ -32,21 +40,22 @@ class MetaboIntBuilder:
         int_df: pd.DataFrame,
         pipeline_params: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Initialize builder using global pipeline configuration."""
+        """Copy input tables and validate configuration without file output."""
         self.metadata_dataframe = meta_info.copy()
         self.intensity_dataframe = int_df.copy()
-        self.params = pipeline_params or {}
+        self.params = validate_pipeline_params(pipeline_params)
 
         # Extract configuration attributes smartly
-        metabo_parms = self.params.get("MetaboInt", {})
+        dataset_params = self.params.get("Dataset", {})
 
-        self.mode = metabo_parms.get("mode", "POS")
-        self.batch = metabo_parms.get("batch", "Batch")
-        self.sample_type = metabo_parms.get("sample_type", "Sample Type")
-        self.bio_group = metabo_parms.get("bio_group", "Bio Group")
-        self.sample_name = metabo_parms.get("sample_name", "Sample Name")
-        self.inject_order = metabo_parms.get("inject_order", "Inject Order")
-        self.resort_strategy = metabo_parms.get("resort_inject_order", "Auto")
+        self.dataset_params = dataset_params
+        self.mode = dataset_params.get("mode", "ESI+")
+        self.batch = dataset_params.get("batch", "Batch")
+        self.sample_type = dataset_params.get("sample_type", "Sample Type")
+        self.bio_group = dataset_params.get("bio_group", "Bio Group")
+        self.sample_name = dataset_params.get("sample_name", "Sample Name")
+        self.inject_order = dataset_params.get("inject_order", "Inject Order")
+        self.resort_strategy = dataset_params.get("resort_inject_order", "Auto")
 
         self.unique_batches = []
         self.is_multi_batch = False
@@ -252,7 +261,7 @@ class MetaboIntBuilder:
                     batch_mask, self.inject_order
                 ].max()
 
-    def _audit_dataset_health(self, metabo_obj: MetaboInt) -> None:
+    def _audit_dataset_health(self, dataset: MetaboDataset) -> None:
         """
         Conducts a comprehensive health audit on the newly built dataset.
         Emits targeted warnings and infos to set user expectations regarding
@@ -261,14 +270,14 @@ class MetaboIntBuilder:
         logger.info("Executing dataset health audit...")
 
         # Blank Samples Check
-        if metabo_obj._blank.empty:
+        if dataset.blank_data.empty:
             logger.warning(
                 "[Audit] No Blank samples detected. Pipeline will skip Stage-2 "
                 "Blank/QC ratio filtering and degrade to QC RSD check only."
             )
 
         # Biological Groups Check
-        if not self.bio_group or self.bio_group not in metabo_obj.columns.names:
+        if not self.bio_group or self.bio_group not in dataset.sample_metadata:
             logger.warning(
                 "[Audit] No Biological Group information detected. "
                 "Missing value "
@@ -276,7 +285,7 @@ class MetaboIntBuilder:
             )
 
         # Internal Standards (IS) Check
-        if len(getattr(metabo_obj, "valid_is", [])) == 0:
+        if not dataset.valid_internal_standards:
             logger.warning(
                 "[Audit] No Internal Standards (IS) detected. "
                 "Analytical outlier "
@@ -284,7 +293,7 @@ class MetaboIntBuilder:
             )
 
         # Outlier Reference Features (ORF) Check
-        if len(getattr(metabo_obj, "valid_orf", [])) == 0:
+        if not dataset.valid_outlier_reference_features:
             logger.info(
                 "[Audit] No Outlier Reference Features (ORF) detected. This is "
                 "normal for untargeted datasets; ORF diagnostics "
@@ -293,7 +302,7 @@ class MetaboIntBuilder:
 
         # High-throughput Cohort Check (Batch Count > 15)
         # Threshold set to 15 to match the plotter's MathText threshold
-        n_batches = len(metabo_obj.attrs.get("batch_list", []))
+        n_batches = len(dataset.ordered_batches)
         if n_batches > 15:
             logger.info(
                 f"[Audit] High batch count (n={n_batches}) detected. "
@@ -302,15 +311,16 @@ class MetaboIntBuilder:
             )
 
         # Critical QC Density Check
-        if metabo_obj._qc.empty:
+        if dataset.qc_data.empty:
             logger.error(
                 "[Audit] FATAL: No QC samples detected! Subsequent correction "
                 "and evaluation steps will inevitably fail."
             )
         else:
-            qc_counts = metabo_obj._qc.columns.get_level_values(
-                self.batch
-            ).value_counts()
+            qc_ids = dataset.role_sample_ids("qc")
+            qc_counts = dataset.sample_metadata.loc[
+                qc_ids, self.batch
+            ].value_counts()
 
             # Warn if any batch has fewer than 3 QCs (Minimum required for
             # SVR/RFSC)
@@ -322,27 +332,58 @@ class MetaboIntBuilder:
                     "QC-SVR) may severely overfit or fail in these batches."
                 )
 
-    def execute_build(self, output_dir: Optional[str] = None) -> MetaboInt:
-        """Execute the validation pipeline and build the MetaboInt object."""
+    @log_execution_time
+    def run_build(
+        self,
+        output_dir: str | Path | None = None,
+    ) -> StageResult[MetaboDataset]:
+        """Build data and audit, then optionally export and render artifacts.
+
+        Args:
+            output_dir: Directory for ``Raw_Data_Intensity.csv`` and
+                ``Global_Acquisition_Overview.svg``. Omit it to run entirely
+                in memory, including preparation of the audit plot payload.
+
+        Returns:
+            A stage result containing the dataset and ``DatasetAuditPayload``.
+        """
+        from .runner import DatasetBuildStageRunner
+
+        return DatasetBuildStageRunner(self, output_dir).run()
+
+    def compute_build(self) -> StageResult[MetaboDataset]:
+        """Prepare the dataset and detached audit without file or plot output.
+
+        Construction uses the same validation and alignment rules as the
+        data-only ``execute_build`` interface.
+        """
+        dataset = self.execute_build()
+        return StageResult(
+            data=dataset,
+            audit=DatasetAuditPayload(
+                metric_values=dataset.dataset_metrics,
+                plot_payload=DatasetPlotPayload(data=snapshot_dataset(dataset)),
+            ),
+        )
+
+    def execute_build(
+        self,
+        output_dir: str | Path | None = None,
+    ) -> MetaboDataset:
+        """Build the dataset using the legacy data-only interface.
+
+        An output directory enables CSV export only, preserving this method's
+        original behavior. Use ``run_build`` for the typed audit and dashboard.
+        """
         self._resolve_duplicate_features()
         self._check_duplicate_samples()
         self._verify_sample_consistency()
         self._verify_metadata_completeness()
         self._manage_injection_orders()
 
-        # Build MultiIndex matrix
+        # Keep the canonical matrix flat and align explicit sample metadata.
         self.intensity_dataframe = self.intensity_dataframe.rename_axis(
             index=["Metabolite"], columns=[self.sample_name]
-        )
-        column_dataframe = (
-            self.intensity_dataframe.columns.to_frame().reset_index(drop=True)
-        )
-
-        column_dataframe = pd.merge(
-            left=column_dataframe,
-            right=self.metadata_dataframe,
-            on=self.sample_name,
-            how="left",
         )
 
         has_bio_group = pd.notna(self.bio_group) and (
@@ -364,16 +405,15 @@ class MetaboIntBuilder:
                 self.sample_name,
             ]
         )
-
-        self.intensity_dataframe.columns = pd.MultiIndex.from_frame(
-            column_dataframe.loc[:, column_order]
+        column_order.extend(
+            column
+            for column in self.metadata_dataframe.columns
+            if column not in column_order
         )
 
-        # Filter out samples lacking names
-        valid_mask = self.intensity_dataframe.columns.get_level_values(
-            level=self.sample_name
-        ).notnull()
-        self.intensity_dataframe = self.intensity_dataframe.loc[:, valid_mask]
+        metadata = self.metadata_dataframe.set_index(self.sample_name).loc[
+            list(self.intensity_dataframe.columns)
+        ]
 
         # =====================================================================
         # Zero-value detection and conversion
@@ -397,65 +437,77 @@ class MetaboIntBuilder:
         # Use float64 for stable downstream machine-learning assignments.
         self.intensity_dataframe = self.intensity_dataframe.astype(float)
 
+        roles = SampleRoleLabels.from_mapping(
+            self.dataset_params.get("sample_dict", {})
+        )
+        schema = DatasetSchema(
+            feature_id=self.intensity_dataframe.index.name or "Metabolite",
+            sample_id=self.sample_name,
+            sample_type=self.sample_type,
+            batch=self.batch,
+            injection_order=self.inject_order,
+            biological_group=(self.bio_group if has_bio_group else None),
+            roles=roles,
+            sample_metadata_order=tuple(column_order),
+        )
+        context = ProcessingContext.from_mapping(self.dataset_params)
+        dataset = MetaboDataset.from_tables(
+            intensity=self.intensity_dataframe,
+            sample_metadata=metadata,
+            schema=schema,
+            context=context,
+        )
+
         if output_dir:
             ensure_directory(output_dir)
-            output_path = os.path.join(output_dir, "Raw_Data_Intensity.csv")
-            self.intensity_dataframe.to_csv(
-                output_path, na_rep="NA", encoding="utf-8-sig"
-            )
-            logger.info(f"MetaboInt raw dataset saved as: {output_path}")
-
-        # Instantiate MetaboInt
-        metabo_obj = MetaboInt(
-            self.intensity_dataframe,
-            pipeline_params=self.params,
-            mode=self.mode,
-            sample_name=self.sample_name,
-            sample_type=self.sample_type,
-            bio_group=self.bio_group,
-            batch=self.batch,
-            inject_order=self.inject_order,
-        )
-
-        metabo_obj.attrs["is_multi_batch"] = self.is_multi_batch
-        metabo_obj.attrs["batch_list"] = self.unique_batches.tolist()
+            _export_dataset_table(dataset, output_dir)
 
         logger.info(
-            f"MetaboInt object built: {metabo_obj.shape[0]} metabolites, "
-            f"{metabo_obj.shape[1]} samples."
+            f"MetaboDataset built: {dataset.intensity.shape[0]} metabolites, "
+            f"{dataset.intensity.shape[1]} samples."
         )
 
-        self._audit_dataset_health(metabo_obj)
+        self._audit_dataset_health(dataset)
 
-        return metabo_obj
+        return dataset
 
 
-@log_execution_time
 def build_dataset(
     meta_info: pd.DataFrame,
     int_df: pd.DataFrame,
     pipeline_params: Optional[Dict[str, Any]] = None,
-    output_dir: Optional[str] = None,
-) -> MetaboInt:
+    output_dir: str | Path | None = None,
+) -> MetaboDataset:
+    """Return only the dataset through the compatible functional interface.
+
+    New workflows should use ``MetaboDatasetBuilder(...).run_build()`` to
+    retain the typed dataset audit as well. This wrapper delegates the full
+    timed build/export/render lifecycle to that same class implementation.
     """
-    Factory wrapper for MetaboIntBuilder, driven strictly by configuration.
-    Accepts raw dataframes and config, returning a MetaboInt object.
-    """
-    builder = MetaboIntBuilder(
+    builder = MetaboDatasetBuilder(
         meta_info=meta_info, int_df=int_df, pipeline_params=pipeline_params
     )
 
-    metabo_obj = builder.execute_build(output_dir=output_dir)
-    if output_dir is not None:
-        _render_dataset_dashboard(metabo_obj, output_dir)
-    return metabo_obj
+    return builder.run_build(output_dir=output_dir).data
+
+
+def _export_dataset_table(
+    dataset: MetaboDataset,
+    output_dir: str | os.PathLike[str],
+) -> None:
+    """Write the established raw CSV for both builder entry points."""
+    output_path = os.path.join(output_dir, "Raw_Data_Intensity.csv")
+    dataset.annotated_frame().to_csv(
+        output_path, na_rep="NA", encoding="utf-8-sig"
+    )
+    logger.info(f"Raw dataset saved as: {output_path}")
 
 
 def _render_dataset_dashboard(
-    metabo_obj: MetaboInt,
+    payload: DatasetPlotPayload,
     output_dir: str | os.PathLike[str],
 ) -> None:
-    """Render the dataset overview as part of dataset execution.
+    """Render the dataset overview from the completed audit's plot payload.
 
     Plotting is imported lazily so dataset validation and construction remain
     usable without importing the plotting stack. Notebook display is handled
@@ -464,7 +516,7 @@ def _render_dataset_dashboard(
     from ..plotting.dataset import DatasetPlotter
 
     try:
-        plotter = DatasetPlotter(builder_obj=metabo_obj)
+        plotter = DatasetPlotter(payload)
         dashboard = plotter.plot_dataset_dashboard()
         if dashboard is None:
             logger.warning(
@@ -473,7 +525,9 @@ def _render_dataset_dashboard(
             )
             return
 
-        overview_path = Path(output_dir) / "Global_Acquisition_Overview.svg"
+        overview_path = os.path.join(
+            output_dir, "Global_Acquisition_Overview.svg"
+        )
         plotter.save_and_show_pw(
             pw_obj=dashboard,
             file_path=str(overview_path),

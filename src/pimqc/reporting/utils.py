@@ -1,18 +1,17 @@
 """Report narrative, visual-asset assembly, and document-rendering utilities.
 
 The module collects stage figures and metrics, constructs scientific narrative
-statistics, stitches compatible SVG dashboards, renders Jinja report templates,
+statistics, draws audit-backed QA dashboards, renders Jinja report templates,
 and exports Markdown, HTML, or PDF deliverables. It also validates template
 references and removes intermediate assets after report assembly when required.
 """
 
 import os
+import re
 from datetime import datetime
 import sys
-import math
 
 import subprocess
-import ctypes
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -23,410 +22,10 @@ from loguru import logger
 from .models import ReportInput
 from typing import Union, Optional, Dict, Any
 
-# CairoSVG defaults to a 96 dpi raster surface.  Report previews are displayed
-# at a reduced CSS width, so render the stitched SVG at a larger pixel surface
-# before handing it to the notebook image widget.
-STITCHED_PNG_SCALE = 3.0
-
-
-# =============================================================================
-# Atomic Utility Functions
-# =============================================================================
-def _get_optimal_cols(n_docs: int, max_cols: int = 4) -> int:
-    """Calculates optimal grid columns for subplot layout.
-
-    Args:
-        n_docs (int): Total number of documents to stitch.
-        max_cols (int): Maximum allowed columns. Defaults to 4.
-
-    Returns:
-        int: Optimal number of columns bounded by max_cols.
-    """
-    if n_docs <= 0:
-        return 1
-
-    # Preset aesthetic mappings for typical plot counts to avoid
-    # disproportionate grid aspect ratios (e.g., forcing 2x2 for 4 plots)
-    layout_map = {
-        1: 1,
-        2: 2,
-        3: 3,
-        4: 2,
-        5: 3,
-        6: 3,
-        7: 4,
-        8: 4,
-        9: 3,
-        10: 4,
-        11: 4,
-        12: 4,
-    }
-
-    if n_docs in layout_map:
-        cols = layout_map[n_docs]
-    else:
-        # Fallback for dynamic calculation on arbitrary large numbers
-        cols = math.ceil(math.sqrt(n_docs))
-
-    return min(max_cols, cols)
-
-
-def stitch_svg_grids(
-    svg_paths: list,
-    file_path: str,
-    cols: Union[int, str] = "auto",
-    max_cols: int = 4,
-    show_plot: bool = True,
-    save_format: Optional[Union[str, list, tuple]] = ["svg", "pdf"],
-    display_format: str = "png",
-    width: Optional[Union[int, str]] = "60%",
-    legend_paths: Optional[list] = None,
-    suptitle: Optional[str] = None,
-    target_width_cm: Optional[float] = 17.8,
-) -> bool:
-    """
-    Stitches multiple SVGs into a grid, saves to disk, and displays inline.
-
-    Assembles individual SVG plots into a unified master SVG grid. Provides
-    dynamic file conversion to PDF/PNG via CairoSVG and aligns with the
-    project's standard Jupyter rendering logic (supporting native VS Code
-    image toolbars and responsive layouts).
-
-    Args:
-    svg_paths (list): List of paths to source SVG subplots.
-    file_path (str): Destination base path for the stitched file(s).
-    cols (Union[int, str]): Number of columns, or 'auto'.
-    max_cols (int): Maximum allowed columns when using 'auto'.
-    show_plot (bool): Whether to render the result in Jupyter/VS Code.
-    save_format (Optional[Union[str, list, tuple]]): Disk export formats.
-    display_format (str): Inline format for notebook preview ('svg' or 'png').
-    width (Optional[Union[int, str]]): CSS width for Jupyter display.
-    legend_paths (Optional[list]): Candidate shared-legend SVGs. At most
-    one valid legend is placed beside the main grid.
-    suptitle (Optional[str]): Shared title placed above the stitched grid.
-    target_width_cm (Optional[float]): Physical target width of the assembled
-    figure in centimetres. Source panels and sidecar legends are scaled
-    together so their typography remains consistent. ``None`` preserves
-    the native source width.
-
-    Returns:
-    bool: True if the stitching and saving were successful, False otherwise.
-
-    """
-    try:
-        import svgutils.transform as sg
-    except ImportError:
-        logger.error("Please install 'svgutils' via 'pip install svgutils'.")
-        return False
-
-    try:
-        # Validate and filter input paths
-        valid_paths = [
-            p
-            for p in svg_paths
-            if Path(p).exists() and Path(p).stat().st_size > 0
-        ]
-        if not valid_paths:
-            return False
-
-        # Calculate optimal grid dimensions
-        n_docs = len(valid_paths)
-        active_cols = (
-            _get_optimal_cols(n_docs, max_cols) if cols == "auto" else int(cols)
-        )
-        rows = (n_docs + active_cols - 1) // active_cols
-
-        # Robust UTF-8 reading to prevent GBK codec errors on Windows
-        svg_figs = []
-        for p in valid_paths:
-            with open(p, "r", encoding="utf-8") as f:
-                svg_figs.append(sg.fromstring(f.read()))
-
-        # Extract maximum dimensions for uniform grid alignment
-        def parse_dim(val: str) -> float:
-            import re
-
-            match = re.search(r"(\d+\.?\d*)", str(val))
-            return float(match.group(1)) if match else 0.0
-
-        def figure_dims(figure: object) -> tuple[float, float]:
-            """Read width/height, falling back to the SVG viewBox."""
-            width = parse_dim(getattr(figure, "width", None))
-            height = parse_dim(getattr(figure, "height", None))
-            if width > 0 and height > 0:
-                return width, height
-            view_box = (
-                str(figure.root.get("viewBox", "")).replace(",", " ").split()
-            )
-            if len(view_box) >= 4:
-                return parse_dim(view_box[2]), parse_dim(view_box[3])
-            return width, height
-
-        dimensions = [figure_dims(f) for f in svg_figs]
-        max_w = max(width for width, _ in dimensions)
-        max_h = max(height for _, height in dimensions)
-
-        # A sidecar legend is deliberately excluded from the main grid. This
-        # preserves the stage ordering while avoiding repeated legend blocks.
-        legend_fig = None
-        if legend_paths:
-            for legend_path in legend_paths:
-                path = Path(legend_path)
-                if not path.exists() or path.stat().st_size == 0:
-                    continue
-                with open(path, "r", encoding="utf-8") as f:
-                    legend_fig = sg.fromstring(f.read())
-                break
-
-        legend_w, legend_h = (
-            figure_dims(legend_fig) if legend_fig is not None else (0.0, 0.0)
-        )
-
-        # Source QA panels are intentionally compact. Reserve explicit gutters
-        # between their SVG canvases so axis labels and tick labels are never
-        # covered by the white background of the following panel. The outer
-        # padding also protects the first-column y label and last-row x label.
-        panel_gap_x = max(4.0, max_w * 0.04) if active_cols > 1 else 0.0
-        panel_gap_y = max(6.0, max_h * 0.07) if rows > 1 else 0.0
-        outer_pad_x = max(3.0, max_w * 0.025)
-        outer_pad_y = max(3.0, max_h * 0.025)
-        native_grid_w = (
-            max_w * active_cols
-            + panel_gap_x * max(0, active_cols - 1)
-            + 2.0 * outer_pad_x
-        )
-        native_grid_h = (
-            max_h * rows + panel_gap_y * max(0, rows - 1) + 2.0 * outer_pad_y
-        )
-        native_title_h = max(18.0, max_h * 0.13) if suptitle else 0.0
-        native_total_h = native_grid_h + native_title_h
-
-        # Seven correction candidates naturally leave one slot in a 2 x 4
-        # grid. Reuse it for the legend; six candidates retain a 2 x 3 grid
-        # with an independent legend column on the right.
-        embed_legend = (
-            legend_fig is not None
-            and n_docs == 7
-            and active_cols == 4
-            and rows == 2
-        )
-        legend_col_w = 0.0
-        if legend_fig is not None and not embed_legend:
-            # Sidecars are tightly cropped at export. Keep only a small gutter
-            # here, rather than expanding the legend to a fraction of plot
-            # width.
-            legend_col_w = legend_w + max(2.0, max_w * 0.015)
-
-        native_total_w = native_grid_w + legend_col_w
-        if target_width_cm is None:
-            scale = 1.0
-            total_w = native_total_w
-        else:
-            # SVG user units emitted by Matplotlib are points, so convert the
-            # requested centimetre width to points before applying one common
-            # scale to plots, titles, and sidecar legends.
-            target_width = float(target_width_cm) * 72.0 / 2.54
-            scale = target_width / native_total_w if native_total_w > 0 else 1.0
-            total_w = target_width
-        title_h = native_title_h * scale
-        total_h = native_total_h * scale
-
-        # Initialize the master canvas with a white background
-        fig = sg.SVGFigure(f"{total_w}", f"{total_h}")
-        bg_svg = sg.fromstring(
-            '<svg><rect width="100%" height="100%" fill="white"/></svg>'
-        ).getroot()
-
-        plots = [bg_svg]
-
-        if suptitle:
-            title = sg.TextElement(
-                (native_grid_w * scale) / 2,
-                title_h * 0.66,
-                str(suptitle),
-                size=max(10.0, 9.0 * scale),
-                weight="bold",
-            )
-            title.root.set("text-anchor", "middle")
-            title.root.set(
-                "style",
-                "font-family: Helvetica, Arial, Liberation Sans, Nimbus Sans, "
-                "DejaVu Sans, sans-serif; fill: #262626;",
-            )
-            plots.append(title)
-
-        # Position each subplot into the calculated grid slot
-        for i, s_fig in enumerate(svg_figs):
-            row, col = divmod(i, active_cols)
-            plot = s_fig.getroot()
-            x_pos = (outer_pad_x + col * (max_w + panel_gap_x)) * scale
-            y_pos = (
-                title_h + (outer_pad_y + row * (max_h + panel_gap_y)) * scale
-            )
-            plot.moveto(x_pos, y_pos, scale_x=scale)
-            plots.append(plot)
-
-        if legend_fig is not None:
-            legend = legend_fig.getroot()
-            if embed_legend:
-                row, col = divmod(n_docs, active_cols)
-                x_pos = (
-                    outer_pad_x
-                    + col * (max_w + panel_gap_x)
-                    + max(2.0, max_w * 0.015)
-                ) * scale
-                y_pos = (
-                    title_h
-                    + (outer_pad_y + row * (max_h + panel_gap_y)) * scale
-                    + max(0.0, (max_h - legend_h) / 2) * scale
-                )
-            else:
-                x_pos = (native_grid_w + max(2.0, max_w * 0.015)) * scale
-                y_pos = (
-                    title_h + max(0.0, (native_grid_h - legend_h) / 2) * scale
-                )
-            legend.moveto(x_pos, y_pos, scale_x=scale)
-            plots.append(legend)
-
-        # Assemble and set viewBox
-        fig.append(plots)
-        fig.root.set("viewBox", f"0 0 {total_w} {total_h}")
-        # Keep a physical width for PDF/Illustrator consumers while retaining
-        # the viewBox coordinates used for responsive SVG placement.
-        fig.root.set("width", f"{total_w}pt")
-        fig.root.set("height", f"{total_h}pt")
-
-        # Extract raw byte string for memory-based format conversion
-        merged_svg_bytes = fig.to_str()
-        merged_svg_str = merged_svg_bytes.decode("utf-8")
-
-        # Format Normalization & Physical Storage Logic
-        filepath_str = str(file_path)
-        base_path = (
-            filepath_str.rsplit(".", 1)[0]
-            if "." in Path(filepath_str).name
-            else filepath_str
-        )
-
-        if save_format:
-            format_list = (
-                [save_format]
-                if isinstance(save_format, str)
-                else list(save_format)
-            )
-
-            for fmt in format_list:
-                clean_fmt = fmt.lower().strip(".")
-                out_path = f"{base_path}.{clean_fmt}"
-
-                if clean_fmt == "svg":
-                    with open(out_path, "wb") as f:
-                        f.write(merged_svg_bytes)
-                else:
-                    # Leverage CairoSVG for dynamic vector/raster conversion
-                    try:
-                        import cairosvg
-
-                        if clean_fmt == "pdf":
-                            cairosvg.svg2pdf(
-                                bytestring=merged_svg_bytes, write_to=out_path
-                            )
-                        elif clean_fmt == "png":
-                            cairosvg.svg2png(
-                                bytestring=merged_svg_bytes,
-                                write_to=out_path,
-                                scale=STITCHED_PNG_SCALE,
-                            )
-                    except ImportError:
-                        logger.error(
-                            f"Cannot save {clean_fmt.upper()}: 'cairosvg' is "
-                            "not installed. Run `pip install cairosvg`."
-                        )
-
-        # Environment-safe Jupyter rendering logic
-        if show_plot:
-            try:
-                from ..runtime import is_jupyter
-
-                if is_jupyter():
-                    from IPython.display import HTML, Image, display
-                    import re
-
-                    display_fmt = display_format.lower()
-                    if display_fmt not in ["svg", "png"]:
-                        display_fmt = "svg"
-
-                    w_css = (
-                        f"{width}px"
-                        if isinstance(width, int)
-                        else (width if width else "100%")
-                    )
-
-                    if display_fmt == "svg":
-                        # Strip absolute dimensions for responsive UI preview
-                        preview_svg = re.sub(
-                            r'(<svg[^>]*?\s)width="[^"]+"',
-                            r'\1width="100%"',
-                            merged_svg_str,
-                            count=1,
-                        )
-                        preview_svg = re.sub(
-                            r'(<svg[^>]*?\s)height="[^"]+"',
-                            r'\1height="auto"',
-                            preview_svg,
-                            count=1,
-                        )
-
-                        container_style = (
-                            f"width:{w_css}; max-width:100%; margin: 0 auto; "
-                            f"height:auto; background-color: white;"
-                        )
-                        display(
-                            HTML(
-                                f'<div style="{container_style}">'
-                                f"{preview_svg}</div>"
-                            )
-                        )
-
-                    elif display_fmt == "png":
-                        try:
-                            import cairosvg
-
-                            # Force solid white background for VS Code dark mode
-                            png_data = cairosvg.svg2png(
-                                bytestring=merged_svg_bytes,
-                                background_color="white",
-                                scale=STITCHED_PNG_SCALE,
-                            )
-                            # Native Image rendering activates VS Code toolbars
-                            display(Image(data=png_data, width=width))
-                        except ImportError:
-                            logger.error(
-                                "Cannot preview PNG: 'cairosvg' missing. "
-                                "Falling back to SVG display."
-                            )
-                            # Safe fallback to SVG if Cairo is missing
-                            container_style = (
-                                f"width:{w_css}; max-width:100%; "
-                                "margin: 0 auto; "
-                                f"height:auto; background-color: white;"
-                            )
-                            display(
-                                HTML(
-                                    f'<div style="{container_style}">'
-                                    f"{merged_svg_str}</div>"
-                                )
-                            )
-
-            except Exception as e:
-                # Silently catch to keep terminal logs clean in headless mode
-                logger.debug(f"Jupyter rendering bypassed: {e}")
-
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to stitch SVG grid: {e}")
-        return False
+# from ..plotting.assembly import stitch_svg_grids as stitch_svg_grids
+from collections.abc import Mapping
+from ..processing.audit import AssessQualityAuditPayload
+from ..plotting.assessment.comparison import render_assessment_comparison
 
 
 # =============================================================================
@@ -456,151 +55,37 @@ class VisualAssetReporter:
 
     def compile_assessor_report(
         self,
+        audits: Mapping[str, AssessQualityAuditPayload],
         is_multi_batch: bool = True,
         report_folder: str = "13_Report_Markdown",
         cols: Union[int, str] = "auto",
-        cleanup_source_svgs: bool = True,
+        show_plot: bool = True,
     ) -> dict[str, str]:
-        """Compile QA SVG plots into grids and deploy to report assets.
-
-        When a stage exports ``*_Legend.svg`` sidecars, one is shared by the
-        stitched grid. Source plot and sidecar SVG/PDF files are removed only
-        after a successful stitch, leaving tables, metrics, and dashboards
-        untouched.
         """
-        if not self.qa_folders:
-            logger.error("No QA folders detected in the base directory.")
-            return {}
-
-        asset_manifest: dict[str, str] = {}
-
+        Draw QA grids from explicit audits using the shared patchwork renderer.
+        """
         report_path = self.base_dir / report_folder
-        assets_path = report_path / "assets"
-
-        report_path.mkdir(parents=True, exist_ok=True)
-        assets_path.mkdir(parents=True, exist_ok=True)
-
-        if is_multi_batch:
-            corr_prefix = "03_Batch_Correlation_Dashboard"
-            corr_file = "Batch_Correlation_Heatmap.svg"
-            corr_title = "Inter-Batch Pooled QC Correlation"
-            logger.info("Multi-batch design detected. Assembling Batch Grid.")
-        else:
-            corr_prefix = "03_QC_Correlation_Dashboard"
-            corr_file = "QC_Correlation_Heatmap.svg"
-            corr_title = "Pooled QCs Correlation"
-            logger.info("Single-batch design detected. Assembling QC Grid.")
-
-        # Target files now expect the .svg extension natively
-        target_map = {
-            "01_QC_Sample_RSD_Dashboard": (
-                "RSD_Barplot.svg",
-                "RSD_Barplot_Legend.svg",
-                "Feature RSD Distribution",
-            ),
-            "02_PCA_Scatter_Dashboard": (
-                "PCA_Scatter_QC_Sample.svg",
-                "PCA_Scatter_QC_Sample_Legend.svg",
-                "Pooled QC & Sample PCA Scatter",
-            ),
-            corr_prefix: (
-                corr_file,
-                f"{Path(corr_file).stem}_Legend.svg",
-                corr_title,
-            ),
-            "04_Outlier_Diagnosis_Dashboard": (
-                "Outlier_Scatter.svg",
-                "Outlier_Scatter_Legend.svg",
-                "Integrated Outlier Diagnostics",
-            ),
+        assets = render_assessment_comparison(
+            audits,
+            report_path / "assets",
+            is_multi_batch=is_multi_batch,
+            cols=cols,
+            show_plot=show_plot,
+        )
+        return {
+            name: str(path.relative_to(report_path))
+            for name, path in assets.items()
         }
-
-        for prefix, (target_file, legend_file, suptitle) in target_map.items():
-            # Output directly to the assets folder as an SVG grid
-            svg_out = assets_path / f"{prefix}.svg"
-            input_svgs = []
-            legend_svgs = []
-            for folder in self.qa_folders:
-                folder_path = self.base_dir / folder
-
-                source_dirs = [folder_path]
-                source_dirs.extend(
-                    sorted(
-                        (d for d in folder_path.iterdir() if d.is_dir()),
-                        key=lambda d: d.stat().st_mtime,
-                    )
-                )
-                for source_dir in source_dirs:
-                    source_file = source_dir / target_file
-                    if not source_file.exists():
-                        continue
-                    input_svgs.append(source_file)
-                    if legend_file:
-                        sidecar = source_dir / legend_file
-                        if sidecar.exists():
-                            legend_svgs.append(sidecar)
-
-            if not input_svgs:
-                logger.warning(f"Skipped {prefix}: No source SVGs found.")
-                continue
-            # Execute SVG stitching
-            stitched = stitch_svg_grids(
-                svg_paths=input_svgs,
-                file_path=svg_out,
-                legend_paths=legend_svgs,
-                suptitle=suptitle,
-                cols=cols,
-                save_format="svg",
-                display_format="png",
-            )
-            if stitched:
-                asset_manifest[prefix] = str(svg_out.relative_to(report_path))
-            if stitched and cleanup_source_svgs:
-                # The four QA panels and their sidecar legends are intermediate
-                # assets. Remove both vector formats after the final grid has
-                # been compiled so stale PDFs cannot remain beside the report.
-                cleanup_paths = []
-                for source_path in dict.fromkeys(input_svgs + legend_svgs):
-                    cleanup_paths.append(source_path)
-                    cleanup_paths.append(source_path.with_suffix(".pdf"))
-                    if target_file in {
-                        "QC_Correlation_Heatmap.svg",
-                        "Batch_Correlation_Heatmap.svg",
-                    }:
-                        # Assessment emits both correlation variants so the
-                        # same QA object can support single- and multi-batch
-                        # reports. Only one is stitched, but neither variant
-                        # should remain as an unreferenced intermediate.
-                        for stem in (
-                            "QC_Correlation_Heatmap",
-                            "Batch_Correlation_Heatmap",
-                        ):
-                            cleanup_paths.extend(
-                                [
-                                    source_path.parent / f"{stem}.svg",
-                                    source_path.parent / f"{stem}.pdf",
-                                    source_path.parent / f"{stem}_Legend.svg",
-                                    source_path.parent / f"{stem}_Legend.pdf",
-                                ]
-                            )
-                for source_path in dict.fromkeys(cleanup_paths):
-                    try:
-                        if source_path.exists():
-                            source_path.unlink()
-                    except OSError as exc:
-                        logger.warning(
-                            "Could not remove stitched source "
-                            f"{source_path}: {exc}"
-                        )
-        logger.success(f"Report SVG assets compiled at: {assets_path}")
-        return asset_manifest
 
 
 # =============================================================================
 # Narrative Statistics Reporter
 # =============================================================================
 class NarrativeStatsReporter:
-    """Extracts metadata from MetaboInt objects to generate a single report."""
+    """Extract metadata from structured stage metrics for one report."""
+
+    _IMAGE_REFERENCE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+    _TABLE_SEPARATOR = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$")
 
     # --- Define CSS as a class constant for cleaner maintenance ---
     REPORT_CSS = """
@@ -627,22 +112,84 @@ class NarrativeStatsReporter:
         height: auto;
     }
 
-    /* --- 3. Out-of-bounds Rendering Magic (WeasyPrint PDF) --- */
+    /* --- 3. Paged Layout (PDF only; Markdown remains portable) --- */
     @media print {
         @page {
-            /* Explicitly specify physical page margins for calculation */
-            margin: 25mm; 
+            size: A4;
+            margin: 20mm;
         }
-        
-        .full-width-image {
-            /* Occupy exactly 95% of the total physical page width.
-             * Math: 0.95 * (100% content width + 50mm total margins) */
-            width: calc(95% + 47.5mm) !important; 
-            
-            /* Shift outward equally to perfectly center the 95% width.
-             * Math: -(Desired Width - 100% Content Width) / 2 */
-            margin-left: calc(2.5% - 23.75mm) !important;
-            margin-right: calc(2.5% - 23.75mm) !important;
+
+        body {
+            /* Override Pandoc's screen-oriented body width and padding. */
+            max-width: none;
+            margin: 0;
+            padding: 0;
+            font-size: 11pt;
+            line-height: 1.3;
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            break-after: avoid;
+            page-break-after: avoid;
+            break-inside: avoid;
+        }
+
+        p, li {
+            orphans: 3;
+            widows: 3;
+        }
+
+        body figure {
+            break-inside: avoid;
+            page-break-inside: avoid;
+            margin: 10pt 0 12pt;
+        }
+
+        figure .full-width-image {
+            /* Auto dimensions preserve SVG aspect ratio under BOTH limits.
+             * Reserve vertical room for a multi-line caption on A4. */
+            width: auto;
+            height: auto;
+            max-width: 100%;
+            max-height: 205mm;
+            margin: 0 auto;
+        }
+
+        body figcaption {
+            margin-top: 6pt;
+            font-size: 9pt;
+            line-height: 1.25;
+            break-before: avoid;
+        }
+
+        body table {
+            max-width: 100%;
+            margin: 8pt auto 12pt;
+            font-size: 8.5pt;
+            line-height: 1.25;
+            /* Long tables may span pages; individual rows stay together. */
+            break-inside: auto;
+        }
+
+        body th, body td {
+            padding: 4pt 6pt;
+            overflow-wrap: break-word;
+        }
+
+        body thead {
+            display: table-header-group;
+        }
+
+        body tr {
+            break-inside: avoid;
+            page-break-inside: avoid;
+        }
+
+        body caption {
+            font-size: 9pt;
+            margin-bottom: 6pt;
+            break-after: avoid;
+            page-break-after: avoid;
         }
     }
 
@@ -712,29 +259,6 @@ class NarrativeStatsReporter:
         font-weight: bold;
     }
 
-    # /* --- 7. Advanced Typography Support (GitHub-Light Stack) --- */
-    # body {
-    #     /* Standard GitHub-Light sans-serif font stack */
-    # font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica,
-    #                 Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
-    #     line-height: 1.5;
-    #     color: #24292e;
-    # }
-
-    # code, pre, kbd, samp {
-    #     /* Professional monospace stack for data & parameters */
-    #     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, 
-    #                 Consolas, "Liberation Mono", monospace;
-    #     font-size: 85%;
-    #     background-color: rgba(27, 31, 35, 0.05);
-    #     padding: 0.2em 0.4em;
-    #     border-radius: 3px;
-    # }
-
-    # pre code {
-    #     background-color: transparent;
-    #     padding: 0;
-    # }
     """
     # Define standard pipeline stages for ordered iteration
     _QA_STAGES = [
@@ -757,6 +281,63 @@ class NarrativeStatsReporter:
                 f"Package templates directory is missing: {template_path}"
             )
         self.env = Environment(loader=FileSystemLoader(str(template_path)))
+
+    @classmethod
+    def _validate_markdown_source(cls, markdown_path: Path) -> None:
+        """Fail before export when assets or table captions are unresolved."""
+        content = markdown_path.read_text(encoding="utf-8")
+        missing_assets: list[str] = []
+        for match in cls._IMAGE_REFERENCE.finditer(content):
+            target = match.group(1).strip()
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1]
+            else:
+                target = target.split(maxsplit=1)[0]
+            if target.startswith(("http://", "https://", "data:", "#")):
+                continue
+            asset_path = markdown_path.parent / Path(target.replace("\\", "/"))
+            if not asset_path.is_file():
+                missing_assets.append(target)
+
+        if missing_assets:
+            missing = ", ".join(sorted(set(missing_assets)))
+            raise FileNotFoundError(
+                f"Unresolved report image reference(s): {missing}"
+            )
+
+        lines = content.splitlines()
+        uncaptioned_tables: list[str] = []
+        for index, line in enumerate(lines):
+            if not cls._TABLE_SEPARATOR.fullmatch(line):
+                continue
+            header_index = index - 1
+            while header_index >= 0 and not lines[header_index].strip():
+                header_index -= 1
+            caption_index = header_index - 1
+            while caption_index >= 0 and not lines[caption_index].strip():
+                caption_index -= 1
+            if caption_index < 0 or not lines[caption_index].startswith(
+                "Table: "
+            ):
+                header = lines[header_index].strip()
+                uncaptioned_tables.append(header)
+
+        if uncaptioned_tables:
+            headers = ", ".join(uncaptioned_tables)
+            raise ValueError(f"Report table(s) lack a caption: {headers}")
+
+        caption_count = sum(
+            line.startswith("Table: ") for line in content.splitlines()
+        )
+        table_count = sum(
+            bool(cls._TABLE_SEPARATOR.fullmatch(line))
+            for line in content.splitlines()
+        )
+        if caption_count != table_count:
+            raise ValueError(
+                "Report table-caption count mismatch: "
+                f"{table_count} table(s), {caption_count} caption(s)."
+            )
 
     def _create_batch_table(self, batch_dist: Dict[str, Any]) -> str:
         """Generates a Markdown table displaying batch sample distributions."""
@@ -1077,21 +658,33 @@ class NarrativeStatsReporter:
             outliers = q_data.get("outliers", {})
             ext_samples = outliers.get("extreme_samples", [])
             ext_str = (
-                ", ".join(map(str, ext_samples)) if ext_samples else "None"
+                ", ".join(map(str, ext_samples))
+                if ext_samples
+                else "None detected"
             )
 
             # IS Outliers
             is_qc = q_data.get("internal_standard_qc", {})
             is_samples = is_qc.get("is_outlier_samples", [])
-            is_rate = is_qc.get("is_outlier_standard", "N/A")
-            is_str = ", ".join(map(str, is_samples)) if is_samples else "None"
+            is_rate = is_qc.get("is_outlier_standard", "Not configured")
+            is_str = (
+                ", ".join(map(str, is_samples))
+                if is_samples
+                else "None detected"
+                if is_qc
+                else "Not configured"
+            )
 
             # ORF Outliers
             orf_qc = q_data.get("orf_qc", {})
             orf_samples = orf_qc.get("orf_outlier_samples", [])
-            orf_rate = orf_qc.get("orf_outlier_standard", "N/A")
+            orf_rate = orf_qc.get("orf_outlier_standard", "Not configured")
             orf_str = (
-                ", ".join(map(str, orf_samples)) if orf_samples else "None"
+                ", ".join(map(str, orf_samples))
+                if orf_samples
+                else "None detected"
+                if orf_qc
+                else "Not configured"
             )
 
             rows.append(
@@ -1303,7 +896,11 @@ class NarrativeStatsReporter:
             return d
 
         batch_count = get_val(
-            pipeline_metrics, "raw_dataset", "batches", "batch_count", default=1
+            pipeline_metrics,
+            "raw_dataset",
+            "batches",
+            "batch_count",
+            default=None,
         )
 
         stats = {
@@ -1327,7 +924,10 @@ class NarrativeStatsReporter:
             "mode",
             get_val(pipeline_metrics, "raw_dataset", "mode", default="N/A"),
         )
-        stats["metadata"].setdefault("is_multi_batch", batch_count > 1)
+        is_multi_batch = (
+            isinstance(batch_count, (int, float)) and batch_count > 1
+        )
+        stats["metadata"].setdefault("is_multi_batch", is_multi_batch)
 
         # [REFACTOR]: Core stages iteration fully handles new 2-Stage Norm logic
         for stage_key, _ in self._QA_STAGES:
@@ -1374,8 +974,7 @@ class NarrativeStatsReporter:
                 (
                     row
                     for row in candidate_rows
-                    if isinstance(row, dict)
-                    and row.get("method") == mar_sel
+                    if isinstance(row, dict) and row.get("method") == mar_sel
                 ),
                 {},
             )
@@ -1393,8 +992,8 @@ class NarrativeStatsReporter:
             "imputation_candidates": self._create_imputation_candidate_table(
                 pipeline_metrics
             ),
-            "normalization_candidates": self._create_normalization_candidate_table(
-                pipeline_metrics
+            "normalization_candidates": (
+                self._create_normalization_candidate_table(pipeline_metrics)
             ),
         }
         stats["rsd_guardrail"] = self._summarize_rsd_guardrail(qa_metrics)
@@ -1487,6 +1086,7 @@ class NarrativeStatsReporter:
         try:
             result = subprocess.run(
                 ["weasyprint", "--version"],
+                timeout=10,
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1497,53 +1097,11 @@ class NarrativeStatsReporter:
                     f"WeasyPrint probe failed. Stderr: {result.stderr.strip()}"
                 )
             return result.returncode == 0
-        except FileNotFoundError:
+        except (OSError, subprocess.TimeoutExpired):
             return False
 
-    def _force_install_weasyprint_conda(self) -> bool:
-        """Forces GTK3/Pango installation via Conda for WeasyPrint on Windows.
-
-        Returns:
-            bool: True if Conda injection succeeded, False otherwise.
-        """
-        # Verify that the pipeline is running inside a Conda environment
-        if not os.path.exists(os.path.join(sys.prefix, "conda-meta")):
-            logger.error("Not a Conda environment. Cannot auto-install GTK3.")
-            return False
-
-        logger.info("Conda detected. Auto-installing GTK3/Pango C-libraries...")
-        conda_exe = os.environ.get("CONDA_EXE", "conda")
-
-        try:
-            subprocess.run(
-                [
-                    conda_exe,
-                    "install",
-                    "-c",
-                    "conda-forge",
-                    "weasyprint",
-                    "pango",
-                    "tinycss2",
-                    "-y",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except Exception as e:
-            logger.error(f"Conda execution failed: {e}")
-            return False
-
-        # Closed-loop verification
-        if self._is_weasyprint_operational():
-            logger.success("WeasyPrint GTK3 libraries injected and verified.")
-            return True
-        else:
-            logger.error("Conda installed WeasyPrint, but DLLs still fail.")
-            return False
-
-    def _is_pdflatex_available(self) -> bool:
-        """Performs a hard check to verify if pdflatex is fully operational.
+    def _is_xelatex_available(self) -> bool:
+        """Perform a bounded operational check of the actual PDF engine.
 
         Bypasses shutil.which to avoid false positives from broken paths or
         ghost registry entries.
@@ -1553,7 +1111,8 @@ class NarrativeStatsReporter:
         """
         try:
             result = subprocess.run(
-                ["pdflatex", "--version"],
+                ["xelatex", "--version"],
+                timeout=10,
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1561,117 +1120,8 @@ class NarrativeStatsReporter:
             )
             # Only return True if the process exits without error
             return result.returncode == 0
-        except (FileNotFoundError, OSError):
+        except (OSError, subprocess.TimeoutExpired):
             # OSError catches cases where the file exists but not executable
-            return False
-
-    def _force_install_tinytex(self) -> bool:
-        """Forces TinyTeX installation, bypassing pytinytex and exit codes.
-
-        Executes the official PowerShell script on Windows. Ignores exit
-        codes (often 1 due to fc-cache warnings) and hard-verifies the
-        binary directory. Finally, broadcasts OS environment changes.
-
-        Returns:
-            bool: True if installation and binary verification succeed.
-        """
-
-        if sys.platform != "win32":
-            try:
-                subprocess.run(
-                    ["pytinytex", "download"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                return True
-            except Exception as e:
-                logger.error(f"pytinytex download failed: {e}")
-                return False
-
-        logger.info("Executing official PowerShell installer (takes time)...")
-        ps_cmd = (
-            "Invoke-WebRequest "
-            "'https://tinytex.yihui.org/install-bin-windows.ps1' "
-            "-OutFile 'ins.ps1'; & .\\ins.ps1; "
-            "Remove-Item 'ins.ps1' -ErrorAction SilentlyContinue"
-        )
-
-        try:
-            # check=False bypasses false negative exit code 1
-            subprocess.run(
-                [
-                    "powershell",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    ps_cmd,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                creationflags=0x08000000,
-            )
-        except Exception as e:
-            logger.error(f"PowerShell execution explicitly failed: {e}")
-            return False
-        finally:
-            # Remove helper scripts created during the browser refresh step.
-            # This ensures cleanup even if the PowerShell script aborts early.
-            if os.path.exists("ins.ps1"):
-                try:
-                    os.remove("ins.ps1")
-                    logger.debug("Cleaned up orphaned ins.ps1 file.")
-                except OSError:
-                    pass
-
-        # Hard verification of binary directory existence
-        appdata = Path(os.environ.get("APPDATA", ""))
-        progdata = Path(os.environ.get("ProgramData", ""))
-
-        target_paths = [
-            appdata / "TinyTeX" / "bin" / "windows",
-            appdata / "TinyTeX" / "bin" / "win32",
-            progdata / "TinyTeX" / "bin" / "windows",
-            progdata / "TinyTeX" / "bin" / "win32",
-        ]
-
-        tt_bin = next((p for p in target_paths if p.is_dir()), None)
-
-        if not tt_bin:
-            logger.error("TinyTeX installed, but bin directory not found.")
-            return False
-
-        # Update process PATH immediately using standard path separator
-        bin_path = str(tt_bin)
-        curr_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{bin_path}{os.pathsep}{curr_path}"
-
-        # Broadcast environment change to Windows OS
-        try:
-            hwnd_broadcast = 0xFFFF
-            wm_settingchange = 0x001A
-            smto_abortifhung = 0x0002
-            result = ctypes.c_long()
-
-            ctypes.windll.user32.SendMessageTimeoutW(
-                hwnd_broadcast,
-                wm_settingchange,
-                0,
-                "Environment",
-                smto_abortifhung,
-                5000,
-                ctypes.byref(result),
-            )
-        except Exception as e:
-            logger.debug(f"OS env broadcast failed (non-fatal): {e}")
-
-        # Verify the environment refresh before launching the browser.
-        if self._is_pdflatex_available():
-            logger.success("TinyTeX force-installed and verified.")
-            return True
-        else:
-            logger.error("TinyTeX installed but pdflatex is still broken.")
             return False
 
     def _is_rsvg_operational(self) -> bool:
@@ -1686,44 +1136,14 @@ class NarrativeStatsReporter:
         try:
             result = subprocess.run(
                 ["rsvg-convert", "--version"],
+                timeout=10,
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             return result.returncode == 0
-        except (FileNotFoundError, OSError):
-            return False
-
-    def _force_install_rsvg_conda(self) -> bool:
-        """Forces librsvg installation via Conda for native SVG support.
-
-        Returns:
-            bool: True if Conda injection succeeded, False otherwise.
-        """
-        if not os.path.exists(os.path.join(sys.prefix, "conda-meta")):
-            logger.error("Not a Conda env. Cannot auto-install librsvg.")
-            return False
-
-        logger.info("Auto-installing rsvg-convert (librsvg) via Conda...")
-        conda_exe = os.environ.get("CONDA_EXE", "conda")
-
-        try:
-            subprocess.run(
-                [conda_exe, "install", "-c", "conda-forge", "librsvg", "-y"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except Exception as e:
-            logger.error(f"Conda execution failed for librsvg: {e}")
-            return False
-
-        if self._is_rsvg_operational():
-            logger.success("rsvg-convert injected and verified.")
-            return True
-        else:
-            logger.error("Conda installed librsvg, but binary fails.")
+        except (OSError, subprocess.TimeoutExpired):
             return False
 
     def generate_markdown(
@@ -1737,6 +1157,8 @@ class NarrativeStatsReporter:
         Iterates through defined template versions and generates distinct
         markdown documents based on the unified metrics context.
         """
+        self._generated_md_paths = []
+        self._markdown_generation_failed = True
         # Consolidate double-source data
         context = self.consolidate_metrics(report_input)
         out_dir = self.base_dir / report_folder
@@ -1777,6 +1199,10 @@ class NarrativeStatsReporter:
                 logger.error(f"Jinja2 rendering failed for {label}: {e}")
                 self._debug_template_errors(template_name, context)
 
+        self._markdown_generation_failed = len(self._generated_md_paths) != len(
+            versions
+        )
+
     def export_report(self, pdf_engine: Optional[str] = "weasyprint") -> bool:
         """Exports all generated markdown reports to PDF/HTML sequentially.
 
@@ -1784,8 +1210,20 @@ class NarrativeStatsReporter:
         Loops through all tracked markdown files and handles fallbacks.
         """
         md_paths = getattr(self, "_generated_md_paths", [])
+        if getattr(self, "_markdown_generation_failed", False):
+            logger.error(
+                "The current run did not generate both report templates."
+            )
+            return False
         if not md_paths:
             logger.error("No Markdown found. Run `generate_markdown` first.")
+            return False
+
+        try:
+            for md_path in md_paths:
+                self._validate_markdown_source(Path(md_path))
+        except (FileNotFoundError, ValueError) as error:
+            logger.error(f"Report export preflight failed: {error}")
             return False
 
         # --- Phase 0: Pandoc Environment Check ---
@@ -1795,10 +1233,10 @@ class NarrativeStatsReporter:
             try:
                 pypandoc.get_pandoc_version()
             except OSError:
-                logger.warning("Pandoc missing. Auto-downloading...")
-                pypandoc.download_pandoc()
+                logger.error("Pandoc is unavailable; install it explicitly.")
+                return False
         except ImportError:
-            logger.error("Missing dependency: pip install pypandoc[tinytex]")
+            logger.error("Missing dependency: install pypandoc and Pandoc.")
             return False
 
         # --- Phase 1: Setup runtime CSS file ---
@@ -1855,8 +1293,8 @@ class NarrativeStatsReporter:
                         os.environ["FONTCONFIG_PATH"] = os.path.dirname(f_conf)
 
                 if not self._is_weasyprint_operational():
-                    if not self._force_install_weasyprint_conda():
-                        return None
+                    logger.warning("WeasyPrint is unavailable.")
+                    return None
 
                 wp_args = base_args + [
                     "--pdf-engine=weasyprint",
@@ -1887,12 +1325,13 @@ class NarrativeStatsReporter:
                 mode = "fallback" if is_fallback else "primary"
                 logger.info(f"Attempting PDF export via LaTeX ({mode})...")
 
-                if not self._is_pdflatex_available():
-                    if not self._force_install_tinytex():
-                        return None
+                if not self._is_xelatex_available():
+                    logger.warning("LaTeX is unavailable.")
+                    return None
 
                 if not self._is_rsvg_operational():
-                    self._force_install_rsvg_conda()
+                    logger.warning("rsvg-convert is unavailable.")
+                    return None
 
                 lx_args = base_args + [
                     "--pdf-engine=xelatex",

@@ -11,13 +11,63 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from typing import Optional
 
 from .. import plot_utils as pu
 from ..heatmap import (
     draw_visible_heatmap_cell_edges,
+    format_heatmap_colorbar_axes,
     heatmap_annotation_fontsize,
 )
+
+
+def _add_batch_annotation_strips(
+    ax: plt.Axes,
+    ordered_batches: list[object] | np.ndarray,
+    colors: dict[object, str],
+    *,
+    strip_points: float = 5.0,
+    outer_gap_points: float = 2.5,
+) -> tuple[float, float]:
+    """Draw flush left/bottom batch strips and return tick padding."""
+    n_items = len(ordered_batches)
+    if n_items == 0:
+        return 3.0, 3.0
+
+    axes_width, axes_height = pu.axis_size_inches(ax)
+    strip_x = strip_points / (axes_width * 72.0)
+    strip_y = strip_points / (axes_height * 72.0)
+
+    for index, batch in enumerate(ordered_batches):
+        color = colors.get(batch, "tab:gray")
+        bottom = plt.Rectangle(
+            (index / n_items, -strip_y),
+            1.0 / n_items,
+            strip_y,
+            transform=ax.transAxes,
+            facecolor=color,
+            edgecolor="k",
+            linewidth=0.5,
+            clip_on=False,
+            zorder=5,
+        )
+        bottom.set_gid("batch-annotation-bottom")
+        ax.add_patch(bottom)
+        left = plt.Rectangle(
+            (-strip_x, 1.0 - (index + 1) / n_items),
+            strip_x,
+            1.0 / n_items,
+            transform=ax.transAxes,
+            facecolor=color,
+            edgecolor="k",
+            linewidth=0.5,
+            clip_on=False,
+            zorder=5,
+        )
+        left.set_gid("batch-annotation-left")
+        ax.add_patch(left)
+
+    tick_pad = strip_points + outer_gap_points
+    return tick_pad, tick_pad
 
 
 class AssessmentHeatmapMixin:
@@ -27,7 +77,7 @@ class AssessmentHeatmapMixin:
     def plot_qc_corr_heatmap(
         self,
         corr_matrix: pd.DataFrame,
-        corr_mask: Optional[np.ndarray],
+        corr_mask: np.ndarray | None,
         batches: list[object] | pd.Index | np.ndarray,
         method: str = "spearman",
         vmin: float = 0.85,
@@ -36,6 +86,7 @@ class AssessmentHeatmapMixin:
         ax: plt.Axes | None = None,
         show_colorbar: bool = True,
         title_mode: str = "full",
+        show_batch_legend: bool = True,
     ) -> plt.Figure:
         """
         Plot sample-level correlation matrix with rigorous clustering forests.
@@ -64,9 +115,9 @@ class AssessmentHeatmapMixin:
         matplotlib.figure.Figure: The fully assembled figure object.
 
         """
+        import matplotlib.patches as mpatches
         import scipy.cluster.hierarchy as sch
         from scipy.spatial.distance import squareform
-        import matplotlib.patches as mpatches
 
         n_samples = corr_matrix.shape[0]
         is_multi_idx = isinstance(corr_matrix.index, pd.MultiIndex)
@@ -157,8 +208,6 @@ class AssessmentHeatmapMixin:
             ordered_batches = [str(x).split("-")[0] for x in corr_matrix.index]
 
         # Canvas & Layout Integration (Matplotlib GridSpec)
-        hm_size = max(5.0, n_samples * 0.2 + 1.0)
-
         annot_fmt = ".3f" if n_samples <= 15 else ".2f"
         show_annot = n_samples <= 15
         cell_edge_lw = pu.DEFAULT_HEATMAP_CELL_LINEWIDTH
@@ -170,7 +219,13 @@ class AssessmentHeatmapMixin:
                     max(compact_hm_size[0], n_samples * 0.12 + 1.0),
                     max(compact_hm_size[1], n_samples * 0.12 + 1.0),
                 ),
-                constrained_layout=True,
+                # The heatmap uses inset axes for its horizontal colorbar and
+                # optional batch legend.  Matplotlib's constrained-layout
+                # solver cannot reserve space for those insets and emits
+                # ``axes sizes collapsed to zero`` during the first draw.
+                # Panel spacing is handled by the explicit GridSpec and the
+                # callers save with ``bbox_inches='tight'`` instead.
+                constrained_layout=False,
             )
             if cluster_mode in ["total", "within-group"]:
                 gs = fig.add_gridspec(
@@ -198,39 +253,31 @@ class AssessmentHeatmapMixin:
         )
 
         heatmap_w, heatmap_h = pu.axis_size_inches(ax_heatmap)
-        raw_x_labels = pu.index_to_tick_labels(corr_matrix.columns)
-        raw_y_labels = pu.index_to_tick_labels(corr_matrix.index)
+        sample_name = self.attrs.get("sample_name", "Sample Name")
+        label_levels = (sample_name,)
+        raw_x_labels = pu.index_to_tick_labels(
+            corr_matrix.columns,
+            preferred_levels=label_levels,
+        )
+        raw_y_labels = pu.index_to_tick_labels(
+            corr_matrix.index,
+            preferred_levels=label_levels,
+        )
         needs_dense_ticks = pu.tick_labels_need_compaction(
             labels=raw_x_labels + raw_y_labels,
             n_items=n_samples,
             axis_inches=min(heatmap_w, heatmap_h),
             default_size=pu.DEFAULT_AXIS_TICK_FONTSIZE,
         )
-        max_tick_chars = pu.dense_label_char_limit(n_samples)
-        x_tick_labels = (
-            [
-                pu.compact_tick_label(label, max_tick_chars)
-                for label in raw_x_labels
-            ]
-            if needs_dense_ticks
-            else raw_x_labels
-        )
-        y_tick_labels = (
-            [
-                pu.compact_tick_label(label, max_tick_chars)
-                for label in raw_y_labels
-            ]
-            if needs_dense_ticks
-            else raw_y_labels
-        )
         max_tick_len = max(
-            [len(label) for label in x_tick_labels + y_tick_labels] or [1]
+            [len(label) for label in raw_x_labels + raw_y_labels] or [1]
         )
-        x_rot = (
-            90
-            if needs_dense_ticks and (n_samples > 12 or max_tick_len > 14)
-            else 45
-        )
+        if not needs_dense_ticks:
+            x_rot = 0
+        elif n_samples > 12 or max_tick_len > 14:
+            x_rot = 90
+        else:
+            x_rot = 45
         x_tick_size = pu.dense_tick_fontsize(
             n_items=n_samples,
             axis_inches=heatmap_w,
@@ -249,6 +296,38 @@ class AssessmentHeatmapMixin:
             fill_ratio=0.62,
             force_dense=needs_dense_ticks,
         )
+        tick_size = min(x_tick_size, y_tick_size)
+
+        # Wrap complete labels at semantic separators before falling back to
+        # sparse ticks.  The renderer-aware helper never splits an
+        # alphanumeric token, so long sample identifiers remain auditable.
+        cell_width_px = heatmap_w * ax_heatmap.figure.dpi / max(n_samples, 1)
+        cell_height_px = heatmap_h * ax_heatmap.figure.dpi / max(n_samples, 1)
+        x_tick_labels = pu.wrap_tick_labels(
+            raw_x_labels,
+            figure=ax_heatmap.figure,
+            max_width_pixels=max(64.0, cell_width_px * 1.15),
+            fontsize=x_tick_size,
+        )
+        y_tick_labels = pu.wrap_tick_labels(
+            raw_y_labels,
+            figure=ax_heatmap.figure,
+            max_width_pixels=max(
+                64.0, min(180.0, cell_height_px * 1.5)
+            ),
+            fontsize=y_tick_size,
+        )
+        if n_samples <= 12 and any("\n" in label for label in x_tick_labels):
+            x_rot = 0
+            x_tick_size = pu.dense_tick_fontsize(
+                n_items=n_samples,
+                axis_inches=heatmap_w,
+                default_size=pu.DEFAULT_AXIS_TICK_FONTSIZE,
+                max_size=pu.DEFAULT_AXIS_TICK_FONTSIZE,
+                min_size=1.2,
+                fill_ratio=0.55,
+                force_dense=needs_dense_ticks,
+            )
         tick_size = min(x_tick_size, y_tick_size)
 
         # Dendrogram Renderer Engine
@@ -342,9 +421,7 @@ class AssessmentHeatmapMixin:
             if cbar_ax is not None:
                 cbar_ax.xaxis.set_ticks_position("top")
                 cbar_ax.xaxis.set_label_position("top")
-                for spine in cbar_ax.spines.values():
-                    spine.set_visible(False)
-                pu.format_colorbar_axes(cbar_ax)
+                format_heatmap_colorbar_axes(cbar_ax)
 
         draw_visible_heatmap_cell_edges(
             ax=ax_heatmap,
@@ -363,42 +440,13 @@ class AssessmentHeatmapMixin:
         for spine in ax_heatmap.spines.values():
             spine.set_visible(False)
 
-        # Color Patches
-        thickness = max(0.4, n_samples * 0.015)
-        gap = max(0.1, n_samples * 0.005)
-
-        for i, b in enumerate(ordered_batches):
-            c = tick_color_dict.get(b, "tab:gray")
-            ax_heatmap.add_patch(
-                plt.Rectangle(
-                    (i, n_samples + gap),
-                    1,
-                    thickness,
-                    facecolor=c,
-                    edgecolor="k",
-                    linewidth=0.5,
-                    clip_on=False,
-                )
-            )
-            ax_heatmap.add_patch(
-                plt.Rectangle(
-                    (-thickness - gap, i),
-                    thickness,
-                    1,
-                    facecolor=c,
-                    edgecolor="k",
-                    linewidth=0.5,
-                    clip_on=False,
-                )
-            )
-
-        # Padding math
-        pt_per_unit = (hm_size * 72) / n_samples
-        patch_width_in_pt = thickness * pt_per_unit
-        pad_amount = max(15, int(patch_width_in_pt + 15))
-
-        ax_heatmap.tick_params(axis="x", pad=pad_amount)
-        ax_heatmap.tick_params(axis="y", pad=pad_amount)
+        # Keep annotation strips in their own physical lanes.  Their size no
+        # longer controls the distance between labels and heatmap cells.
+        x_tick_pad, y_tick_pad = _add_batch_annotation_strips(
+            ax_heatmap,
+            ordered_batches,
+            tick_color_dict,
+        )
 
         # Remove Seaborn-injected DataFrame axis names before final formatting.
         # This prevents 'inject_order' from being squeezed between ticks and
@@ -438,13 +486,15 @@ class AssessmentHeatmapMixin:
         ax_heatmap.set_xticklabels(
             x_tick_labels,
             rotation=x_rot,
-            ha="right",
+            ha="center" if x_rot in {0, 90} else "right",
             va="top",
             fontsize=x_tick_size,
             rotation_mode="anchor",
         )
-        ax_heatmap.tick_params(axis="x", pad=pad_amount + 3, length=2)
-        ax_heatmap.tick_params(axis="y", pad=pad_amount, length=2)
+        # Cell edges already locate every row and column.  Suppressing tick
+        # marks prevents them from crossing the flush annotation strips.
+        ax_heatmap.tick_params(axis="x", pad=x_tick_pad, length=0)
+        ax_heatmap.tick_params(axis="y", pad=y_tick_pad, length=0)
         pu.apply_batch_tick_colors(
             ax_heatmap.get_xticklabels(), tick_color_dict
         )
@@ -452,37 +502,38 @@ class AssessmentHeatmapMixin:
             ax_heatmap.get_yticklabels(), tick_color_dict
         )
 
-        legend_handles = [
-            mpatches.Patch(
-                facecolor=c, edgecolor="k", linewidth=0.5, label=str(b)
+        if show_batch_legend:
+            legend_handles = [
+                mpatches.Patch(
+                    facecolor=c, edgecolor="k", linewidth=0.5, label=str(b)
+                )
+                for b, c in tick_color_dict.items()
+            ]
+
+            ax_heatmap.legend(
+                handles=legend_handles,
+                title="Batch",
+                loc="upper right",
+                bbox_to_anchor=(0.95, 0.82),
+                frameon=True,
+                edgecolor="k",
             )
-            for b, c in tick_color_dict.items()
-        ]
 
-        ax_heatmap.legend(
-            handles=legend_handles,
-            title="Batch",
-            loc="upper right",
-            bbox_to_anchor=(0.95, 0.82),
-            frameon=True,
-            edgecolor="k",
-        )
-
-        self._format_single_legend(
-            ax=ax_heatmap,
-            group_title="Batch",
-            loc="upper right",
-            bbox_to_anchor=(0.95, 0.82),
-        )
-
-        # Defensive property re-assignment post-standardization
-        if ax_heatmap.get_legend() is not None:
-            ax_heatmap.get_legend().set_title("Batch")
-            ax_heatmap.get_legend().get_title().set_fontweight("bold")
-            ax_heatmap.get_legend().get_title().set_fontsize(
-                pu.DEFAULT_LEGEND_TITLE_FONTSIZE
+            self._format_single_legend(
+                ax=ax_heatmap,
+                group_title="Batch",
+                loc="upper right",
+                bbox_to_anchor=(0.95, 0.82),
             )
-            ax_heatmap.get_legend().set_bbox_to_anchor((0.95, 0.82))
+
+            # Defensive property re-assignment post-standardization
+            if ax_heatmap.get_legend() is not None:
+                ax_heatmap.get_legend().set_title("Batch")
+                ax_heatmap.get_legend().get_title().set_fontweight("bold")
+                ax_heatmap.get_legend().get_title().set_fontsize(
+                    pu.DEFAULT_LEGEND_TITLE_FONTSIZE
+                )
+                ax_heatmap.get_legend().set_bbox_to_anchor((0.95, 0.82))
 
         return fig
 
@@ -578,9 +629,7 @@ class AssessmentHeatmapMixin:
             )
 
         if cbar_ax is not None:
-            for spine in cbar_ax.spines.values():
-                spine.set_visible(False)
-            pu.format_colorbar_axes(cbar_ax)
+            format_heatmap_colorbar_axes(cbar_ax)
 
         draw_visible_heatmap_cell_edges(
             ax=current_ax,
@@ -609,31 +658,15 @@ class AssessmentHeatmapMixin:
             axis_inches=min(ax_w, ax_h),
             default_size=pu.DEFAULT_AXIS_TICK_FONTSIZE,
         )
-        max_tick_chars = pu.dense_label_char_limit(n_batches)
-        x_tick_labels = (
-            [
-                pu.compact_tick_label(label, max_tick_chars)
-                for label in raw_x_labels
-            ]
-            if needs_dense_ticks
-            else raw_x_labels
-        )
-        y_tick_labels = (
-            [
-                pu.compact_tick_label(label, max_tick_chars)
-                for label in raw_y_labels
-            ]
-            if needs_dense_ticks
-            else raw_y_labels
-        )
         max_tick_len = max(
-            [len(label) for label in x_tick_labels + y_tick_labels] or [1]
+            [len(label) for label in raw_x_labels + raw_y_labels] or [1]
         )
-        x_rot = (
-            90
-            if needs_dense_ticks and (n_batches > 10 or max_tick_len > 14)
-            else 45
-        )
+        if not needs_dense_ticks:
+            x_rot = 0
+        elif n_batches > 10 or max_tick_len > 14:
+            x_rot = 90
+        else:
+            x_rot = 45
         x_tick_size = pu.dense_tick_fontsize(
             n_items=n_batches,
             axis_inches=ax_w,
@@ -652,6 +685,37 @@ class AssessmentHeatmapMixin:
             fill_ratio=0.70,
             force_dense=needs_dense_ticks,
         )
+        x_tick_labels = pu.wrap_tick_labels(
+            raw_x_labels,
+            figure=current_ax.figure,
+            max_width_pixels=max(
+                64.0, ax_w * current_ax.figure.dpi / max(n_batches, 1) * 1.15
+            ),
+            fontsize=x_tick_size,
+        )
+        y_tick_labels = pu.wrap_tick_labels(
+            raw_y_labels,
+            figure=current_ax.figure,
+            max_width_pixels=max(
+                64.0,
+                min(
+                    180.0,
+                    ax_h * current_ax.figure.dpi / max(n_batches, 1) * 1.5,
+                ),
+            ),
+            fontsize=y_tick_size,
+        )
+        if n_batches <= 12 and any("\n" in label for label in x_tick_labels):
+            x_rot = 0
+            x_tick_size = pu.dense_tick_fontsize(
+                n_items=n_batches,
+                axis_inches=ax_w,
+                default_size=pu.DEFAULT_AXIS_TICK_FONTSIZE,
+                max_size=pu.DEFAULT_AXIS_TICK_FONTSIZE,
+                min_size=1.6,
+                fill_ratio=0.55,
+                force_dense=needs_dense_ticks,
+            )
         tick_size = min(x_tick_size, y_tick_size)
 
         # Standard Formatting
@@ -681,7 +745,7 @@ class AssessmentHeatmapMixin:
         current_ax.set_xticklabels(
             x_tick_labels,
             rotation=x_rot,
-            ha="right",
+            ha="center" if x_rot in {0, 90} else "right",
             va="top",
             fontsize=x_tick_size,
             rotation_mode="anchor",
@@ -696,14 +760,29 @@ class AssessmentHeatmapMixin:
         method: str,
         vmin: float = 0.85,
         vmax: float = 1.0,
+        ax: plt.Axes | None = None,
     ) -> plt.Figure:
         """
-        Render the shared correlation colorbar used by report heatmap grids.
+        Render the shared, half-height colorbar used by report heatmap grids.
+
+        The compact sidecar is shared by both the 2 x 4 (embedded spare-slot)
+        and 2 x 3 (right-hand column) report layouts.  Its physical height is
+        controlled centrally in :mod:`pimqc.plotting.plot_utils` so the
+        relative size remains stable when the report is scaled.
         """
-        fig = plt.figure(figsize=(0.95, 3.0))
+        fig = plt.figure(
+            figsize=(
+                pu.CORRELATION_COLORBAR_LEGEND_WIDTH_IN,
+                pu.CORRELATION_COLORBAR_LEGEND_HEIGHT_IN,
+            )
+        ) if ax is None else ax.figure
         # Keep the color strip narrow; the label and ticks expand the tight
         # export boundary only as much as their text actually requires.
-        current_ax = fig.add_axes([0.08, 0.08, 0.16, 0.84])
+        if ax is None:
+            current_ax = fig.add_axes([0.08, 0.08, 0.16, 0.84])
+        else:
+            ax.axis("off")
+            current_ax = ax.inset_axes([0.12, 0.25, 0.06, 0.5])
         custom_cmap = pu.custom_linear_cmap(
             ["white", pu.PRIMARY_ACCENT_COLOR], 100
         )
@@ -719,7 +798,7 @@ class AssessmentHeatmapMixin:
             format="%.2f",
             label=f"{method.title()} Correlation",
         )
-        pu.format_colorbar_axes(colorbar.ax)
+        format_heatmap_colorbar_axes(colorbar.ax)
         return fig
 
     # Dimensionality Reduction and Outlier Plots

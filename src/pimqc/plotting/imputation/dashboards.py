@@ -168,9 +168,7 @@ class ImputationDashboardMixin:
         )
         plot_sample_structure_change_map(
             ax=sample_ax,
-            raw_obj=self.raw_obj,
-            transformed_obj=self.imp_obj,
-            structure_metrics=metrics,
+            diagnostics=self.payload.sample_structure,
             title="Sample Structure Change Map",
             compact_style=True,
         )
@@ -425,9 +423,7 @@ class ImputationDashboardMixin:
         )
         plot_sample_structure_change_map(
             ax=ax_sample_structure,
-            raw_obj=self.raw_obj,
-            transformed_obj=self.imp_obj,
-            structure_metrics=metrics,
+            diagnostics=self.payload.sample_structure,
             title="Sample Structure Change Map",
             compact_style=True,
         )
@@ -464,7 +460,7 @@ class ImputationDashboardMixin:
         shared_lims = (d_min - margin, d_max + margin)
 
         pw.clear()
-        layout_width = 13.2
+        layout_width = 12.0
         ax_scatter = pw.Brick(
             figsize=pu.dashboard_brick_size(4.0, 4.0, layout_width),
             label="method_nrmse_scatter",
@@ -492,6 +488,7 @@ class ImputationDashboardMixin:
             ax=ax_density,
             compact_title=False,
             article_compact=True,
+            show_legend=True,
         )
 
         ax_sample_structure = pw.Brick(
@@ -500,25 +497,12 @@ class ImputationDashboardMixin:
         )
         plot_sample_structure_change_map(
             ax=ax_sample_structure,
-            raw_obj=self.raw_obj,
-            transformed_obj=self.imp_obj,
-            structure_metrics=metrics,
+            diagnostics=self.payload.sample_structure,
             title="Sample Structure Change Map",
             compact_style=True,
         )
 
-        ax_legend = pw.Brick(
-            figsize=pu.dashboard_brick_size(1.2, 8.0, layout_width),
-            label="method_kde_legend",
-        )
-        self._plot_kde_standalone_legend(
-            ax=ax_legend,
-            legend_cols=1,
-            loc="center left",
-            bbox_to_anchor=(0.0, 0.5),
-        )
-
-        return ax_scatter | ax_density | ax_sample_structure | ax_legend
+        return ax_scatter | ax_density | ax_sample_structure
 
     def plot_imputation_nrmse_appendix_dashboard(
         self,
