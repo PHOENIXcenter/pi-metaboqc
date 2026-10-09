@@ -11,11 +11,10 @@
 The overview figure is a conceptual workflow summary. In v1.5.0, the framework-neutral object produced after construction is `MetaboDataset`. `MetaboDatasetBuilder.run_build()` returns this dataset and its typed audit through `StageResult`, the same boundary used by later processing actions. The same boundaries are intended to support future workflow-plugin and LLM-skill adapters while keeping those integrations outside the scientific core. The figure should therefore be read together with the current object contracts in the [native API reference](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/docs/native_api.md).
 
 > [!IMPORTANT]
-<<<<<<< HEAD
+
 > **Version 1.5.0 adds an optional R compatibility backend.** The 1.4.0 breaking data-model boundary remains in force: the former pandas-subclass-based `MetaboInt` API has been removed. Native integrations should use `MetaboDataset` and typed `StageResult`/`AuditPayload` contracts. See the [changelog](CHANGELOG.md) for the complete migration boundary.
-=======
+
 > **Version 1.4.0 is a breaking data-model release.** The former pandas-subclass-based `MetaboInt` API has been removed. Native integrations should now use `MetaboDataset` and typed `StageResult`/`AuditPayload` contracts. See the [Changelog](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/CHANGELOG.md) for the complete migration boundary.
->>>>>>> 70e58c0def8324a481f8ecc043f740cefa34e481
 
 ## ✨ Core Capabilities
 
