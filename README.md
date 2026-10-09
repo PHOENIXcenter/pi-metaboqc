@@ -186,7 +186,7 @@ pi-metaboqc/
 
 ## 📖 Supplementary Analyses
 
-Research comparisons, case studies and sensitivity analyses are maintained in [pi-metaboqc-supplementary](https://github.com/PHOENIXcenter/pi-metaboqc-casestudy), independently of the core package. The link retains the currently configured GitHub address; renaming the local checkout does not rename the remote repository.
+Research comparisons, case studies and sensitivity analyses are maintained in [pi-metaboqc-supplementary](https://github.com/PHOENIXcenter/pi-metaboqc-supplementary), independently of the core package. The link retains the currently configured GitHub address; renaming the local checkout does not rename the remote repository.
 
 ## 🤝 Contributing & License
 
