@@ -70,6 +70,7 @@ venv.bak/
 # Testing: Pytest and coverage
 # ==========================================
 .pytest_cache/
+.pytest-tmp-*/
 .ruff_cache/
 .mypy_cache/
 .pyright/
@@ -127,15 +128,8 @@ desktop.ini
 # Deprecated scripts and WIP functions
 .deprecated/
 
-# AI-assistant artifacts, scratch scripts, and downloaded caches
-/.codex_artifacts/
-/.codex_tmp_*
-.codex-test-*
-/.agents/
-/.gemini/
-/.claude/
+# Local temporary work
 /tmp/
 
-# Local data files that should not be public
+# Generated tutorial reports; source inputs and notebook outputs are retained
 examples/tutorial_output/
-/output/pdf/release_validation/

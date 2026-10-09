@@ -14,8 +14,6 @@ import pandas as pd
 import scipy.stats as stats
 from joblib import Parallel, delayed
 from loguru import logger
-from numba import njit
-from scipy.optimize import minimize
 from scipy.spatial.distance import pdist
 
 from ...config import resolve_stage_config
@@ -26,59 +24,10 @@ from ...statistics import metrics as su
 from ...statistics import sample_structure as structure_stats
 from ...statistics import selection as selection_utils
 from ..stage import StageResult
+from ..numeric_domain import inspect_numeric_domain
 from .methods import NORMALIZATION_METHODS
 from .runner import NormalizationStageRunner
-
-
-# =============================================================================
-# Private Numba JIT Engines for Normalization
-# =============================================================================
-@njit(fastmath=True)
-def _numba_vsn_nll(params: np.ndarray, fit_data: np.ndarray) -> float:
-    """Compute negative log-likelihood for VSN compiled via Numba."""
-    rows, cols = fit_data.shape
-    a_vec = params[:-1]
-    b = params[-1]
-
-    ll_jacobian_sum = 0.0
-    total_residuals_sq = 0.0
-    total_valid = 0
-
-    for i in range(rows):
-        row_sum = 0.0
-        row_valid = 0
-
-        # Pass 1: Compute transformed values and accumulate for mean & Jacobian
-        for j in range(cols):
-            val = fit_data[i, j]
-            if not np.isnan(val):
-                z = a_vec[j] + b * val
-                t_val = np.arcsinh(z)
-                row_sum += t_val
-                row_valid += 1
-                ll_jacobian_sum += np.log(b) - 0.5 * np.log1p(z**2)
-
-        if row_valid > 0:
-            row_mean = row_sum / row_valid
-
-            # Pass 2: Compute squared residuals
-            for j in range(cols):
-                val = fit_data[i, j]
-                if not np.isnan(val):
-                    z = a_vec[j] + b * val
-                    t_val = np.arcsinh(z)
-                    total_residuals_sq += (t_val - row_mean) ** 2
-            total_valid += row_valid
-
-    if total_valid == 0:
-        return 1e10
-
-    sigma_sq = total_residuals_sq / total_valid
-    if sigma_sq <= 1e-16:
-        return 1e10
-
-    ll = ll_jacobian_sum - (total_valid / 2.0) * np.log(sigma_sq)
-    return -ll
+from .vsn import fit_vsn
 
 
 # =============================================================================
@@ -87,7 +36,9 @@ def _numba_vsn_nll(params: np.ndarray, fit_data: np.ndarray) -> float:
 class DataNormalizer(DatasetProcessor):
     """Normalization engine for global sample-wise preprocessing."""
 
-    _RUNTIME_CONFIG_KEYS = frozenset({"norm_method", "global_seed", "n_jobs"})
+    _RUNTIME_CONFIG_KEYS = frozenset(
+        {"norm_method", "global_seed", "n_jobs", "implementation"}
+    )
     _AUTO_CANDIDATES = (
         "ROBUST_LOG_ONLY",
         "TIC",
@@ -138,6 +89,7 @@ class DataNormalizer(DatasetProcessor):
         norm_method: Optional[str] = None,
         global_seed: Optional[int] = None,
         n_jobs: Optional[int] = None,
+        implementation: Optional[str] = None,
     ) -> None:
         """Initialize the data normalization engine.
 
@@ -145,6 +97,7 @@ class DataNormalizer(DatasetProcessor):
             data: Explicit dataset to normalize.
             pipeline_params: Global configuration dictionary from TOML.
             norm_method: Normalization method (e.g., 'Auto', 'VSN', 'Quantile').
+            implementation: 'python' (default) or original R VSN via 'r'.
         """
         super().__init__(data)
 
@@ -153,6 +106,7 @@ class DataNormalizer(DatasetProcessor):
             "DataNormalizer",
             {
                 "norm_method": "Auto",
+                "implementation": "python",
                 "global_seed": self.config.get(
                     "global_seed", DEFAULT_RANDOM_SEED
                 ),
@@ -160,6 +114,7 @@ class DataNormalizer(DatasetProcessor):
             },
             {
                 "norm_method": norm_method,
+                "implementation": implementation,
                 "global_seed": global_seed,
                 "n_jobs": n_jobs,
             },
@@ -438,6 +393,25 @@ class DataNormalizer(DatasetProcessor):
             scale_rel_delta_tol=self._SAMPLE_SCALE_REL_DELTA_TOL,
         )
 
+    @staticmethod
+    def _supported_change_score(score_weights, reference_values) -> float:
+        """Use input-defined submetrics; lost support invalidates the group.
+
+        Signed changes cannot replace an unavailable submetric with neutral
+        zero: that could reward a candidate when the other changes are bad.
+        Return NaN instead so the outer score assigns zero contribution.
+        """
+        planned = [
+            (score, weight)
+            for (score, weight), before in zip(
+                score_weights, reference_values, strict=True
+            )
+            if np.isfinite(su.finite_or_nan(before))
+        ]
+        if any(not np.isfinite(score) for score, _ in planned):
+            return float("nan")
+        return su.fixed_weighted_mean_score(planned, clip_values=False)
+
     def calc_auto_norm_candidate_results(
         self,
         norm_obj: pd.DataFrame,
@@ -513,26 +487,31 @@ class DataNormalizer(DatasetProcessor):
             metrics["rle_spread_before"] = rle_before["rle_spread"]
             metrics["rle_spread_after"] = rle_after["rle_spread"]
 
-            metrics["rle_alignment_change_score"] = su.weighted_mean_score(
-                [
-                    (
-                        su.practical_signed_change_lower_better(
-                            rle_before["rle_center_offset"],
-                            rle_after["rle_center_offset"],
-                            min_rel_change=0.01,
+            metrics["rle_alignment_change_score"] = (
+                self._supported_change_score(
+                    [
+                        (
+                            su.practical_signed_change_lower_better(
+                                rle_before["rle_center_offset"],
+                                rle_after["rle_center_offset"],
+                                min_rel_change=0.01,
+                            ),
+                            3.0,
                         ),
-                        3.0,
-                    ),
-                    (
-                        su.practical_signed_change_lower_better(
-                            rle_before["rle_spread"],
-                            rle_after["rle_spread"],
-                            min_rel_change=0.01,
+                        (
+                            su.practical_signed_change_lower_better(
+                                rle_before["rle_spread"],
+                                rle_after["rle_spread"],
+                                min_rel_change=0.01,
+                            ),
+                            2.0,
                         ),
-                        2.0,
-                    ),
-                ],
-                clip_values=False,
+                    ],
+                    reference_values=[
+                        rle_before["rle_center_offset"],
+                        rle_before["rle_spread"],
+                    ],
+                )
             )
 
             qc_log_raw = log_raw[qc_cols].astype(float)
@@ -563,37 +542,43 @@ class DataNormalizer(DatasetProcessor):
             metrics["mean_variance_abs_slope_after"] = var_after[
                 "mean_variance_abs_slope"
             ]
-            metrics["variance_stabilization_score"] = su.weighted_mean_score(
-                [
-                    (
-                        su.practical_signed_change_lower_better(
-                            var_before["mean_variance_abs_rho"],
-                            var_after["mean_variance_abs_rho"],
-                            min_abs_change=0.01,
-                            min_rel_change=0.02,
+            metrics["variance_stabilization_score"] = (
+                self._supported_change_score(
+                    [
+                        (
+                            su.practical_signed_change_lower_better(
+                                var_before["mean_variance_abs_rho"],
+                                var_after["mean_variance_abs_rho"],
+                                min_abs_change=0.01,
+                                min_rel_change=0.02,
+                            ),
+                            4.0,
                         ),
-                        4.0,
-                    ),
-                    (
-                        su.practical_signed_change_lower_better(
-                            var_before["mean_variance_abs_slope"],
-                            var_after["mean_variance_abs_slope"],
-                            min_abs_change=0.005,
-                            min_rel_change=0.02,
+                        (
+                            su.practical_signed_change_lower_better(
+                                var_before["mean_variance_abs_slope"],
+                                var_after["mean_variance_abs_slope"],
+                                min_abs_change=0.005,
+                                min_rel_change=0.02,
+                            ),
+                            4.0,
                         ),
-                        4.0,
-                    ),
-                    (
-                        su.practical_signed_change_lower_better(
-                            var_before["qc_dispersion_median"],
-                            var_after["qc_dispersion_median"],
-                            min_abs_change=0.001,
-                            min_rel_change=0.02,
+                        (
+                            su.practical_signed_change_lower_better(
+                                var_before["qc_dispersion_median"],
+                                var_after["qc_dispersion_median"],
+                                min_abs_change=0.001,
+                                min_rel_change=0.02,
+                            ),
+                            2.0,
                         ),
-                        2.0,
-                    ),
-                ],
-                clip_values=False,
+                    ],
+                    reference_values=[
+                        var_before["mean_variance_abs_rho"],
+                        var_before["mean_variance_abs_slope"],
+                        var_before["qc_dispersion_median"],
+                    ],
+                )
             )
 
         if len(qc_cols) >= 3:
@@ -621,7 +606,7 @@ class DataNormalizer(DatasetProcessor):
             metrics["qc_pairwise_distance_after"] = qc_structure_after[
                 "qc_pairwise_distance_median"
             ]
-            metrics["qc_structure_change_score"] = su.weighted_mean_score(
+            metrics["qc_structure_change_score"] = self._supported_change_score(
                 [
                     (
                         su.practical_signed_change_lower_better(
@@ -642,7 +627,10 @@ class DataNormalizer(DatasetProcessor):
                         1.0,
                     ),
                 ],
-                clip_values=False,
+                reference_values=[
+                    qc_structure_before["qc_centroid_distance_median"],
+                    qc_structure_before["qc_pairwise_distance_median"],
+                ],
             )
 
         metrics.update(self._sample_structure_preservation_metrics(norm_obj))
@@ -672,6 +660,10 @@ class DataNormalizer(DatasetProcessor):
 
         overall_weighted_sum = pd.Series(0.0, index=score_df.index)
         overall_weight_sum = pd.Series(0.0, index=score_df.index)
+        planned_weight = 0.0
+        baseline_mask = ok_mask & score_df["method"].eq(
+            cls._AUTO_BASELINE_METHOD
+        )
 
         for (
             score_col,
@@ -681,6 +673,16 @@ class DataNormalizer(DatasetProcessor):
                 score_df.get(score_col), errors="coerce"
             )
             valid_score_mask = ok_mask & np.isfinite(score_values)
+            # The input/log-only baseline defines applicable diagnostics.
+            # A candidate cannot increase its score by losing a metric.
+            applicable = (
+                bool(valid_score_mask.loc[baseline_mask].any())
+                if baseline_mask.any()
+                else bool(valid_score_mask.any())
+            )
+            if not applicable:
+                continue
+            planned_weight += score_weight
 
             if score_col in cls._AUTO_CENTERED_CHANGE_COMPONENTS:
                 baseline_mask = ok_mask & score_df["method"].eq(
@@ -756,9 +758,9 @@ class DataNormalizer(DatasetProcessor):
             )
 
         score_df.loc[scoreable_mask, "auto_score"] = (
-            overall_weighted_sum.loc[scoreable_mask]
-            / overall_weight_sum.loc[scoreable_mask]
+            overall_weighted_sum.loc[scoreable_mask] / planned_weight
         )
+        score_df["planned_metric_weight"] = planned_weight
         score_df.loc[scoreable_mask, "available_metric_weight"] = (
             overall_weight_sum.loc[scoreable_mask]
         )
@@ -792,6 +794,8 @@ class DataNormalizer(DatasetProcessor):
         """Build the concise user-facing Auto normalization summary table."""
         summary_cols = [
             "method",
+            "implementation",
+            "implementation_provenance",
             "normalization_applied",
             "log_transform_applied",
             "status",
@@ -805,6 +809,10 @@ class DataNormalizer(DatasetProcessor):
             "sample_structure_rank_preservation",
             "sample_structure_scale_preservation",
             "selection_margin",
+            "available_metric_weight",
+            "planned_metric_weight",
+            "numerical_domain",
+            "error",
         ]
         summary = score_df.reindex(columns=summary_cols).copy()
         summary = summary.rename(columns={"auto_score": "overall_score"})
@@ -836,6 +844,8 @@ class DataNormalizer(DatasetProcessor):
 
         ordered_cols = [
             "method",
+            "implementation",
+            "implementation_provenance",
             "normalization_applied",
             "log_transform_applied",
             "status",
@@ -850,6 +860,10 @@ class DataNormalizer(DatasetProcessor):
             "sample_structure_scale_preservation",
             "delta_vs_robust_log_only",
             "selection_margin",
+            "available_metric_weight",
+            "planned_metric_weight",
+            "numerical_domain",
+            "error",
         ]
         return summary[ordered_cols]
 
@@ -897,65 +911,20 @@ class DataNormalizer(DatasetProcessor):
     @staticmethod
     def calc_vsn_normalization(
         df: pd.DataFrame,
-    ) -> tuple[pd.DataFrame, dict[str, float]]:
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
         """
-        Apply Variance Stabilizing Normalization (VSN).
+        Fit sample-wise affine VSN with robust profile likelihood.
+
+        The returned values are already on generalized log2 scale. Sample
+        coefficients, the actual output offset, and optimizer diagnostics
+        are retained in metadata; no extra log or empirical shift is used.
 
         Ref:
             Variance stabilization applied to microarray data calibration and
             to the quantification of differential expression (Bioinformatics,
             2002)
         """
-        data_arr = df.to_numpy(dtype=np.float64)
-        rows, cols = data_arr.shape
-
-        # Stratified subsampling for fast optimization
-        max_features = min(rows, 1000)
-        row_medians = np.nanmedian(data_arr, axis=1)
-        sorted_idx = np.argsort(row_medians)
-        best_indices = sorted_idx[
-            np.linspace(0, rows - 1, max_features, dtype=int)
-        ]
-        fit_data = data_arr[best_indices, :]
-
-        # Optimize via L-BFGS-B
-        a_init = np.zeros(cols)
-        b_init = 1.0 / np.nanmedian(fit_data)
-        x0 = np.concatenate([a_init, [b_init]])
-        bounds = [(None, None)] * cols + [(1e-12, None)]
-
-        res = minimize(
-            _numba_vsn_nll,
-            x0=x0,
-            args=(fit_data,),
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": 1000, "ftol": 1e-5},
-        )
-        a_vec, b = res.x[:-1], res.x[-1]
-
-        # Apply glog transformation
-        shift_constant = np.log2(2 * b)
-        normed_arr = (
-            np.arcsinh(a_vec + b * data_arr) / np.log(2)
-        ) - shift_constant
-
-        # Correct for global intensity shift
-        log2_data = np.log2(np.where(data_arr > 0, data_arr, np.nan))
-        valid = ~np.isnan(log2_data) & ~np.isnan(normed_arr)
-
-        pure_shift = 0.0
-        if np.any(valid):
-            y_val, x_val = normed_arr[valid], log2_data[valid]
-            high_mask = x_val > np.percentile(x_val, 50)
-            pure_shift = np.median(x_val[high_mask] - y_val[high_mask])
-            normed_arr += pure_shift
-
-        res_df = df.copy()
-        res_df.iloc[:, :] = normed_arr
-
-        vsn_meta = {"vsn_scale": float(b), "vsn_shift": float(pure_shift)}
-        return res_df, vsn_meta
+        return fit_vsn(df)
 
     @staticmethod
     def calc_quantile_normalization(df: pd.DataFrame) -> pd.DataFrame:
@@ -1151,6 +1120,11 @@ class DataNormalizer(DatasetProcessor):
         meta_stamps: dict[str, Any] = {
             "norm_method": method,
             "is_logged": False,
+            "implementation": (
+                "r"
+                if method == "VSN" and self.config.get("implementation") == "r"
+                else "python"
+            ),
         }
 
         # ---------------------------------------------------------------------
@@ -1173,6 +1147,11 @@ class DataNormalizer(DatasetProcessor):
                 )
 
             meta_stamps["normalization_applied"] = method != "ROBUST_LOG_ONLY"
+            # Do not let robust_log2_transform silently floor a bad linear
+            # prediction. Validate on the physical scale before logging.
+            self._validate_candidate_domain(
+                df_norm, df_target, {"value_scale": "raw_positive"}
+            )
             if apply_external_log:
                 df_norm = su.robust_log2_transform(df_norm)
                 meta_stamps["is_logged"] = True
@@ -1183,6 +1162,9 @@ class DataNormalizer(DatasetProcessor):
         # ---------------------------------------------------------------------
         elif method == "QUANTILE":
             meta_stamps["normalization_applied"] = True
+            self._validate_candidate_domain(
+                df_norm, df_target, {"value_scale": "raw_positive"}
+            )
             if apply_external_log:
                 df_norm = su.robust_log2_transform(df_norm)
                 meta_stamps["is_logged"] = True
@@ -1194,8 +1176,18 @@ class DataNormalizer(DatasetProcessor):
         # ---------------------------------------------------------------------
         elif method == "VSN":
             meta_stamps["normalization_applied"] = True
-            df_norm, vsn_meta = self.calc_vsn_normalization(df_norm)
-            meta_stamps.update(vsn_meta)
+            if self.config.get("implementation", "python") == "r":
+                from ..r_backend import run_r_method
+
+                df_norm, provenance = run_r_method(
+                    "VSN",
+                    df_norm,
+                    seed=int(self.config["global_seed"]),
+                )
+                meta_stamps["implementation_provenance"] = [provenance]
+            else:
+                df_norm, vsn_meta = self.calc_vsn_normalization(df_norm)
+                meta_stamps.update(vsn_meta)
             meta_stamps["is_logged"] = True
 
         else:
@@ -1204,7 +1196,54 @@ class DataNormalizer(DatasetProcessor):
                 "Use ROBUST_LOG_ONLY for the log-only baseline."
             )
 
+        meta_stamps["value_scale"] = (
+            "vsn_glog"
+            if method == "VSN"
+            else "log2"
+            if meta_stamps["is_logged"]
+            else "raw_positive"
+        )
         return df_norm, meta_stamps
+
+    @staticmethod
+    def _validate_candidate_domain(
+        result: pd.DataFrame,
+        reference: pd.DataFrame,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Check the delivered scale without clipping legitimate glog signs."""
+        if not result.index.equals(reference.index) or not (
+            result.columns.equals(reference.columns)
+        ):
+            raise ValueError("Normalization changed output identities.")
+        values = result.to_numpy(dtype=float)
+        observed = np.isfinite(reference.to_numpy(dtype=float))
+        finite = np.isfinite(values)
+        report = {
+            **inspect_numeric_domain(result),
+            "value_scale": metadata["value_scale"],
+            "observed_reference_count": int(observed.sum()),
+            "new_missing_count": int((observed & ~finite).sum()),
+            "observed_coverage": (
+                float(finite[observed].mean()) if observed.any() else None
+            ),
+            "policy": "preserve_signed_transform; require_valid_predictions",
+        }
+        metadata["numerical_domain"] = report
+        if not observed.any() or not finite[observed].all():
+            raise ValueError(
+                "Normalization lost observed values or has no valid support."
+            )
+        if np.isinf(values).any():
+            raise ValueError("Normalization produced infinite output.")
+        if (
+            metadata["value_scale"] == "raw_positive"
+            and (values[observed] <= 0).any()
+        ):
+            raise ValueError("Linear normalization produced nonpositive data.")
+        # An existing missing value is not evidence for a fitted zero value.
+        result.iloc[:, :] = np.where(observed, values, np.nan)
+        return report
 
     def _finalize_normalized_object(
         self,
@@ -1239,6 +1278,7 @@ class DataNormalizer(DatasetProcessor):
         candidate_outputs: dict[str, tuple[pd.DataFrame, dict[str, Any]]] = {}
 
         for method in self._AUTO_CANDIDATES:
+            meta_stamps = {}
             apply_external_log = self._uses_external_log_for_method(method)
             logger.info(
                 f"Evaluating Auto normalization candidate: {method} "
@@ -1251,10 +1291,12 @@ class DataNormalizer(DatasetProcessor):
                     apply_external_log=apply_external_log,
                 )
 
-                arr = df_norm.to_numpy(dtype=float)
-                if np.isinf(arr).any() or np.isnan(arr).all():
+                domain = self._validate_candidate_domain(
+                    df_norm, df_target, meta_stamps
+                )
+                if meta_stamps.get("vsn_converged") is False:
                     raise ValueError(
-                        "Candidate produced invalid normalized values."
+                        "VSN optimization did not converge; excluded from AUTO."
                     )
 
                 candidate_obj = self._finalize_normalized_object(
@@ -1267,12 +1309,17 @@ class DataNormalizer(DatasetProcessor):
 
                 record = {
                     "method": method,
+                    "implementation": meta_stamps["implementation"],
+                    "implementation_provenance": meta_stamps.get(
+                        "implementation_provenance", []
+                    ),
                     "normalization_applied": meta_stamps.get(
                         "normalization_applied", False
                     ),
                     "log_transform_applied": apply_external_log,
                     "status": "ok",
                     "error": "",
+                    "numerical_domain": domain,
                     **auto_metrics,
                 }
                 candidate_outputs[method] = (df_norm, meta_stamps)
@@ -1282,10 +1329,20 @@ class DataNormalizer(DatasetProcessor):
                 )
                 record = {
                     "method": method,
+                    "implementation": (
+                        "r"
+                        if method == "VSN"
+                        and self.config.get("implementation") == "r"
+                        else "python"
+                    ),
+                    "implementation_provenance": meta_stamps.get(
+                        "implementation_provenance", []
+                    ),
                     "normalization_applied": method != "ROBUST_LOG_ONLY",
                     "log_transform_applied": apply_external_log,
                     "status": "failed",
                     "error": str(exc),
+                    "numerical_domain": meta_stamps.get("numerical_domain"),
                 }
                 for metric in self._AUTO_SCORE_COMPONENT_WEIGHTS:
                     record[metric] = float("nan")
@@ -1332,9 +1389,18 @@ class DataNormalizer(DatasetProcessor):
                     "selected_method": selected_method,
                     "selected_label": selected_method,
                     "is_auto": True,
+                    "requested_implementation": self.config.get(
+                        "implementation", "python"
+                    ),
+                    "implementation": meta_stamps["implementation"],
+                    "implementation_provenance": meta_stamps.get(
+                        "implementation_provenance", []
+                    ),
                     "selected_score": selected_score,
                     "selection_margin": selected_margin,
                     "candidate_results": auto_summary.to_dict(orient="records"),
+                    "numerical_domain": meta_stamps.get("numerical_domain"),
+                    "status": "completed",
                 },
             }
         )
@@ -1357,6 +1423,24 @@ class DataNormalizer(DatasetProcessor):
             strict=False,
         )
 
+        implementation = self.config.get("implementation", "python")
+        if implementation == "r":
+            if method not in {"VSN", "AUTO"}:
+                raise ValueError(
+                    "R normalization requires norm_method='VSN' or 'Auto'; "
+                    "other explicit methods have no original R adapter."
+                )
+            if self.dataset.context.is_logged:
+                raise ValueError(
+                    "R VSN requires unlogged intensities; the dataset is "
+                    "already log-transformed."
+                )
+            if self.dataset.context.is_scaled:
+                raise ValueError(
+                    "R VSN requires unscaled intensities; the dataset is "
+                    "already scaled."
+                )
+
         if method == "AUTO":
             return self._select_auto_normalization(df_target)
 
@@ -1366,14 +1450,28 @@ class DataNormalizer(DatasetProcessor):
             method=method,
             apply_external_log=apply_external_log,
         )
+        domain = self._validate_candidate_domain(
+            df_norm, df_target, meta_stamps
+        )
         meta_stamps["selection"] = {
             "requested_method": method,
             "selected_method": method,
             "selected_label": method,
             "is_auto": False,
+            "implementation": implementation,
+            "requested_implementation": implementation,
+            "implementation_provenance": meta_stamps.get(
+                "implementation_provenance", []
+            ),
             "selected_score": None,
             "selection_margin": None,
             "candidate_results": [],
+            "numerical_domain": domain,
+            "status": (
+                "degraded"
+                if meta_stamps.get("vsn_converged") is False
+                else "completed"
+            ),
         }
         return self._finalize_normalized_object(df_norm, meta_stamps)
 
@@ -1411,12 +1509,17 @@ class DataNormalizer(DatasetProcessor):
                 "log_transform_active": execution.get("is_logged", False),
             },
             "selection": selection,
+            "numerical_domain": execution.get("numerical_domain", {}),
         }
 
-        if execution.get("norm_method", "ROBUST_LOG_ONLY").upper() == "VSN":
+        if (
+            execution.get("norm_method", "ROBUST_LOG_ONLY").upper() == "VSN"
+            and execution.get("implementation", "python") == "python"
+        ):
             metrics["vsn_parameters"] = {
-                "vsn_scale": execution.get("vsn_scale", float("nan")),
-                "vsn_shift": execution.get("vsn_shift", float("nan")),
+                key: value
+                for key, value in execution.items()
+                if key.startswith("vsn_")
             }
 
         return metrics
@@ -1429,7 +1532,7 @@ class DataNormalizer(DatasetProcessor):
     ) -> StageResult[MetaboDataset]:
         """Return the structured normalization stage result.
 
-        ``norm_method``, ``global_seed``, or ``n_jobs`` supplied here take
+        ``norm_method``, ``implementation``, ``global_seed``, or ``n_jobs`` take
         precedence over pipeline configuration and module defaults.
         """
         result = NormalizationStageRunner(

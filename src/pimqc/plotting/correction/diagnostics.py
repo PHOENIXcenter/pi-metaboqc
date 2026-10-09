@@ -535,3 +535,157 @@ class CorrectionDiagnosticsMixin:
                 ),
             )
         return current_ax
+
+    def plot_canonical_d_ratio_distribution(
+        self,
+        result: dict[str, Any],
+        ax: plt.Axes,
+        show_legend: bool = True,
+        box_width_fraction: float | None = None,
+    ) -> plt.Axes:
+        """Show stored feature-wise canonical D-ratios by evaluation stage."""
+        from matplotlib.patches import Patch
+
+        stages = (
+            ("Before", "d_ratio_baseline", "tab:gray", "-"),
+            (
+                "OOF",
+                "d_ratio_current_oof",
+                pu.PRIMARY_ACCENT_COLOR,
+                "--",
+            ),
+            (
+                "Full",
+                "d_ratio_current_full",
+                pu.PRIMARY_ACCENT_COLOR,
+                "-",
+            ),
+        )
+        data = []
+        labels = []
+        colors = []
+        styles = []
+        legend_artist = None
+        for label, key, color, style in stages:
+            values = result.get(key)
+            if values is None:
+                continue
+            values = pd.Series(values, dtype=float).replace(
+                [np.inf, -np.inf], np.nan
+            ).dropna()
+            if values.empty:
+                continue
+            data.append(values.to_numpy(dtype=float))
+            labels.append(label)
+            colors.append(
+                pu.get_equivalent_hex(
+                    color, alpha=0.33 if label == "OOF" else 1.0
+                )
+            )
+            styles.append(style)
+
+        if not data:
+            ax.text(
+                0.5,
+                0.5,
+                "No valid D-ratio values",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+        else:
+            paired = "OOF" in labels and "Full" in labels
+            positions = [
+                1.0 if label == "Before" else (
+                    2.6 + (-0.28 if label == "OOF" else 0.28)
+                    if paired else 2.6
+                )
+                for label in labels
+            ]
+            x_limits = (min(positions) - 0.5, max(positions) + 0.5)
+            # Match the fraction of the plotting area occupied by an RSD
+            # box, including when that panel has both intra/inter stages.
+            box_width = (
+                0.38 if box_width_fraction is None
+                else box_width_fraction * (x_limits[1] - x_limits[0])
+            )
+            box = ax.boxplot(
+                data,
+                positions=positions,
+                widths=box_width,
+                patch_artist=True,
+                showfliers=False,
+            )
+            for patch, color, style in zip(
+                box["boxes"], colors, styles
+            ):
+                patch.set_facecolor(color)
+                patch.set_edgecolor("k")
+                patch.set_linestyle(style)
+                patch.set_linewidth(pu.DEFAULT_AXIS_LINEWIDTH)
+            for median in box["medians"]:
+                median.set_color("k")
+                # Match the QC-RSD article boxplots: medians are slightly
+                # heavier than box/whisker outlines while the axes remain at
+                # the shared publication linewidth.
+                median.set_linewidth(
+                    0.7 if box_width_fraction is None else pu.DEFAULT_AXIS_LINEWIDTH
+                )
+            for artist in [*box["whiskers"], *box["caps"]]:
+                artist.set_color("k")
+                artist.set_linewidth(pu.DEFAULT_AXIS_LINEWIDTH)
+            ax.set_xticks(
+                [1.0, 2.6], ["Before\ncorrection", "After\ncorrection"]
+            )
+            ax.set_xlim(*x_limits)
+            ax.set_ylim(0.0, 100.0)
+            if show_legend:
+                handles = [
+                    Patch(
+                        facecolor=color,
+                        edgecolor="k",
+                        linewidth=pu.DEFAULT_AXIS_LINEWIDTH,
+                        linestyle=style,
+                        label=label,
+                    )
+                    for label, color, style in zip(
+                        labels, colors, styles
+                    )
+                ]
+                ax.legend(handles=handles)
+                legend_artist = self._format_single_legend(
+                    ax=ax,
+                    group_title="Evaluation stage",
+                    loc="best",
+                    bbox_to_anchor=None,
+                )
+        self._apply_standard_format(
+            ax,
+            title="Canonical D-ratio Distribution",
+            ylabel="Canonical D-ratio (%)",
+            append_stage=False,
+        )
+        # Match the article boxplot panels: axis ticks/spines and all boxplot
+        # artists use the same publication linewidth.
+        for spine in ax.spines.values():
+            if spine.get_visible():
+                spine.set_linewidth(pu.DEFAULT_AXIS_LINEWIDTH)
+        ax.tick_params(
+            axis="both",
+            width=pu.DEFAULT_AXIS_LINEWIDTH,
+            length=2,
+        )
+        if data:
+            medians = [
+                f"{label}: {np.median(values):.2f}%"
+                for label, values in zip(labels, data)
+            ]
+            al.add_auto_annotation(
+                ax=ax,
+                text="Median D-ratio\n" + "\n".join(medians),
+                legend=legend_artist,
+                fontsize=pu.DEFAULT_ANNOTATION_FONTSIZE,
+                bbox=pu.ai_ready_text_bbox(pad=0.25),
+                expand_axes=False,
+            )
+        return ax

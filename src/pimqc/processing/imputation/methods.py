@@ -1,7 +1,7 @@
 """Declare canonical missing-value imputation identifiers and aliases.
 
-The registry provides consistent dispatch and display labels for MAR methods
-without flattening their distinct parameters or benchmark behavior. MNAR routing
+The registry provides consistent dispatch and display labels for R-route methods
+without flattening their distinct parameters or benchmark behavior. S-route
 continues to be controlled independently by the imputation processor.
 """
 

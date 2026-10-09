@@ -13,6 +13,7 @@ from typing import Any, Generic, Mapping, TypeVar, cast
 
 from ..io import ensure_directory
 from ..config.resolution import validate_stage_values
+from ..config.schema import normalize_imputation_route_options
 from .audit import AuditPayload
 
 DataT = TypeVar("DataT")
@@ -50,6 +51,8 @@ def validate_runtime_overrides(
             )
     engine = getattr(processor, "_engine", processor)
     section = type(engine).__name__
+    if section == "MissingValueImputer":
+        overrides = normalize_imputation_route_options(overrides)
     merged = validate_stage_values(
         section, {**getattr(processor, "config", {}), **overrides}
     )

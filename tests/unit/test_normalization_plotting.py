@@ -9,6 +9,7 @@ splitting without coupling the suite to private mixin decorators.
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import pytest
 
 from pimqc.core import MetaboDataset
 from pimqc.plotting.base import BasePlotter
@@ -86,6 +87,50 @@ def _auto_selection() -> dict[str, object]:
         "selected_method": "PQN",
         "is_auto": True,
         "candidate_results": candidate_results,
+    }
+
+
+def _saved_diagnostics() -> dict[str, object]:
+    """Small saved plot inputs; no normalization or statistics are rerun."""
+    qc = {}
+    for stage in ("Before Norm", "After Norm"):
+        qc[stage] = {
+            "rle_records": [
+                {"Stage": stage, "Metric": metric, "Value": 0.2,
+                 "Q25": 0.1, "Q75": 0.3}
+                for metric in ("RLE center offset", "RLE spread")
+            ],
+            "variance": {
+                "feature_stats": pd.DataFrame({"mean_intensity": [1., 2., 3.]}),
+                "trend": pd.DataFrame({
+                    "mean_intensity": [1., 2., 3.],
+                    "dispersion_median": [0.2, 0.3, 0.4],
+                    "dispersion_q25": [0.1, 0.2, 0.3],
+                    "dispersion_q75": [0.3, 0.4, 0.5],
+                }),
+                "mean_variance_abs_rho": 0.5,
+                "mean_variance_abs_slope": 0.1,
+                "qc_dispersion_median": 0.3,
+            },
+            "structure": {
+                "qc_centroid_distance": pd.Series([0.2, 0.3, 0.4]),
+                "qc_pairwise_distance": pd.Series([0.4, 0.5, 0.6]),
+            },
+        }
+    return {
+        "qc_diagnostics": qc,
+        "sample_structure": {
+            "samples": pd.DataFrame({
+                "scale_shift": [-0.05, 0.05],
+                "rank_rho": [0.92, 0.96],
+                "local_trust": [0.95, 0.96],
+            }),
+            "metrics": {
+                "sample_structure_trustworthiness": 0.95,
+                "sample_structure_rank_preservation": 0.94,
+                "sample_structure_scale_preservation": 0.9,
+            },
+        },
     }
 
 
@@ -205,7 +250,9 @@ def test_fixed_normalization_dashboard_uses_compact_target(
         "_plot_qc_structure_improvement",
         "_plot_sample_structure_preservation",
     ):
-        monkeypatch.setattr(plotter, method_name, lambda *a, **k: None)
+        monkeypatch.setattr(
+            plotter, method_name, lambda *a, **k: k.get("ax", k.get("ax_geom"))
+        )
 
     dashboard = plotter.plot_normalization_dashboard()
 
@@ -242,6 +289,7 @@ def test_decorated_fixed_normalization_dashboard_uses_two_by_two_preview() -> (
         sample_scale_log_ratio_tolerance=0.25,
         sample_scale_relative_delta_tolerance=0.25,
         global_seed=42,
+        **_saved_diagnostics(),
     )
 
     dashboard = NormalizationPlotter(payload).plot_normalization_dashboard()
@@ -252,4 +300,66 @@ def test_decorated_fixed_normalization_dashboard_uses_two_by_two_preview() -> (
         BasePlotter.resolve_dashboard_display_width(dashboard)
         == pu.TWO_BY_TWO_DASHBOARD_DISPLAY_WIDTH
     )
+    plt.close("all")
+
+
+@pytest.mark.parametrize("mode", ["auto", "fixed", "article"])
+@pytest.mark.parametrize("trend_missing", ["empty", "nonfinite"])
+def test_normalization_omits_unavailable_variance_panel_and_stage_legend(
+    mode, trend_missing,
+):
+    """A valid scalar score does not require a drawable binned trend."""
+    data = snapshot_dataset(_minimal_normalization_dataset())
+    diagnostic = _saved_diagnostics()
+    for stage in diagnostic["qc_diagnostics"].values():
+        trend = stage["variance"]["trend"]
+        stage["variance"]["trend"] = (
+            trend.iloc[:0] if trend_missing == "empty" else trend * np.nan
+        )
+    selection = {} if mode == "fixed" else _auto_selection()
+    plotter = NormalizationPlotter(NormalizationPlotPayload(
+        raw_data=data, normalized_data=data, selection=selection,
+        score_component_weights={
+            "rle_alignment_change_score": 0.3,
+            "variance_stabilization_score": 0.3,
+            "qc_structure_change_score": 0.2,
+            "sample_structure_score": 0.2,
+        },
+        sample_scale_log_ratio_tolerance=0.25,
+        sample_scale_relative_delta_tolerance=0.25,
+        global_seed=42, **diagnostic,
+    ))
+    dashboard = (
+        plotter.plot_normalization_article_dashboard() if mode == "article"
+        else plotter.plot_normalization_dashboard()
+    )
+    assert dashboard is not None
+    assert all("variance" not in label.lower() for label in dashboard.bricks_dict)
+    assert all(ax.get_visible() for ax in dashboard.bricks_dict.values())
+    from matplotlib.text import Text
+    text = [
+        artist.get_text() for ax in dashboard.bricks_dict.values()
+        for artist in ax.findobj(Text)
+    ]
+    assert not any("Insufficient" in t for t in text)
+    assert "QC variance stabilization stage" not in text
+    if mode != "fixed":
+        assert "QC variance stabilization" in text  # Score legend stays valid.
+        assert selection["candidate_results"][0]["overall_score"] == 0.75
+    plt.close("all")
+
+
+@pytest.mark.parametrize("panel", [
+    "_plot_qc_rle_boxplot", "_plot_qc_variance_stabilization",
+    "_plot_qc_structure_improvement", "_plot_sample_structure_preservation",
+])
+def test_empty_normalization_diagnostics_return_none_without_placeholder(panel):
+    data = snapshot_dataset(_minimal_normalization_dataset())
+    plotter = NormalizationPlotter(NormalizationPlotPayload(
+        raw_data=data, normalized_data=data, selection={},
+        score_component_weights={}, sample_scale_log_ratio_tolerance=0.25,
+        sample_scale_relative_delta_tolerance=0.25, global_seed=42,
+    ))
+    assert getattr(plotter, panel)() is None
+    assert plotter.plot_normalization_dashboard() is None
     plt.close("all")

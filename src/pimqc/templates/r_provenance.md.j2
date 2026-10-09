@@ -1,0 +1,39 @@
+{% macro original_r(selection) -%}
+{# Report provenance for the selected R output only.  R candidates evaluated
+   during an AUTO request are retained in the audit/JSON, not mixed into a
+   report for a Python-selected output. #}
+{%- set selected_implementation = selection.get('implementation', selection.get('selected_implementation', 'python')) | string | lower -%}
+{%- set requested_implementation = selection.get('requested_implementation', '') | string | lower -%}
+{%- set report_r = selected_implementation == 'r' or (not selection.get('is_auto', false) and requested_implementation == 'r') -%}
+{%- if report_r -%}
+{%- set calls = namespace(records=selection.get('implementation_provenance', [])) -%}
+{%- if calls.records -%}
+**Original R implementation.** The selected method used an original R implementation. The provider, package, function, versions, and warnings are summarized below; complete call-specific parameters, phases, transformations, and warnings remain in `Report_Input.json` and the stage audit.
+{%- set seen = namespace(providers=[], warnings=[]) -%}
+{%- for record in calls.records -%}
+{%- set provider = [record.get('method'), record.get('package'), record.get('package_version'), record.get('function'), record.get('r_version'), record.get('rpy2_version'), record.get('seed')] -%}
+{%- if provider not in seen.providers -%}
+{%- set seen.providers = seen.providers + [provider] -%}
+{{ '\n\n' }}**{{ record.get('method', 'Method not recorded') }}:** `{{ record.get('function', 'Function not recorded') }}` from **{{ record.get('package', 'Package not recorded') }} {{ record.get('package_version', 'version not recorded') }}**; {{ record.get('r_version', 'R version not recorded') }}; rpy2 {{ record.get('rpy2_version', 'version not recorded') }}; random seed: {{ record.get('seed') if record.get('seed') is not none else 'not set' }}. Detailed parameters are retained in the stage audit.
+{%- if record.get('upstream_source') -%}
+{%- set source = record.get('upstream_source') -%}
+{{ '\n\n' }}**Upstream function source:** {{ source.get('url') }}; commit `{{ source.get('commit') }}`; upstream app SHA-256 `{{ source.get('upstream_app_sha256') }}`; loaded source SHA-256 `{{ source.get('loaded_source_sha256') }}`. The listed R package is the numerical dependency, not an independently released SERRF package. {{ source.get('license') }}.
+{%- endif -%}
+{%- if record.get('blank_policy') == 'excluded_from_fit_and_retained_unchanged' or record.get('input_policy', {}).get('blank_output') == 'unchanged' or record.get('upstream_source') -%}
+{{ ' ' }}Blank columns, when present, were excluded from this R fit and retained unchanged.
+{%- endif -%}
+{%- endif -%}
+{%- for warning in record.get('warnings', []) + record.get('diagnostic_warnings', []) -%}
+{%- if warning not in seen.warnings -%}
+{%- set seen.warnings = seen.warnings + [warning] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- if seen.warnings -%}
+{{ '\n\n' }}**R warnings:** {{ seen.warnings | join('; ') }}.
+{%- endif -%}
+{%- else -%}
+R implementation was requested, but no original-package call was recorded for this stage.
+{%- endif -%}
+{%- endif -%}
+{%- endmacro %}

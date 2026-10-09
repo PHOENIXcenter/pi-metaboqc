@@ -327,7 +327,7 @@ class ImputationDiagnosticsMixin:
             annot_lines.append(f"NRMSE (low): {nrmse_low:.4f}")
         annot_text = "\n".join(annot_lines)
 
-        title_str = "MAR Masked Simulation"
+        title_str = "R-route Masked Simulation"
         if method_name:
             is_selected = method_name.strip().startswith("*")
             clean_name = method_name.replace("*", "").strip()

@@ -5,16 +5,31 @@ features, applies the SVD-based projection, and returns corrected numerical
 data. It does not depend on configuration, export, or visualization.
 """
 
-import warnings
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from loguru import logger
 
+from .missing_input import prepare_median_input
+
+
+def _observed_control_support(
+    values: np.ndarray, groups: np.ndarray
+) -> np.ndarray:
+    """Require real varying observations within at least one replicate group."""
+    supported = np.zeros(values.shape[0], dtype=bool)
+    for group in np.unique(groups):
+        block = values[:, groups == group]
+        for feature, observed in enumerate(block):
+            observed = observed[~np.isnan(observed)]
+            if observed.size >= 2 and np.ptp(observed) > 0:
+                supported[feature] = True
+    return supported
+
 
 class RUVCorrector:
-    """Pure mathematical engine for RUV-III correction via SVD projection."""
+    """QC/control-residual variant of RUV, not an exact original-R port."""
 
     def __init__(self, k: int = 3) -> None:
         """Initialize the unwanted-factor model.
@@ -23,6 +38,7 @@ class RUVCorrector:
             k: Number of unwanted latent factors to remove.
         """
         self.k = k
+        self.diagnostics: dict = {}
 
     def fit_transform(
         self,
@@ -47,6 +63,7 @@ class RUVCorrector:
         """
 
         logger.info(f"Executing RUV-III (k={self.k})...")
+        self.diagnostics = {}
         if control_features.empty:
             raise ValueError("RUV-III requires at least one control feature.")
 
@@ -63,24 +80,23 @@ class RUVCorrector:
         if not np.any(fit_mask):
             raise ValueError("RUV-III requires at least one non-Blank sample.")
 
-        Y_safe = np.clip(Y_raw, a_min=0, a_max=None)
-        Y = np.log1p(Y_safe)
-
-        # Define zero-only features from the fitting set so Blank background
-        # cannot alter the RUV feature space.
-        zero_mask = np.all(Y_safe[fit_mask, :] == 0, axis=0)
-
-        nan_mask = np.isnan(Y)
-        if nan_mask.any():
+        # Nonpositive raw values are input-domain missingness.  Do not let
+        # them enter the fitted model as artificial zeros; the output stage
+        # will retain these positions as missing rather than restoring them.
+        if np.isinf(Y_raw).any():
+            raise ValueError("RUV-III intensities must not contain infinity.")
+        safe_frame = intensity_df.astype(float).where(intensity_df > 0)
+        filled, missing, adapter = prepare_median_input(
+            safe_frame, fit_mask, scale="log1p"
+        )
+        if adapter["applied"]:
             logger.warning(
-                "NaNs detected. Applying non-Blank median imputation..."
+                "RUV temporarily median-filled {} missing fit cells in log "
+                "space; original missing positions will be restored.",
+                adapter["temporary_filled_cells"],
             )
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                col_medians = np.nanmedian(Y[fit_mask, :], axis=0)
-            col_medians[np.isnan(col_medians)] = 0.0
-            nan_rows, nan_cols = np.where(nan_mask)
-            Y[nan_rows, nan_cols] = col_medians[nan_cols]
+        Y = filled.T.to_numpy(dtype=float)
+        nan_mask = missing.T.to_numpy(dtype=bool)
 
         # Blank rows are held out of all fitted quantities.  QC rows share one
         # group, while each non-QC biological row remains its own RUV group.
@@ -105,12 +121,47 @@ class RUVCorrector:
         group_means = np.linalg.solve(group_sizes, M.T @ Y_fit)
         Y0 = Y_fit - (M @ group_means)
 
-        # Exclude zero-variance control features dynamically
-        ctl_mask = intensity_df.index.isin(control_features) & ~zero_mask
+        # Filled values cannot establish control support in replicate groups.
+        support = _observed_control_support(
+            safe_frame.loc[:, fit_mask].to_numpy(dtype=float),
+            np.asarray(group_ids),
+        )
+        ctl_mask = intensity_df.index.isin(control_features)
+        supported_controls = ctl_mask & support
+        if int(supported_controls.sum()) < self.k:
+            raise ValueError(
+                "RUV-III observed negative-control support is below k; "
+                "each control needs varying real replicate observations."
+            )
         Y0_ctl = Y0[:, ctl_mask]
 
         U, S, Vt = np.linalg.svd(Y0_ctl, full_matrices=False)
-        safe_k = min(self.k, Y0_ctl.shape[0], Y0_ctl.shape[1])
+        if self.k > Y0_ctl.shape[0]:
+            raise ValueError("RUV-III k exceeds the fitting sample count.")
+        safe_k = self.k
+        residual_rank = int(np.linalg.matrix_rank(Y0_ctl))
+        self.diagnostics.update({
+            "estimator": "QC control-residual SVD with recentering",
+            "requested_k": int(self.k), "effective_k": int(safe_k),
+            "control_feature_ids": intensity_df.index[ctl_mask].tolist(),
+            "observed_supported_control_ids": (
+                intensity_df.index[supported_controls].tolist()
+            ),
+            "observed_supported_control_count": int(
+                supported_controls.sum()
+            ),
+            "control_residual_rank": residual_rank,
+            "replicate_residual_df": int((qc_mask & fit_mask).sum()) - 1,
+            "input_negative_count": int((Y_raw < 0).sum()),
+            "input_zero_count": int((Y_raw == 0).sum()),
+            "output_policy": "unmodified kernel; stage maps invalid to missing",
+            "missing_input_adapter": adapter,
+        })
+        if residual_rank < safe_k:
+            logger.warning(
+                "RUV requested factors exceed the observed control rank; "
+                "some fitted directions are unidentifiable."
+            )
         alpha_ctl = Vt[:safe_k, :]
 
         W_fit = Y_fit[:, ctl_mask] @ alpha_ctl.T
@@ -125,15 +176,28 @@ class RUVCorrector:
         W_all = Y[:, ctl_mask] @ alpha_ctl.T
         correction = W_all @ alpha_full - correction_center
 
-        # Protect absolute zero features from being negatively corrected
-        correction[:, zero_mask] = 0.0
-
         Y_corr_log = Y - correction
-        Y_corrected = np.expm1(Y_corr_log)
-        Y_corrected = np.clip(Y_corrected, a_min=1e-6, a_max=None)
-
-        # Restore original strict zeros
-        Y_corrected[:, zero_mask] = 1e-6
+        with np.errstate(over="ignore", invalid="ignore"):
+            Y_corrected = np.expm1(Y_corr_log)
+        required = ~nan_mask
+        self.diagnostics.update({
+            "output_negative_count": int(
+                ((Y_corrected < 0) & required).sum()
+            ),
+            "output_zero_count": int(
+                ((Y_corrected == 0) & required).sum()
+            ),
+            "output_nonfinite_count": int(
+                (~np.isfinite(Y_corrected) & required).sum()
+            ),
+        })
+        if self.diagnostics["output_negative_count"] or (
+            self.diagnostics["output_nonfinite_count"]
+        ):
+            logger.warning(
+                "Native RUV returned invalid raw intensities; the correction "
+                "stage maps these to missing. Counts remain in diagnostics."
+            )
 
         if nan_mask.any():
             Y_corrected[nan_mask] = np.nan

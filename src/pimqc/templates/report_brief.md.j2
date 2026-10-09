@@ -1,5 +1,6 @@
 # Executive Summary: Quality Control Summary via $\pi$-metaboqc
 
+{% from 'r_provenance.md.j2' import original_r %}
 {%- set meta = metadata | default({}) -%}
 {%- set raw_params = raw_dataset.get('pipeline_params', {}) -%}
 {%- set feats = raw_params.get('features', {}) -%}
@@ -25,6 +26,10 @@
 
 {%- set imp_params = missing_value_imputation.get('pipeline_params', {}) -%}
 {%- set imp_strat = imp_params.get('strategies', {}) -%}
+{%- set imp_dist = imp_params.get('feature_distribution', {}) -%}
+{%- set r_count = imp_dist.get('r_route_count', imp_dist.get('mar_count', 0)) -%}
+{%- set s_count = imp_dist.get('s_route_count', imp_dist.get('mnar_count', 0)) -%}
+{%- set correction_gaps = imp_params.get('missingness_routing', {}).get('correction_reconstruction_count', 0) -%}
 {%- set imp_selection = imp_params.get('selection', {}) -%}
 {%- set imp_status = imp_params.get('imputation_status', 'Pending') -%}
 {%- set imp_selected_label = imp_selection.get('selected_label', 'Unknown') -%}
@@ -50,13 +55,15 @@ The analytical dataset, acquired in **{{ meta.get('mode', 'Unknown') }}** ioniza
 ### Feature Retention Summary
 
 * **Initial Acquisition:** **{{ feats.get('total', 'N/A') }}** raw mass spectral features.
-* **Final High-Fidelity Matrix:** Following stringent topological missing-value screening, blank-ratio background elimination, and strict relative standard deviation (RSD) reproducibility evaluation, **{{ lq_final_total }}** genuine metabolic features (**{{ lq_final.get('mar_count', 'N/A') }}** missing-at-random (MAR) and **{{ lq_final.get('mnar_count', 'N/A') }}** missing-not-at-random (MNAR)) were successfully isolated for downstream statistical analysis.
+* **Final Filtered Matrix:** Missing-value screening, blank/QC filtering, and relative standard deviation (RSD) evaluation retained **{{ lq_final_total }}** features (**{{ lq_final.get('mar_count', 'N/A') }}** R-route and **{{ lq_final.get('mnar_count', 'N/A') }}** S-route) for downstream analysis. R-route denotes reconstruction; S-route denotes special handling after group-pattern or low-intensity QC rescue. These are operational routes, not statistical missingness mechanisms.
 
 ## 2. Signal Drift Correction, Imputation & Normalization
 
 {%- set primary_algo = sc_stages[0].get('algorithm', 'a QC-anchored') if sc_stages else 'a QC-anchored' %}
 
 Systematic technical variations, including time-dependent instrument drift and batch discrepancies, were mitigated utilizing the **{{ primary_algo }}** algorithm{% if sc_is_auto %}; AUTO selection delivered **{{ sc_selected_method }}**{% endif %}.
+
+{{ original_r(sc_selection) }}
 
 {%- set rsd_before = sc_perf.get('median_qc_rsd_baseline') %}
 {%- set final_rsd_full = sc_perf.get('median_qc_rsd_current_full') %}
@@ -74,27 +81,35 @@ Signal correction was applied, but QC RSD metrics are unavailable for this repor
 Subsequently, missing-value imputation was bypassed because no missing values were detected in the target analytical matrix; the matrix was propagated unchanged.
 {%- else %}
 Subsequently, missing values were reconstructed.
-{% if imp_params.get('feature_distribution', {}).get('mnar_count', 0) > 0 %}
-MNAR features were imputed using **{{ imp_strat.get('mnar_method', 'N/A') }}**; QRILC uses seeded sampling rather than deterministic constant substitution.
+{% if s_count > 0 %}
+Original missing cells on S-route features were imputed using **{{ imp_strat.get('s_route_method', imp_strat.get('mnar_method', 'N/A')) }}**; QRILC uses seeded sampling rather than deterministic constant substitution.
 {% endif %}
-{% if imp_params.get('feature_distribution', {}).get('mar_count', 0) > 0 %}
-MAR features were imputed using **{{ imp_selected_label }}**{% if imp_selection.get('is_auto') %} selected by AUTO benchmarking{% endif %}. Low-abundance NRMSE evaluates masked observations from features whose median intensity is at or below the 25th percentile of all feature medians.
+{% if r_count > 0 or correction_gaps > 0 %}
+R-route cells (original gaps on R-route features and any correction-induced gaps) were imputed using **{{ imp_selected_label }}**{% if imp_selection.get('is_auto') %} selected by AUTO benchmarking{% endif %}. Low-abundance NRMSE evaluates masked observations from features whose median intensity is at or below the 25th percentile of all feature medians.
 {% else %}
-MAR imputation and benchmarking were not required.
+R-route imputation and benchmarking were not required.
 {% endif %}
 {%- endif %}
+
+{{ original_r(imp_selection) }}
 
 {% if is_auto_norm %}
 Finally, global quantitative refinement used automatic selection of **{{ norm_selection.get('selected_label', norm_selection.get('selected_method', norm_method)) | replace('_', ' ') }}** normalization from predefined candidates. Selection was based on QC relative log expression (RLE) alignment change, QC variance stabilization, QC structure distance improvement, and sample structure preservation relative to the robust-log reference{% if norm_selection.get('selected_score') is number %} (overall score: **{{ norm_selection.get('selected_score') | round(3) }}**){% endif %}.
 {% elif norm_method == 'ROBUST_LOG_ONLY' %}
 Finally, global quantitative refinement used a robust Log2 transformation without sample-wise normalization. QC relative log expression (RLE) alignment, QC variance stabilization, QC structure distance, and sample structure preservation diagnostics were generated for review.
 {% elif norm_method == 'VSN' %}
+{% if norm_selection.get('implementation') == 'r' %}
+Finally, global quantitative refinement fitted **VSN** using the original `vsn::vsn2` function and `vsn::predict`. The returned generalized logarithmic values were used without another Log2 transformation. QC and sample-structure diagnostics describe this R-produced matrix.
+{% else %}
 Finally, global quantitative refinement used **VSN** to shift the data into a generalized logarithmic space (glog). Normalization diagnostics focused on QC relative log expression (RLE) alignment, QC variance stabilization, QC structure distance, and sample structure preservation.
+{% endif %}
 {% elif norm_method == 'QUANTILE' %}
 Finally, global quantitative refinement used {% if is_log %}a robust Log2 transformation followed by {% endif %}**QUANTILE** normalization, with score-aligned diagnostics used to inspect technical alignment and sample structure preservation.
 {% else %}
 Finally, global quantitative refinement used **{{ norm_method }}** normalization{% if is_log %} followed by a robust Log2 transformation{% endif %}, with score-aligned diagnostics used to inspect technical alignment and sample structure preservation.
 {% endif %}
+
+{{ original_r(norm_selection) }}
 
 ## 3. Global Data Quality Validation
 
@@ -104,8 +119,9 @@ A fixed QA suite is run for each stage snapshot to show how processing changed t
 
 {% set rsd_guardrail = rsd_guardrail | default({}) -%}
 Pooled-QC RSD was used to assess analytical precision, while biological-sample RSD was retained as a descriptive guardrail against compression of sample heterogeneity.
+The stored evaluation scale and valid-feature support determine interpretation: VSN uses an exponentiated diagnostic, not a raw-intensity inverse, and centered/scaled intensity RSD is unavailable.
 {% if rsd_guardrail.get('available') -%}
-The proportion of features with calculable pooled-QC RSD below 10% changed from **{{ rsd_guardrail.get('raw_qc_low_pct') | round(1) }}%** in the raw matrix to **{{ rsd_guardrail.get('final_qc_low_pct') | round(1) }}%** after **{{ rsd_guardrail.get('final_stage') }}**. In contrast, the proportion of retained features with biological-sample RSD above 30% changed from **{{ rsd_guardrail.get('raw_actual_high_pct') | round(1) }}%** to **{{ rsd_guardrail.get('final_actual_high_pct') | round(1) }}%**, consistent with preservation of a broad sample-variation distribution rather than convergence toward pooled-QC precision.
+The proportion of features with calculable pooled-QC RSD below 10% was **{{ rsd_guardrail.get('raw_qc_low_pct') | round(1) }}%** in the raw matrix and **{{ rsd_guardrail.get('final_qc_low_pct') | round(1) }}%** after **{{ rsd_guardrail.get('final_stage') }}**. The reported evaluation scale was **{{ rsd_guardrail.get('final_evaluation_scale') }}**; when the raw and final scales differ, these values are descriptive and not a direct precision comparison. Biological-sample RSD above 30% was **{{ rsd_guardrail.get('final_actual_high_pct') | round(1) }}%** at the final stage and was interpreted with sample-structure diagnostics rather than optimized.
 {% endif %}
 
 ![**Feature RSD Dashboard**](assets/01_QC_Sample_RSD_Dashboard.svg){.full-width-image}

@@ -1,6 +1,6 @@
-# 1 Native Python API — pi-metaboqc 1.4.0
+# 1 Native Python API — pi-metaboqc 1.5.0
 
-This reference describes the composition-based Python API implemented in pi-metaboqc 1.4.0. For a guided workflow with stage-by-stage dashboards, start with the [interactive tutorial](../examples/interactive_tutorial.ipynb). Configuration examples are available in the packaged [TOML](../src/pimqc/resources/demo/pipeline_parameters.toml) and [JSON](../src/pimqc/resources/demo/pipeline_parameters.json) files.
+This reference describes the composition-based Python API implemented in pi-metaboqc 1.5.0. For a guided workflow with stage-by-stage dashboards, start with the [interactive tutorial](../examples/interactive_tutorial.ipynb). Configuration examples are available in the packaged [TOML](../src/pimqc/resources/demo/pipeline_parameters.toml) and [JSON](../src/pimqc/resources/demo/pipeline_parameters.json) files.
 
 Contents:
 
@@ -21,7 +21,7 @@ Contents:
 
 The standard pipeline performs dataset construction → sample missingness filtering → feature missingness classification/filtering → signal correction → feature quality filtering → imputation → normalization. Quality assessment (QA) observes the raw dataset and subsequent feature-processing checkpoints, including every selected correction stage. QA does not replace the intensity matrix.
 
-Sample and feature missingness are separate execution boundaries with independent audits. They share the user-facing `02_MV_Filtered` directory and one combined missingness dashboard. Feature quality filtering remains a separate stage after correction; it uses the original feature missingness tracking to preserve MAR/MNAR routing and retention history.
+Sample and feature missingness are separate execution boundaries with independent audits. They share the user-facing `02_MV_Filtered` directory and one combined missingness dashboard. Feature quality filtering remains a separate stage after correction; it uses the original feature missingness tracking to preserve R-route/S-route assignments and retention history. R-route means reconstruction route, not the R programming language. S-route means special-handling route for features retained through group-pattern or low-intensity QC rescue. These operational categories do not identify statistical missingness mechanisms.
 
 ```text
 MetaboDataset
@@ -183,7 +183,7 @@ The effective priority is:
 3. The validated configuration section.
 4. Built-in defaults.
 
-`resolve_stage_config(pipeline_params, section_name, defaults, explicit_overrides=None)` returns the merged mapping without modifying input mappings. Run-time override names are checked against each stage's allowed keys before computation; changes update the processor configuration and invalidate cached calculations. This key check is not a second full Pydantic validation of all explicit numerical values.
+`resolve_stage_config(pipeline_params, section_name, defaults, explicit_overrides=None)` merges settings without modifying input mappings and validates the resulting stage values against the Pydantic schema. Run-time overrides also undergo an allowed-key check before computation; accepted changes update the processor configuration and invalidate cached calculations.
 
 Omitting a method means “use the resolved configuration,” not “force Auto.” A configured `norm_method="VSN"` remains VSN if the constructor omits `norm_method`; explicitly passing `norm_method="Auto"` requests selection. Omission and explicit Auto coincide when the resolved method is Auto, including the normal default configuration. Inspect the returned audit to determine what ran.
 
@@ -198,11 +198,13 @@ The demo configuration is an example, not a table of immutable class defaults. S
 | `Dataset` | `mode`, `sample_name`, `sample_type`, `bio_group`, `group_order`, `batch`, `inject_order`, `boundary`, `global_seed`, `internal_standard`, `outlier_ref_feat`, `resort_inject_order`, `sample_dict` |
 | `QualityAssessor` | `corr_method`, `scaling_method`, `is_outlier_threshold`, `orf_outlier_threshold` |
 | `FeatureFilter` | `sample_mv_tol`, `mv_global_tol`, `mv_qc_tol`, `mv_group_tol`, `mnar_group_mv_tol`, `mnar_qc_mv_tol`, `mnar_intensity_pct`, `blank_qc_ratio_tol`, `qc_rsd_tol` |
-| `SignalCorrector` | `base_est`, `loess_span`, `loess_degree`, `rlsc_span_selection`, `rlsc_span_grid`, `rlsc_min_qc`, `rlsc_robust`, `rlsc_robust_iterations`, `rf_n_tree`, `serrf_n_tree`, `serrf_corr_features`, `serrf_backend`, `serrf_batch_size`, `svr_kernel`, `svr_c`, `svr_gamma`, `ruv_k`, `waveica_components`, `waveica_cutoff`, `waveica_levels`, `waveica_spline_knots`, `waveica_max_iter`, `regression_backend`, `regression_batch_size`, `cv_folds`, `n_jobs` |
-| `MissingValueImputer` | `mnar_method`, `mnar_fraction`, `mar_method`, `knn_neighbors`, `lls_neighbors`, `bpca_components`, `bpca_max_iter`, `bpca_tol`, `sim_mask_ratio` |
-| `DataNormalizer` | `norm_method`, `n_jobs` |
+| `SignalCorrector` | `implementation`, `base_est`, `loess_span`, `loess_degree`, `rlsc_span_selection`, `rlsc_span_grid`, `rlsc_min_qc`, `rlsc_robust`, `rloess_span_selection`, `rloess_span`, `rloess_iterations`, `rf_n_tree`, `serrf_n_tree`, `serrf_corr_features`, `serrf_backend`, `serrf_batch_size`, `serrf_r_source`, `svr_kernel`, `svr_c`, `svr_gamma`, `ruv_k`, `ruv_control_features`, `ruv_replicate_column`, `waveica_components`, `waveica_cutoff`, `waveica_alpha`, `waveica_levels`, `waveica_spline_knots`, `waveica_max_iter`, `regression_backend`, `regression_batch_size`, `cv_folds`, `n_jobs` |
+| `MissingValueImputer` | `implementation`, `mnar_method`, `mnar_fraction`, `mar_method`, `knn_neighbors`, `lls_neighbors`, `bpca_components`, `bpca_max_iter`, `bpca_tol`, `sim_mask_ratio` |
+| `DataNormalizer` | `implementation`, `norm_method`, `n_jobs` |
 
 The three independent filters share the `FeatureFilter` section; do not create configuration sections named after their individual classes. Their constructor/run-time overrides accept only their relevant field subsets, listed below.
+
+The table lists stored schema fields. For imputation, prefer the input aliases `r_route_method` and `s_route_method` in constructors, run-time overrides, and TOML/JSON configuration. They resolve to `mar_method` and `mnar_method`, respectively; `model_dump()` retains these historical field names for compatibility. Conflicting aliases in the same input layer are rejected. `mnar_fraction` and the filtering thresholds named `mnar_*` remain supported field names; they configure S-route handling and do not imply a missingness mechanism.
 
 `global_seed` is configured under `Dataset`; correction, imputation, and normalization also accept it as a direct constructor/run-time override. It is not an extra field in those three TOML/JSON sections.
 
@@ -214,13 +216,99 @@ The three independent filters share the `FeatureFilter` section; do not create c
 | QA `scaling_method` | `Auto-scaling`, `Pareto-scaling`, `None`; applied locally for assessment |
 | QA reference outlier thresholds | Float from 0 to 1 means a failing-reference ratio; integer ≥ 1 means an absolute count. `1.0` and `1` therefore have different meanings |
 | Dataset `boundary` | `IQR` or `sigma` |
-| Correction `base_est` | `Auto`, `QC-RLSC`, `QC-RFSC`, `QC-SVR`, `SERRF`, `RUV-III`, `WaveICA 2.0` |
-| Correction `rlsc_span_selection` | `fixed` or `gcv`; robustness is controlled separately by `rlsc_robust` and `rlsc_robust_iterations` |
-| Imputation `mnar_method` | `QRILC`, `Row-wise`, `Column-wise`, `Global` |
-| Imputation `mar_method` | `Auto`, `MinProb`, `KNN`, `LLS`, `BPCA`, `Median` |
+| Correction `base_est` | `Auto`, `QC-RLSC`, `robust QC-RLSC`, `QC-RFSC`, `QC-SVR`, `SERRF`, `RUV-III`, `WaveICA 2.0`, `Metanorm-rLOESS` |
+| Correction `rlsc_span_selection` | `fixed` or constrained-grid `gcv`, for standard raw-scale QC-RLSC only |
+| Correction `rloess_span_selection` | `gcv` (continuous GCV, default) or `fixed`, for MetaNorm-style robust QC-RLSC; `rloess_span` controls fixed fits and `rloess_iterations` controls robust fitting |
+| Imputation `s_route_method` (stored as `mnar_method`) | `QRILC`, `Row-wise`, `Column-wise`, `Global` |
+| Imputation `r_route_method` (stored as `mar_method`) | `Auto`, `MinProb`, `KNN`, `LLS`, `BPCA`, `Median` |
 | Normalization `norm_method` | `Auto`, `ROBUST_LOG_ONLY`, `TIC`, `Median`, `PQN`, `MDFC`, `Quantile`, `VSN` |
 
 Method dispatch normalizes supported spellings and may record a canonical identifier such as `MEDIAN` or `QUANTILE`. Use `selected_method` for programmatic decisions and `selected_label` for display where provided.
+
+### 1.3.5 Optional R implementations
+
+`implementation="python"` is the default for correction, imputation, and normalization. Selecting `"r"` changes the scientific implementation, not the Joblib execution backend. Configure it using the same constructor, run-time, or file precedence rules as other stage settings. R supports compatible explicit methods and `AUTO`; implicit cross-language fallback is never used.
+
+AUTO keeps the existing candidate sets and scoring definitions. Providers are assigned before evaluation; this is not a competition between both implementations of every method.
+
+| Stage | Candidates replaced by original R | Candidates retaining Python |
+|---|---|---|
+| Correction | Robust QC-RLSC, SERRF, RUV-III, WaveICA 2.0 | Standard QC-RLSC, QC-SVR |
+| Imputation | BPCA, QRILC | KNN, MinProb, Median, LLS |
+| Normalization | VSN | ROBUST_LOG_ONLY, PQN, MDFC, TIC, Median, Quantile |
+
+An incompatible or failed R AUTO candidate remains failed, while eligible alternatives continue; the same method is not retried in Python. Explicit unsupported R/method combinations still raise errors. `selection["requested_implementation"]` retains the request, `selection["implementation"]` identifies the selected method's actual backend, and candidate rows retain their own `implementation` and `implementation_provenance`. Imputation additionally records `s_route_implementation`, with `mnar_implementation` retained as a compatibility key. Repeated AUTO runs retain the original request even when a Python-only candidate wins.
+
+```python
+from pimqc import DataNormalizer, MissingValueImputer, SignalCorrector
+
+# Choose only the stages for which you want original R execution.
+imputed_result = MissingValueImputer(
+    quality_filtered_dataset,
+    pipeline_params=params,
+    r_route_method="BPCA",
+    s_route_method="QRILC",
+    implementation="r",
+).run_imputation()
+
+normalized_result = DataNormalizer(
+    imputed_result.data,
+    pipeline_params=params,
+    norm_method="VSN",
+    implementation="r",
+).run_normalization()
+
+# Correction runs earlier in the pipeline, before quality filtering.
+corrected_result = SignalCorrector(
+    mv_filtered_dataset,
+    pipeline_params=params,
+    base_est="QC-RLSC",
+    rlsc_robust=True,
+    implementation="r",
+).run_signal_correction()
+```
+
+Equivalent TOML settings are:
+
+```toml
+[MissingValueImputer]
+implementation = "r"
+r_route_method = "BPCA"
+s_route_method = "QRILC"
+
+[DataNormalizer]
+implementation = "r"
+norm_method = "VSN"
+
+[SignalCorrector]
+implementation = "r"
+base_est = "QC-RLSC"
+rlsc_robust = true
+```
+
+These choices leave the `MetaboDataset`/`StageResult`/typed Audit contract unchanged. Access provenance at `result.audit.metrics["selection"]["implementation_provenance"]`; normalization also exposes the same selection via `result.audit.selection`. Entries contain the actual R package/function, versions, available upstream source metadata, parameters, random seed/RNG kind, transformations, and warnings. No R objects are retained; existing serialization and detached plotting remain usable without R. A skipped imputation has no R invocation and therefore no fabricated execution provenance.
+
+R calls run serially on the main Python thread. R seeds must be integers from 0 to 2,147,483,647; identical integer seeds in Python and R do not imply identical stochastic outputs. The backend restores the host R random state after execution. Missing R/rpy2/packages, invalid upstream inputs, or failed R fits raise an error rather than return an unlabeled Python result. The existing `calc_*` and `impute_by_*` helpers remain native Python computations; the selectable implementation is a processor/stage API. Quantile remains Python-only. WaveICA 2.0, RUV-III, and the pinned-source SERRF adapter are also available for explicit R correction; their requirements are detailed in [1.4.7.1](#1471-original-r-correction-adapters).
+
+Use separate output directories when comparing Python and R runs. Imputation retains its existing method-based CSV/SVG names, and report/audit output locations are not automatic run identifiers.
+
+For installation, the verified local versions, diagnostics, and optional tests, see the [optional R backend guide](r_backend.md). `pimqc.processing.r_backend.check_r_environment(packages=())` reports runtime/package availability without installing anything; the numerical adapter helpers are internal implementation details.
+
+#### 1.3.5.1 Input and output scales
+
+An original R function may perform its own centering, scaling, or generalized-log transformation. Do not pre-log data just because the selected implementation is R. The stage accepts its declared input scale and owns any adapter transformation: imputation uses `log2(x+1)` and `exp2(x)-1`; RUV-III uses the same outer pair; Metanorm rLOESS uses `log2(x)` and `exp2(x)`; VSN receives raw data and returns its intrinsic generalized-log2 output without a second log. WaveICA and SERRF receive raw data but still perform their own internal correction operations.
+
+VSN generalized-log values are not ordinary log2 intensities and cannot be inverted with a generic `exp2(x)-1`. RUV-III may return valid log-space output whose inverse violates the stage's positive raw-intensity contract. The correction boundary converts those raw inverse values to missing and records affected cells; it does not silently recenter, clip, or substitute original measurements. Accurate dataset context is required to detect already transformed inputs. See [original R correction adapters](#1471-original-r-correction-adapters) for the method-specific input and control requirements.
+
+#### 1.3.5.2 Default numeric-domain policies and AUTO evaluation
+
+No additional run-time choice is required. Correction delivers positive raw intensities or missing values; imputation delivers positive reconstructed intensities while preserving observed entries; normalization retains legitimate signed log2 or VSN generalized-log coordinates. These stage-specific policies share inspection utilities but do not apply one positivity rule to every matrix.
+
+Correction preserves feature-level route assignments and adds cell provenance in `feature_metadata["correction_missing_samples"]`, a tuple of sample IDs per feature. Existing provenance is merged. Imputation sends still-missing correction-induced cells through R-route reconstruction even on an S-route feature, leaves original missing cells on S-route features under the configured special-handling strategy, and clears consumed provenance. Normalization uses the completed values, not route labels.
+
+`context.extra_attrs["value_scale"]` records `raw_positive`, `log2`, `log2p1`, `vsn_glog` or `centered_scaled` without changing the artifact schema. QA uses a named positive RSD view: raw intensities, `exp2` for log2, `exp2 - 1` for log2p1, or an `exp2` diagnostic view for VSN. The VSN view is **not an inverse to original intensities**; centered/scaled input has no intensity RSD. Per-feature stable rescaling avoids overflow without changing CV; no epsilon clipping is used.
+
+AUTO evaluates production-policy outputs, independently of Python–R kernel comparison. Shared input support and planned metric weights prevent a candidate from gaining weight by losing observations or diagnostics. Failed candidates retain their reasons and domain diagnostics. Nonconverged native VSN is excluded from AUTO; an explicitly requested finite VSN result remains available with degraded status. Missing dependencies, invalid shapes and model-fitting failures remain errors rather than automatic backend substitutions.
 
 ## 1.4 Processing API
 
@@ -294,7 +382,7 @@ feature_mv_result = FeatureMissingValueFilter(
 mv_filtered_dataset = feature_mv_result.data
 ```
 
-Features are assessed using global, QC, and available biological-group missingness, then retained/routed as MAR or MNAR or excluded. Retained labels travel in `result.data.feature_metadata["missingness_type"]`; the full retention history is in `result.audit.feature_tracking`.
+Features are assessed using global, QC, and available biological-group missingness, then assigned to R-route or S-route or excluded. R-route retains features meeting the baseline missingness limits. S-route retains features through a group-pattern rule or low-intensity QC rescue. Canonical labels travel in `result.data.feature_metadata["imputation_route"]` as `R-route` or `S-route`; the parallel historical `missingness_type` column retains `MAR`/`MNAR` solely for compatibility. The full retention history is in `result.audit.feature_tracking`, whose `Stage1_Status` records current route labels and any group/QC rescue detail.
 
 Running without `sample_result` is supported: metrics record `sample_filter_status="not_run"` and the dashboard omits the sample-filter panel. Without biological groups, group-specific routes/panels are unavailable. With no missing values, feature MV is marked skipped. These conditions can coexist; inspect recorded execution status and available diagnostics rather than assuming every panel exists.
 
@@ -309,7 +397,7 @@ Constructor: `FeatureQualityFilter(data, pipeline_params=None, *, missingness_me
 | `filter_features_by_quality(*, missingness_metadata=None, idx_mar=None, idx_mnar=None, missingness_tracking=None)` | `StageResult[MetaboDataset]` |
 | `run_filter_features_by_quality(output_dir=None, *, missingness_metadata=None, idx_mar=None, idx_mnar=None, **runtime_overrides)` | Same result, with optional CSV exports and quality dashboard |
 
-Allowed run-time overrides are `qc_rsd_tol` and `blank_qc_ratio_tol`. Supply `missingness_metadata` as a Series or DataFrame containing recognized MAR/MNAR labels; supported columns include `missingness_type` and `Stage1_Status`. Prefer the complete feature MV audit table, which retains previously excluded features as well as retained labels.
+Allowed run-time overrides are `qc_rsd_tol` and `blank_qc_ratio_tol`. Supply `missingness_metadata` as a Series or DataFrame containing recognized R-route/S-route labels; supported columns include `imputation_route`, `Stage1_Status`, and the legacy `missingness_type` column. Historical MAR/MNAR values remain accepted as route aliases. Prefer the complete feature MV audit table, which retains previously excluded features as well as retained labels.
 
 ```python
 from pimqc import FeatureQualityFilter
@@ -323,7 +411,7 @@ quality_result = FeatureQualityFilter(
 quality_filtered_dataset = quality_result.data
 ```
 
-The normal route checks Blank/QC ratio and QC RSD, with MNAR features exempt from the MAR RSD screen. Without recognized missingness labels, the stage runs in `quality_only` mode using the Blank/QC and QC-RSD checks; it does not silently rerun missingness classification. Explicit `idx_mar`/`idx_mnar` provide a lower-level routing alternative but do not reconstruct the complete retention history.
+Both routes undergo the Blank/QC check when blanks are available; the QC-RSD screen applies only to R-route features, with S-route features exempt. Without recognized route labels, the stage runs in `quality_only` mode using the Blank/QC and QC-RSD checks for all eligible features; it does not silently rerun feature routing. Explicit `idx_mar`/`idx_mnar` are retained lower-level API names for R-route/S-route indices but do not reconstruct the complete retention history. Audit tables additionally expose the descriptive aliases `idx_r_route` and `idx_s_route`.
 
 `missingness_tracking` is a compute-method argument, not a supported keyword for `run_filter_features_by_quality()`. For a run lifecycle, pass full tracking through `missingness_metadata` instead.
 
@@ -343,7 +431,7 @@ For the full scientific order, call `run_missingness()`, run correction on `.fea
 
 ### 1.4.7 `SignalCorrector`
 
-`SignalCorrector(data, pipeline_params=None, ...)` accepts every `SignalCorrector` field listed in [1.3.3](#133-accepted-fields) as an explicit optional constructor argument, plus `global_seed`. These are named parameters, not an arbitrary options dictionary; all default to `None` at the override boundary.
+`SignalCorrector(data, pipeline_params=None, ...)` accepts every `SignalCorrector` field listed in [1.3.3](#133-accepted-fields) as an explicit optional constructor argument, plus `global_seed`. These are named parameters, not an arbitrary options dictionary; all default to `None` at the override boundary. `implementation` defaults to `"python"`.
 
 `run_signal_correction(output_dir=None, **runtime_overrides) -> StageResult[dict[str, MetaboDataset]]` returns an ordered mapping of the selected method's correction stages. It does not return every Auto candidate's intensity matrix. Algorithm/seed settings can also be overridden at run time.
 
@@ -361,13 +449,86 @@ corrected_dataset = list(corrected_stages.values())[-1]
 
 QC-based correction can produce `Intra-batch corrected` and, when applicable, `Inter-batch corrected` datasets. Global-method outputs use labels such as `SERRF`, `RUV-III`, or `WaveICA 2.0`. Select the last output for downstream quality filtering; assess each output separately when comparing correction stages.
 
-Auto compares its registered candidate set, including standard/robust QC-RLSC, QC-SVR, SERRF, RUV-III, and WaveICA 2.0. Not every explicitly supported method is necessarily an Auto candidate. The audit records requested/selected methods, candidate evidence, and selected prediction. These remain available for plotting without rerunning fitting or cross-validation.
+With `base_est="robust QC-RLSC"` or `base_est="QC-RLSC", rlsc_robust=True`, the revised robust method follows MetaNorm rLOESS: positive raw intensities are logged with `log2`, quadratic symmetric LOESS is fitted within each batch, and residuals are restored to the reference log-mean before `exp2`. It is no longer the earlier fixed-span, raw-intensity robust ratio correction. Standard QC-RLSC (`rlsc_robust=False`) retains its existing algorithm and parameters. The robust method instead uses `rloess_span_selection="gcv"`, `rloess_span=0.75` for explicit fixed-span fits, and `rloess_iterations=4` (total fits, including the initial fit, as in R). These replace the former public `rlsc_robust_iterations` setting; existing configurations must be migrated rather than silently interpreted as the new algorithm. Its Python backend uses the compiled scikit-misc LOESS kernel without requiring R; `implementation="r"` selects the original R LOESS fitting kernel with the same declared fitting rules.
 
-AUTO records inapplicable or failed candidates in `audit.metrics["selection"]["failed_candidates"]` and continues with viable candidates; if all candidates fail, execution raises an error. A fixed-method failure is propagated. The selected `validation` passport reports OOF availability, requested/effective folds, QC-value coverage, and whether selection used OOF or full-model evidence. Unavailable OOF is never replaced by training predictions and labeled as cross-validation. Global-model QC RSD remains descriptive, not independent validation. Reusing an AUTO processor retains the AUTO request.
+The robust Python/R paths use the same finite-sample support checks and refit span selection and the model using training QCs inside each validation fold. Held-out QC responses do not determine the restoring mean. Neither backend extrapolates outside the training-QC injection range; unsupported cells and failed fits remain missing and contribute to coverage diagnostics. The production adapter excludes Blank samples from fitting/reference statistics and keeps their measurements unchanged. These missingness, support, and held-out-validation rules must be distinguished from an untouched full-input `metanormWorker` call. No full-fit predictions are substituted for unavailable OOF predictions.
+
+Robust reweighting follows the original six-MAD bisquare rule, with weighted local-design checks before each fit. This explicit loop prevents singular sparse-QC fits from entering the unsafe native symmetric-fit path; the R adapter applies the same support rules. The fitting kernels and adapter-level safeguards are recorded separately from the original MetaNorm reference. Insufficient support is an unavailable fit, not a request to change polynomial degree, extrapolate, substitute raw measurements, or switch language backends.
+
+Native robust LOESS runs in one isolated worker process; `n_jobs` does not make these fits multithreaded. This contains compiled-kernel failures without terminating the notebook kernel. A native runtime failure disposes of the worker and fails the candidate, never retries the same method in R, and never substitutes raw data. The R backend remains on the main Python thread. Shared weighted-design checks require at least five span neighbours; continuous GCV is restricted to spans at most `0.95`, so five QCs alone cannot support its default search. Even larger QC counts do not guarantee estimability after robust reweighting or fold splitting. Consult the fit diagnostics and held-out coverage, not only the nominal sample count.
+
+Native SERRF fits per batch, intersects QC and biological-sample correlation rankings, standardizes predictors within each role, and performs role-specific cross-batch alignment. QC validation refits predictor selection, scaling and forests inside each fold; biological-cohort statistics remain transductive and are not a prediction model for a new cohort. The low-level `SERRFCorrector.fit_transform` no longer accepts a precomputed pooled `corr_mat`: that matrix cannot represent batch/fold-specific fitting. Native diagnostics distinguish full and fold fits, unavailable predictors, unsupported fits, invalid denominators and OOF coverage. Nonpositive or nonfinite prediction denominators produce missing full-output values; invalid held-out QC predictions remain unavailable rather than substituting training or original values. The same final correction-domain policy applies to both backends, while any repairs internal to the original R function remain separately documented.
+
+Auto compares its registered candidate set, including standard/robust QC-RLSC, QC-SVR, SERRF, RUV-III, and WaveICA 2.0. Its score has three fixed-support components: technical precision (the equal-weight combination of median and feature-wise QC-RSD improvement), biological-variation preservation (canonical D-ratio improvement), and sample-structure preservation. When all three are supported by the input, their weights are 0.35, 0.35, and 0.30. An input-unsupported component is omitted and the remaining weights are renormalized identically for all candidates. A candidate-specific unavailable metric instead contributes zero without shrinking the denominator. The two technical-precision terms follow the same fixed-input-support rule.
+
+Candidates use held-out QC (OOF) evidence where available; jointly fitted WaveICA 2.0 and RUV-III use descriptive full-model evidence. Robust QC-RLSC and R SERRF require usable OOF evidence for selection and cannot substitute full-fit metrics. Other candidates retain a descriptive full-model fallback when OOF evidence is absent. Read each candidate's `validation` passport, especially `evaluation_basis`, rather than assuming that every score is held out. Not every explicitly supported method is an Auto candidate. Requested/selected methods, candidate evidence, and selected predictions remain available for plotting without rerunning fitting or cross-validation.
+
+The candidate comparison dashboard places QC-RSD and D-ratio distributions side by side. Each candidate has one box per metric, using its final correction stage and the recorded evaluation basis; intermediate stages and duplicate full-fit/OOF boxes are omitted. Short method labels retain `Inter-batch` where applicable, and the shared legend below both panels distinguishes OOF from full-model evidence. Ineligible candidates or missing evaluation distributions remain N/A rather than being replaced with descriptive full-fit results. OOF denotes held-out QC evaluation, not independent validation of every study sample. These distributions accompany, but are not identical to, the composite selection scores. Detailed selected-method dashboards retain their existing stage-by-stage diagnostics.
+
+Set `implementation="r"` together with `base_est="Metanorm-rLOESS"` to call the exported `metanorm::metanormWorker` through `rpy2`. This is a distinct method, not an interchangeable R alias for QC-RLSC; it is not included in `AUTO`. The wrapper calls the original worker sequentially because the upstream high-level `metanorm()` starts a PSOCK cluster even with one CPU. It uses positive unlogged intensities, `log2 → rLOESS → exp2`, QC-only fitting, per-batch GCV, and `keepScale=TRUE`, without adding pseudocounts or extra batch alignment. The original full-input log-mean centering includes Blank columns when present. At least four distinct finite QC injection orders per feature/batch are required, and every observed target must fall within that feature's QC order range; the original LOESS cannot extrapolate. Invalid inputs or fits raise an error. OOF is explicitly unavailable, full-fit QC diagnostics are descriptive, and no AUTO score is fabricated. Other methods' parameters such as `loess_span`, `rlsc_span_grid`, and `cv_folds` do not tune this R worker.
+
+AUTO records candidate execution errors in `audit.metrics["selection"]["failed_candidates"]` and continues evaluating alternatives. Computed candidates lacking required selection evidence remain in `audit.metrics["selection"]["candidate_results"]` with `status="ineligible"` and validation details. Selection raises an error if every candidate fails or no candidate is eligible; an explicit fixed-method execution error is propagated. The selected `validation` passport reports OOF availability, requested/effective folds, QC-value coverage, and the evaluation basis. A descriptive full-model fallback is not labeled as cross-validation. Global-model QC RSD is not independent validation. Reusing an AUTO processor retains the AUTO request.
+
+#### 1.4.7.1 Original R correction adapters
+
+R SERRF executes the verified author function with an audited NA-safe subscript fix (`runtime_fixes`) and per-forest seed adaptation (`runtime_seed_adaptation`); the local source and checksum are unchanged. The indexing fix prevents zero/negative repair selectors containing NA from causing an assignment error, while retaining the original replacement distributions. Features with no observed value in any fitting batch cannot establish the required batch minimum: `unsupported_feature_ids` and `all_missing_features_by_fit_batch` record their exclusion, and their non-Blank output remains unavailable across batches. The same rule is recomputed using training QCs and real biological samples inside each OOF fold, never held-out QC values. Supported complete inputs retain the original numerical path apart from the explicit seed adaptation. These explicit runtime adaptations qualify references below to the original function and its stochastic repair policy.
+
+Select one of the following explicit `base_est` values, or `base_est="Auto"`, together with `implementation="r"`. AUTO replaces the corresponding candidate kernels with R while retaining the original candidate set; selecting R is not a claim of cross-language numerical equivalence. All three adapters exclude Blank columns from fitting, preserve their values unchanged, and require unlogged, unscaled intensities. WaveICA/RUV-III share a temporary feature-median input adapter with their Python counterparts, since the original kernels require complete matrices. Medians use only observed non-Blank values, in raw space for WaveICA and log space for RUV; the original missing mask is restored after correction. `missing_input_adapter` diagnostics record the scale, counts and reference population. No additional option is needed. Fully missing fitting features and insufficient real RUV replicate-control support are rejected rather than filled with invented references. SERRF accepts NaN and zeros for its unchanged upstream stochastic repair, records input counts and repair ownership, and rejects negative/infinite input. Its adapter restores original non-Blank NA positions in full-fit and OOF outputs before the production correction-domain policy, preserving the later imputation stage's responsibility. Provenance and diagnostics record `output_missing_policy="restore_original_missing_positions"` and `restored_missing_count`, the number of original non-Blank NA cells. Zero inputs are not additionally converted to NA by this restoration. Temporary repairs still influence model fitting and other corrected values; restoring NA does not remove that influence or guarantee support for arbitrary missingness. Upstream failures remain failures; no pipeline reorder occurs.
+
+| Method | Original entry point | Effective settings and input requirements |
+| --- | --- | --- |
+| `WaveICA 2.0` | `WaveICA2.0::WaveICA_2.0` | `waveica_components` maps to `K`, `waveica_cutoff` to `Cutoff`, and R-only `waveica_alpha` to `alpha` (default `0`). Uses `wf="haar"`, the upstream wavelet depth and GAM defaults, and preserves the supplied finite intensity scale. Requires at least 10 non-Blank samples, distinct globally ordered injection values, and `K >= 2`; the original package limits `K` to the smaller matrix dimension. Sorting is restored on output. Native `waveica_levels`, `waveica_spline_knots`, and `waveica_max_iter` do not tune R and non-default values are rejected. |
+| `RUV-III` | `ruv::RUVIII` | Explicit nonempty `ruv_control_features` supplies feature IDs; `ruv_k` supplies `k`. No empirical low-RSD controls are automatically substituted. The adapter applies `log2(x+1)`, calls R on samples × features, then reconstructs with `exp2(x)-1`; invalid reconstructed intensities are recorded and converted to missing at the correction boundary rather than clipped. This is standard RUV-III, not the missing-value variant RUV-III-C. |
+| `SERRF` | Pinned Shiny-SERRF `serrfR`, using `ranger` | `serrf_r_source` points to the separately obtained original `app.R` or its verified extraction. `serrf_corr_features` maps to `num` (at least 2, less than the feature count); the native `serrf_corr_features=0` order-only mode has no original-R equivalent. Passes NaN/zeros to original repairs; negative/infinite input is rejected. Requires at least 3 QCs and 3 biological samples in every batch; constant, fully positive role/batch vectors are rejected. Missing-data fitting can still fail upstream. Native `serrf_n_tree`, `serrf_backend`, and `serrf_batch_size` do not tune this function and non-default values are rejected. |
+
+For RUV-III, the default repeat design assumes all supplied QCs are aliquots of the same pooled material and treats each other non-Blank sample as independent. To use true technical replicates or distinct QC pools, set `ruv_replicate_column` to a sample-metadata column whose shared labels identify the same underlying material. This must not be a biological treatment/group column. Every non-Blank sample needs a label, including unique labels for unreplicated samples. The adapter validates the repeat design, negative controls, and available rank rather than silently reducing `k`. Internal standards can be explicit controls only when their scientific interpretation supports the negative-control assumption.
+
+Example for an already complete raw-intensity dataset (replace the example IDs with scientifically justified controls):
+
+```python
+ruv_result = SignalCorrector(
+    complete_dataset,
+    base_est="RUV-III",
+    implementation="r",
+    ruv_control_features=["IS_1", "IS_2", "IS_3"],
+    ruv_k=2,
+).run_signal_correction()
+
+waveica_result = SignalCorrector(
+    complete_dataset,
+    base_est="WaveICA 2.0",
+    implementation="r",
+    waveica_components=5,
+    waveica_cutoff=0.1,
+    waveica_alpha=0.0,
+).run_signal_correction()
+
+serrf_result = SignalCorrector(
+    complete_dataset,
+    base_est="SERRF",
+    implementation="r",
+    serrf_r_source="/path/to/pinned/Shiny-SERRF/app.R",
+    serrf_corr_features=10,
+).run_signal_correction()
+```
+
+`pimqc.processing.correction.serrf_r.prepare_serrf_source(source_path, output_path) -> pathlib.Path` verifies the pinned author file, extracts only its unchanged `serrfR` function using R syntax parsing, and saves a reusable local function file. The adapter never executes the Shiny application or arbitrary top-level source expressions. At execution, UI callbacks are isolated and the verified function receives recorded NA-indexing and per-forest seed adaptations in memory. The source file/checksum and upstream `ranger` defaults remain unchanged; native Python forest options do not replace them. See the [README](r_backend.md#4-prepare-the-optional-local-serrf-source) for the supported source commit, checksum, dependency installation, and redistribution caveat.
+
+The upstream function calls `set.seed(1)` internally for every forest. The runtime AST adapter verifies that this is the sole seed call and replaces only its constant with `random_state` in both full fit and OOF refits. For example, `random_state=123` gives an effective per-forest seed of 123. Provenance records the outer seed, upstream `original_model_seed=1`, `effective_model_seed`, and `runtime_seed_adaptation`; it identifies source-adapted execution, not an unmodified original function. The surrounding R RNG state is restored after the call. Tree count, predictors, and other algorithm settings are unchanged; later stochastic repairs may follow a different RNG trajectory while retaining the upstream replacement distributions.
+
+R SERRF uses the same NA-safe source adapter for the full fit and an explicit pi-metaboqc held-out-QC validation layer. With `cv_folds` enabled, each fold refits the function using training QCs and the real biological samples only. The wrapper captures the actual ranger models, selected predictors and training-QC scales, predicts excluded QCs, and applies alignment learned solely from training output. Held-out QCs are never reclassified as biological samples. Biological-cohort statistics remain transductive, so this validates within-cohort QC repeatability, not prediction on a new cohort. Failed folds or invalid denominators remain missing and are never replaced by full-fit values. The internal `SERRFRCorrector` adapter defaults to five folds and permits `cv_folds=0` for a full-fit-only reference call, which cannot supply OOF evidence for AUTO. The public `SignalCorrector` constructor, run method and TOML/JSON configuration require at least two folds; their built-in default is five, while the bundled demo explicitly requests three.
+
+Python and R SERRF use the same deterministic within-batch fold assignment. Diagnostics record fold IDs, effective folds, coverage, failures, validation origin, and R full-fit/OOF elapsed times. This is not an OOF API provided by the original author. RUV-III and WaveICA retain full-fit QC-RSD evaluation in AUTO, as their existing native counterparts do; this remains descriptive, not independent held-out validation. Metanorm-rLOESS remains outside AUTO.
+
+The audit records actual R functions, runtime/package versions, transformations, Blank policy, effective options, repeat/negative-control design where applicable, and source identity for the SERRF extraction. Source files and R packages are not needed to load the saved results or render their payloads. Use separate output directories when comparing Python and R runs: correction retains method-based CSV/SVG names.
+
+Original WaveICA may return negative intensities. Low-level adapters retain signed/nonfinite outputs as diagnostic evidence; the production correction stage converts invalid raw intensities to missing before metrics, selection, plotting payloads and delivery. Features or cells lost by a candidate do not disappear from its planned AUTO support. Full and OOF coverage and affected coordinates are recorded in the audit.
+
+For native `RUV-III`, `ruv_control_features` can also explicitly select the controls without automatic augmentation. If omitted, the existing native heuristic combines declared standards/reference features with low-RSD biological features; these are operational controls, not proven biological negative controls. The native QC/control-residual SVD and recentering remain a distinct estimator from the original R call; the implicit intensity floor has been removed. `audit.metrics["selection"]["native_diagnostics"]` records effective controls/rank, `output_negative_count`, `output_zero_count`, `output_nonfinite_count`, and `output_policy`. A custom `ruv_replicate_column` remains specific to the original-R backend.
 
 ### 1.4.8 `MissingValueImputer`
 
-Constructor: `MissingValueImputer(data, pipeline_params=None, mar_method=None, mnar_method=None, mnar_fraction=None, knn_neighbors=None, lls_neighbors=None, bpca_components=None, bpca_max_iter=None, bpca_tol=None, sim_mask_ratio=None, global_seed=None)`.
+Constructor: `MissingValueImputer(data, pipeline_params=None, mar_method=None, mnar_method=None, mnar_fraction=None, knn_neighbors=None, lls_neighbors=None, bpca_components=None, bpca_max_iter=None, bpca_tol=None, sim_mask_ratio=None, global_seed=None, implementation=None, *, r_route_method=None, s_route_method=None)`.
 
 `run_imputation(output_dir=None, **runtime_overrides) -> StageResult[MetaboDataset]` accepts the same algorithm/seed settings as run-time overrides.
 
@@ -377,24 +538,30 @@ from pimqc import MissingValueImputer
 imputation_result = MissingValueImputer(
     quality_filtered_dataset,
     pipeline_params=params,
-    mar_method="KNN",
+    r_route_method="KNN",
 ).run_imputation()
 imputed_dataset = imputation_result.data
 ```
 
-The imputer reads `feature_metadata["missingness_type"]`; without this column it uses the MAR route. MNAR uses QRILC or the configured row/column/global LOD-fraction strategy. MAR uses the requested method or Auto selection. Only QC/actual target columns are filled; Blank columns are preserved.
+The imputer reads `feature_metadata["imputation_route"]`, falling back to historical `missingness_type` when needed. Without either column it uses R-route. S-route uses QRILC or the configured row/column/global small-value fraction strategy; the fraction is not a measured detection limit. R-route uses the requested reconstruction method or automatic selection. Only QC/actual target columns are filled; Blank columns are preserved.
 
-Mechanism labels are stripped and normalized to uppercase; unknown/null labels raise an error. MNAR-only execution records MAR selection as `Not required`, with no candidate benchmark or MAR dashboard. QC and actual samples are imputed locally first; unresolved values may use pooled evidence. `audit.metrics["isolation_fallbacks"]` records cross-role fills in the final transformation, excluding benchmark simulations. A matrix still containing missing target values is not returned as completed.
+Route labels are stripped and matched case-insensitively, then normalized to `R-route` or `S-route`; historical `MAR` and `MNAR` are accepted only as aliases. Unknown/null labels raise an error, as do conflicting canonical and legacy assignments. These are operational feature categories, not inferred missingness mechanisms. S-route-only execution records reconstruction selection as `Not required` unless correction-induced gaps still require R-route processing. R-route imputation first uses QC and actual-sample evidence separately; unresolved values may use pooled evidence. `audit.metrics["isolation_fallbacks"]` records cross-role fills in the final transformation, excluding benchmark simulations. A matrix still containing missing target values is not returned as completed.
 
-Auto reconstruction metrics come from simulated masking; they are not identical to final-data distribution/structure metrics. `audit.candidate_results` stores method-specific metrics and true/predicted benchmark values. Keep these with the audit rather than recomputing them in a plotter.
+Automatic reconstruction metrics come from intensity-aware masked-value challenges, including low-intensity-weighted masking based on the fitted intensity distribution. This tests reconstruction under a demanding abundance pattern; it does not simulate or identify MAR/MNAR statistical mechanisms. The metrics are not identical to final-data distribution/structure metrics. `audit.candidate_results` stores method-specific metrics and true/predicted benchmark values. Keep these with the audit rather than recomputing them in a plotter.
 
-If no target values require imputation, `audit.skipped` is true, `selected_method` is `"Not required"`, `is_auto` is false, and `plot_payload` is `None`. With exports enabled the unchanged result is written as `Imputed_Data_NotRequired.csv`, without a dashboard. A run with no MAR features also omits MAR reconstruction dashboards even if MNAR imputation was performed.
+QRILC participates in the reconstruction benchmark, but `r_route_method="QRILC"` is not an accepted explicit setting in the current public schema. Use `r_route_method="Auto"` for candidate selection and `s_route_method="QRILC"` for the separate special-handling route; do not infer valid configuration values from candidate labels alone.
+
+Native QRILC uses the actual one-dimensional sampling SD of the inspected original implementation (`fitted_slope * tune_sigma`), not its square root. Its low-level kernel retains signed log-scale draws and warns when a small or constant column uses the native constant-fill extension. Both production backends use the same post-kernel repair: only newly imputed finite nonpositive predictions are replaced by half the smallest positive raw training observation from the same feature and sample role, falling back to the same role across features. Nonfinite predictions and inverse overflow still fail. Masked truth, previously imputed cells and other roles never determine the replacement; observed values and legitimate small positive predictions are unchanged. Stochastic imputation should be evaluated on held-out entries and within-column distributions relative to repeated R runs, not by full-matrix correlation dominated by unchanged observations.
+
+Set `implementation="r"` with `r_route_method="BPCA"` or `"Auto"`, and `s_route_method="QRILC"`. The stage calls `pcaMethods::pca`/`completeObs` and `imputeLCMD::impute.QRILC` for the corresponding evaluation and final-filling operations. Automatic selection reuses the same masked-value benchmark and six reconstruction candidates, replacing BPCA/QRILC with R while retaining Python for the other methods. BPCA receives `bpca_components`, `bpca_max_iter`, and `bpca_tol`, with upstream centering enabled and scaling disabled; QRILC uses `tune.sigma=1`. The workflow supplies `log2(x + 1)` and reconstructs with `exp2(x) - 1`; already logged/scaled input is rejected. Finite nonpositive new predictions use the common training-only half-minimum repair, whereas nonfinite predictions or inverse overflow remain failures. R-route models are fitted separately for QC and biological samples; S-route QRILC receives all target sample roles. Completely missing features or samples within an R input slice are rejected rather than replaced with Python heuristics. Unsupported explicit route-method settings are rejected. Each actual R invocation is recorded in `audit.metrics["selection"]["implementation_provenance"]`, with phase, sample roles, dimensions, and transformations; candidate rows separately retain their evaluation/final-fit provenance. The `R` in R-route describes reconstruction and is independent of `implementation="r"`.
+
+If no target values require imputation, `audit.skipped` is true, `selected_method` is `"Not required"`, `is_auto` is false, and `plot_payload` is `None`. With exports enabled the unchanged result is written as `Imputed_Data_NotRequired.csv`, without a dashboard. A run with no R-route features and no correction-induced reconstruction gaps also omits reconstruction dashboards even if S-route imputation was performed.
 
 ### 1.4.9 `DataNormalizer`
 
-Constructor: `DataNormalizer(data, pipeline_params=None, norm_method=None, global_seed=None, n_jobs=None)`.
+Constructor: `DataNormalizer(data, pipeline_params=None, norm_method=None, global_seed=None, n_jobs=None, implementation=None)`.
 
-`run_normalization(output_dir=None, **runtime_overrides) -> StageResult[MetaboDataset]` accepts `norm_method`, `global_seed`, and `n_jobs` overrides.
+`run_normalization(output_dir=None, **runtime_overrides) -> StageResult[MetaboDataset]` accepts `norm_method`, `global_seed`, `n_jobs`, and `implementation` overrides.
 
 ```python
 from pimqc import DataNormalizer
@@ -413,6 +580,12 @@ assert selection["is_auto"] is False
 TIC, Median, PQN, and MDFC apply robust Log2 after scale normalization; Quantile operates on a robust-logged view; `ROBUST_LOG_ONLY` applies robust Log2 alone. VSN uses its intrinsic generalized-log transform, not an additional external robust Log2 step. Blank samples are excluded from normalized output, and dataset context records transformation state.
 
 `audit.selection` contains requested/selected methods, selected label, Auto flag, and available selection evidence. Candidate results are present for Auto comparison, not fabricated for a fixed method. `audit.output_suffix` controls filenames such as `Normalized_Data_PQN_Log2.csv` and `Normalization_Dashboard_PQN_Log2.svg`; Auto candidate rows may also be exported to `Normalization_Auto_Summary.csv`.
+
+Native VSN fits sample-specific offsets and positive slopes using a profile likelihood and intensity-stratified least-trimmed-squares refinement. `audit.metrics["vsn_parameters"]` retains sample IDs/coefficients, actual glog output offset, fit feature count, convergence and per-round optimizer diagnostics. `vsn_scale` summarizes the geometric mean of sample slopes; `vsn_shift` is the additive glog output offset, not the previous empirical alignment shift. Do not interpret them as a shared-scale calibration. Nonconverged finite fits issue a warning and retain their actual status.
+
+Set `implementation="r"` with `norm_method="VSN"` or `"Auto"` to call `vsn::vsn2` and `vsn::predict`. AUTO retains all existing strategies and scoring, replacing only VSN with R. The R path requires unlogged, unscaled input; neither backend adds an empirical abundance-alignment shift or a second log transform. Blank columns are excluded before the R fit. R model parameters are not misreported as native Python `vsn_scale`/`vsn_shift`; selected execution provenance is retained in `audit.selection["implementation_provenance"]`, with other executed R candidates recorded in `candidate_results`. If R VSN wins, output filenames use `VSN_R`, for example `Normalization_Dashboard_VSN_R.svg`; a Python-only winner retains its native suffix.
+
+Upstream VSN fitting constraints are retained: the verified vsn 3.78.1 matrix method defaults to `minDataPointsPerStratum=42L` and may reject small or unsuitable matrices. The R adapter does not silently lower that bound or change model defaults to force a fit. Native VSN retains its documented smaller-input extension (at least three observed features per sample with nonconstant values); small-input acceptance is not a claim of matching the original package's input policy.
 
 Request configuration is separate from completed-output metadata. Reading `normalization_metrics` before execution does not freeze pending values, and repeated AUTO runs remain AUTO. The payload includes computed RLE summaries and paired Wilcoxon p-values as well as variance/structure diagnostics; rendering does not repeat these calculations.
 
@@ -434,7 +607,7 @@ The generic parameter describes `data`, not the audit type. Building, filtering,
 
 ### 1.5.2 Shared and stage-specific audit fields
 
-All audits provide `metrics`, `audit_type`, `schema_version`, and `contract_identity()`. The latter returns `{"audit_type": ..., "schema_version": ...}`. Audit schema version `"1.0"` is independent of package version `1.4.0`.
+All audits provide `metrics`, `audit_type`, `schema_version`, and `contract_identity()`. The latter returns `{"audit_type": ..., "schema_version": ...}`. Audit schema version `"1.0"` is independent of package version `1.5.0`.
 
 There is no universal `status`, `skipped`, `parameters`, or `execution_time` attribute on `AuditPayload`. Status, thresholds, parameters, and decisions are represented by the concrete audit's fields and metric structure.
 
@@ -451,6 +624,8 @@ There is no universal `status`, `skipped`, `parameters`, or `execution_time` att
 
 Most classes expose `metric_values` through `metrics`; the sample audit constructs report-facing metrics from tracking/status fields. Preserve typed audits rather than flattening them into generic dictionaries: report metrics alone cannot recreate every figure.
 
+`ImputationAuditPayload.r_route_feature_count` is the descriptive accessor for the serialized compatibility field `mar_feature_count`. Imputation metrics expose `r_route_count`/`s_route_count`, `s_route_method`/`s_route_fraction`, and route definitions while retaining the older keys so saved audits remain readable. Historical plotting payload names such as `mnar_group_mv_tolerance` likewise retain their storage contract; current plots and reports display R-route/S-route.
+
 ### 1.5.3 Missing, skipped, and degraded results
 
 | Situation | Consumer behavior |
@@ -458,7 +633,7 @@ Most classes expose `metric_values` through `metrics`; the sample audit construc
 | Sample filter not executed | Retain `not_run` provenance; do not infer sample decisions from the feature-filtered matrix |
 | Feature MV has no missing values | Respect skipped status; do not reserve an empty classification dashboard |
 | Biological groups unavailable | Omit group-dependent routing/diagnostics; retain available QC/global evidence |
-| Feature quality has no recognized MV tracking | Respect `quality_only`; do not reconstruct MAR/MNAR decisions |
+| Feature quality has no recognized MV tracking | Respect `quality_only`; do not infer R-route/S-route assignments |
 | Imputation has no missing target values | Preserve skipped audit and unchanged data; no empty dashboard |
 | QA skipped | Do not pass a missing payload to `AssessmentPlotter`; `render_assessment()` handles skipped audits directly |
 | Auto candidate evidence absent | Do not invent candidate scores or assume a fixed-method run was Auto |
@@ -545,6 +720,17 @@ if dashboard is not None:
 ```
 
 `BasePlotter.save_and_show_pw()` provides vector export and notebook display for patchwork objects. `show_plot=False` suppresses display, not export. Display width is layout-dependent; compact 2 × 2 and single-brick layouts are not displayed at the same width as larger dashboards.
+
+The six manuscript (`*_article_dashboard`) builders use the current 1.5.0
+payloads and a shared **17.7 cm total export width**, including labels and
+legends, when saved with `save_and_show_pw()`. Existing font families and
+point sizes are retained; only panel geometry is adjusted. Article notebook
+previews default to 60% width. Correction includes canonical D-ratio and
+sample-structure diagnostics; normalization includes sample preservation.
+These optional compact-layout APIs reuse computed audits rather than fitting
+models again. They are not invoked by the public tutorial. Manuscript-specific
+panel assembly, cropping and source figure exports are maintained privately
+and are not required for package installation or scientific reproduction.
 
 ### 1.7.2 Rendering one assessment audit
 
@@ -679,7 +865,7 @@ PDF/HTML export uses explicitly provisioned tools such as Pandoc, WeasyPrint, Xe
 
 ## 1.10 Integration boundaries
 
-1.4.0 is a breaking native-API redesign. New workflows should exchange `MetaboDataset`, `StageResult`, typed audits, and detached plot payloads. Do not recreate the removed `MetaboInt` pandas-subclass contract, attach cross-stage state implicitly to `DataFrame.attrs`, or assume former result dictionaries are accepted.
+The 1.5.0 API retains the composition-based redesign introduced in 1.4.0. New workflows should exchange `MetaboDataset`, `StageResult`, typed audits, and detached plot payloads. Do not recreate the removed `MetaboInt` pandas-subclass contract, attach cross-stage state implicitly to `DataFrame.attrs`, or assume former result dictionaries are accepted.
 
 Some current implementation helpers and the exported `FeatureFilter` facade still exist in source. They are not evidence that pre-1.4 workflows remain compatible; the independent filters and named run entry points above are the recommended application interfaces. Private algorithm workers, caches, and runner internals are not an integration contract.
 

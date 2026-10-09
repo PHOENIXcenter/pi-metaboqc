@@ -1,248 +1,42 @@
-"""Mechanism-aware missing-value imputation and candidate selection.
+"""Route-aware missing-value imputation and candidate selection.
 
-MissingValueImputer applies MNAR methods such as QRILC or censored estimates
-and MAR methods including Median, MinProb, KNN, LLS, BPCA, and AUTO selection.
+MissingValueImputer applies special handling (S-route) such as QRILC or
+censored estimates and reconstruction (R-route) using Median, MinProb, KNN,
+LLS, BPCA, or metric-guided candidate selection. Route labels are operational,
+not inferred statistical missingness mechanisms.
 It evaluates masked reconstruction, distribution fidelity, and sample-structure
 preservation, then records the selected strategy and imputed stage metrics.
 """
 
-import math
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import pandas as pd
-import scipy.stats as stats
 from loguru import logger
 from sklearn.impute import KNNImputer
 
 from ...config import resolve_stage_config
+from ...config.schema import normalize_imputation_route_options
 from ...constants import DEFAULT_RANDOM_SEED
 from ...core import DatasetProcessor, MetaboDataset
+from ...core.routes import (
+    R_ROUTE,
+    S_ROUTE,
+    ROUTE_DEFINITIONS,
+    routes_from_metadata,
+)
 from ...plotting.payloads import ImputationPlotPayload, snapshot_dataset
 from ...runtime import log_execution_time
 from ...statistics import metrics as su
 from ...statistics import sample_structure as structure_stats
 from ...statistics import selection as selection_utils
 from ..audit import ImputationAuditPayload
+from ..numeric_domain import repair_imputed_log_values
 from ..stage import StageResult
+from .bpca import BayesianPCAImputer
 from .methods import IMPUTATION_METHODS
+from .qrilc import impute_qrilc
 from .runner import ImputationStageRunner
-
-
-class BayesianPCAImputer:
-    """Bayesian PCA missing-value estimator adapted from pcaMethods BPCA.
-
-    The implementation follows the structure of the pcaMethods R port of
-    Oba's BPCA algorithm: initialize principal axes with SVD, then iteratively
-    update scores, loadings, residual precision (tau), and loading precision
-    terms (alpha). Input rows are observations and columns are variables.
-    """
-
-    def __init__(
-        self,
-        n_components: int = 2,
-        max_iter: int = 100,
-        threshold: float = 1e-4,
-    ) -> None:
-        """Initialize BPCA model settings."""
-        self.n_components = max(1, int(n_components))
-        self.max_iter = max(1, int(max_iter))
-        self.threshold = float(threshold)
-
-    @staticmethod
-    def _safe_inverse(mat: np.ndarray) -> np.ndarray:
-        """Invert a small matrix with pseudo-inverse fallback."""
-        try:
-            return np.linalg.inv(mat)
-        except np.linalg.LinAlgError:
-            return np.linalg.pinv(mat)
-
-    def _initialize_model(self, y: np.ndarray) -> dict[str, Any]:
-        """Initialize the BPCA working state from an incomplete matrix."""
-        rows, cols = y.shape
-        nans = np.isnan(y)
-        yest = np.where(nans, 0.0, y)
-
-        max_components = max(1, min(self.n_components, rows, cols))
-        if rows > 1 and cols > 1:
-            cov_y = np.cov(yest, rowvar=False)
-            cov_y = np.atleast_2d(cov_y)
-        else:
-            cov_y = np.eye(cols) * np.nanvar(yest)
-
-        cov_y = np.nan_to_num(cov_y, nan=0.0, posinf=0.0, neginf=0.0)
-        u, s, _ = np.linalg.svd(cov_y, full_matrices=False)
-        s = np.clip(s[:max_components], a_min=0.0, a_max=None)
-
-        mean = np.nanmean(y, axis=0)
-        if np.isnan(mean).any():
-            global_mean = np.nanmean(y)
-            if np.isnan(global_mean):
-                global_mean = 0.0
-            mean = np.where(np.isnan(mean), global_mean, mean)
-
-        pa = u[:, :max_components] @ np.diag(np.sqrt(s))
-        residual_var = float(np.trace(cov_y) - np.sum(s))
-        tau = 1.0 / residual_var if residual_var > 1e-10 else 1e10
-        tau = float(np.clip(tau, 1e-10, 1e10))
-
-        galpha0 = 1e-10
-        balpha0 = 1.0
-        alpha_denom = tau * np.diag(pa.T @ pa) + 2 * galpha0 / balpha0
-        alpha = (2 * galpha0 + cols) / np.maximum(alpha_denom, 1e-12)
-
-        return {
-            "rows": rows,
-            "cols": cols,
-            "comps": max_components,
-            "yest": yest.copy(),
-            "row_miss": np.where(nans.sum(axis=1) != 0)[0],
-            "row_nomiss": np.where(nans.sum(axis=1) == 0)[0],
-            "nans": nans,
-            "mean": mean,
-            "pa": pa,
-            "tau": tau,
-            "scores": np.zeros((rows, max_components), dtype=float),
-            "galpha0": galpha0,
-            "balpha0": balpha0,
-            "alpha": alpha,
-            "gmu0": 0.001,
-            "btau0": 1.0,
-            "gtau0": 1e-10,
-            "sigw": np.eye(max_components),
-        }
-
-    def _do_step(self, model: dict[str, Any], y: np.ndarray) -> dict[str, Any]:
-        """Perform one BPCA EM/Bayesian update step."""
-        rows = model["rows"]
-        cols = model["cols"]
-        comps = model["comps"]
-        pa = model["pa"]
-        tau = model["tau"]
-        sigw = model["sigw"]
-        mean = model["mean"]
-        nans = model["nans"]
-
-        scores = np.zeros((rows, comps), dtype=float)
-        t_mat = np.zeros((cols, comps), dtype=float)
-        tr_s = 0.0
-
-        rx = np.eye(comps) + tau * (pa.T @ pa) + sigw
-        rx_inv = self._safe_inverse(rx)
-
-        idx_nomiss = model["row_nomiss"]
-        if len(idx_nomiss) > 0:
-            dy = y[idx_nomiss, :] - mean
-            x = tau * rx_inv @ pa.T @ dy.T
-            t_mat += dy.T @ x.T
-            tr_s += float(np.sum(dy * dy))
-            scores[idx_nomiss, :] = x.T
-
-        for i in model["row_miss"]:
-            missing = nans[i, :]
-            observed = ~missing
-
-            dyo = y[i, observed] - mean[observed]
-            wm = pa[missing, :]
-            wo = pa[observed, :]
-
-            rx_obs = rx - tau * (wm.T @ wm)
-            rx_obs_inv = self._safe_inverse(rx_obs)
-
-            ex = tau * wo.T @ dyo.reshape(-1, 1)
-            x = rx_obs_inv @ ex
-            dym = (wm @ x).ravel()
-
-            dy_full = np.zeros(cols, dtype=float)
-            dy_full[observed] = dyo
-            dy_full[missing] = dym
-
-            model["yest"][i, :] = dy_full + mean
-            t_mat += dy_full.reshape(-1, 1) @ x.reshape(1, -1)
-
-            if missing.any():
-                t_mat[missing, :] += wm @ rx_obs_inv
-                tr_s += float(
-                    dy_full @ dy_full
-                    + np.sum(missing) / tau
-                    + np.trace(wm @ rx_obs_inv @ wm.T)
-                )
-            else:
-                tr_s += float(dy_full @ dy_full)
-
-            scores[i, :] = x.ravel()
-
-        t_mat /= rows
-        tr_s /= rows
-
-        dw = (
-            rx_inv
-            + tau * t_mat.T @ pa @ rx_inv
-            + np.diag(model["alpha"]) / rows
-        )
-        dw_inv = self._safe_inverse(dw)
-
-        pa_new = t_mat @ dw_inv
-        tau_num = cols + 2 * model["gtau0"] / rows
-        tau_den = (
-            tr_s
-            - np.trace(t_mat.T @ pa_new)
-            + (
-                float(np.dot(mean, mean)) * model["gmu0"]
-                + 2 * model["gtau0"] / model["btau0"]
-            )
-            / rows
-        )
-        tau_new = float(tau_num / max(float(tau_den), 1e-12))
-        tau_new = float(np.clip(tau_new, 1e-10, 1e10))
-
-        sigw_new = dw_inv * (cols / rows)
-        alpha_denom = (
-            tau_new * np.diag(pa_new.T @ pa_new)
-            + np.diag(sigw_new)
-            + 2 * model["galpha0"] / model["balpha0"]
-        )
-        alpha_new = (2 * model["galpha0"] + cols) / np.maximum(
-            alpha_denom, 1e-12
-        )
-
-        model["scores"] = scores
-        model["pa"] = pa_new
-        model["tau"] = tau_new
-        model["sigw"] = sigw_new
-        model["alpha"] = alpha_new
-        return model
-
-    def fit_transform(self, y: np.ndarray) -> np.ndarray:
-        """Estimate missing values in an observation-by-variable matrix."""
-        y = np.asarray(y, dtype=float)
-        if y.ndim != 2:
-            raise ValueError("BPCA input must be a 2D matrix.")
-
-        if not np.isnan(y).any():
-            return y.copy()
-
-        if y.shape[0] < 2 or y.shape[1] < 2:
-            means = np.nanmean(y, axis=0)
-            global_mean = np.nanmean(y)
-            if np.isnan(global_mean):
-                global_mean = 0.0
-            means = np.where(np.isnan(means), global_mean, means)
-            return np.where(np.isnan(y), means, y)
-
-        model = self._initialize_model(y)
-        tau_old = 1000.0
-
-        for step in range(1, self.max_iter + 1):
-            model = self._do_step(model, y)
-            if step % 10 == 0:
-                dtau = abs(np.log10(model["tau"]) - np.log10(tau_old))
-                if dtau < self.threshold:
-                    break
-                tau_old = model["tau"]
-
-        result = np.where(np.isnan(y), model["yest"], y)
-        return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class MissingValueImputer(DatasetProcessor):
@@ -252,6 +46,8 @@ class MissingValueImputer(DatasetProcessor):
         {
             "mar_method",
             "mnar_method",
+            "r_route_method",
+            "s_route_method",
             "mnar_fraction",
             "knn_neighbors",
             "lls_neighbors",
@@ -260,6 +56,7 @@ class MissingValueImputer(DatasetProcessor):
             "bpca_tol",
             "sim_mask_ratio",
             "global_seed",
+            "implementation",
         }
     )
 
@@ -277,21 +74,29 @@ class MissingValueImputer(DatasetProcessor):
         bpca_tol: Optional[float] = None,
         sim_mask_ratio: Optional[float] = None,
         global_seed: Optional[int] = None,
+        implementation: Optional[str] = None,
+        *,
+        r_route_method: Optional[str] = None,
+        s_route_method: Optional[str] = None,
     ) -> None:
         """Initialize the missing-value imputation engine.
 
         Args:
             data: Explicit dataset to impute.
             pipeline_params: Global configuration dictionary.
-            mar_method: Method for MAR features.
-            mnar_method: Method for MNAR features.
-            mnar_fraction: Multiplier for LOD-based MNAR imputation.
+            mar_method: Legacy alias for ``r_route_method``.
+            mnar_method: Legacy alias for ``s_route_method``.
+            r_route_method: Reconstruction-route method or ``Auto``.
+            s_route_method: Special-handling method, normally QRILC.
+            mnar_fraction: Legacy name for the S-route LOD multiplier.
             knn_neighbors: Number of neighbors for the KNN algorithm.
             lls_neighbors: Number of neighbors for the LLS algorithm.
             bpca_components: Number of principal components for BPCA.
             bpca_max_iter: Maximum BPCA EM/Bayesian update steps.
             bpca_tol: BPCA precision-change convergence threshold.
             sim_mask_ratio: Ratio for simulated masking during evaluation.
+            implementation: ``python`` or optional original-package ``r``.
+                The R path supports R-route BPCA/Auto and S-route QRILC.
         """
         super().__init__(data)
 
@@ -308,22 +113,110 @@ class MissingValueImputer(DatasetProcessor):
                 "bpca_max_iter": 100,
                 "bpca_tol": 1e-4,
                 "sim_mask_ratio": 0.05,
+                "implementation": "python",
             },
-            {
-                "mar_method": mar_method,
-                "mnar_method": mnar_method,
-                "mnar_fraction": mnar_fraction,
-                "knn_neighbors": knn_neighbors,
-                "lls_neighbors": lls_neighbors,
-                "bpca_components": bpca_components,
-                "bpca_max_iter": bpca_max_iter,
-                "bpca_tol": bpca_tol,
-                "sim_mask_ratio": sim_mask_ratio,
-                "global_seed": global_seed,
-            },
+            normalize_imputation_route_options(
+                {
+                    "mar_method": mar_method,
+                    "mnar_method": mnar_method,
+                    "r_route_method": r_route_method,
+                    "s_route_method": s_route_method,
+                    "mnar_fraction": mnar_fraction,
+                    "knn_neighbors": knn_neighbors,
+                    "lls_neighbors": lls_neighbors,
+                    "bpca_components": bpca_components,
+                    "bpca_max_iter": bpca_max_iter,
+                    "bpca_tol": bpca_tol,
+                    "sim_mask_ratio": sim_mask_ratio,
+                    "global_seed": global_seed,
+                    "implementation": implementation,
+                }
+            ),
         )
 
         self.config.update(imp_configs)
+
+    def _validate_implementation(self) -> None:
+        """Reject unsupported R choices without substituting Python methods."""
+        implementation = str(
+            self.config.get("implementation", "python")
+        ).lower()
+        if implementation not in {"python", "r"}:
+            raise ValueError("implementation must be either 'python' or 'r'.")
+        self.config["implementation"] = implementation
+        if implementation != "r":
+            return
+        if self.dataset.context.is_logged or self.dataset.context.is_scaled:
+            raise ValueError(
+                "R imputation requires unlogged, unscaled intensities; "
+                "the stage applies log2(x + 1) before the original R call."
+            )
+        mar_key = IMPUTATION_METHODS.resolve(self.config["mar_method"]).key
+        if mar_key not in {"BPCA", "AUTO"}:
+            raise ValueError(
+                "implementation='r' requires mar_method='BPCA' or 'Auto'; "
+                "use r_route_method='BPCA' or 'Auto'. Other explicit "
+                "R-route methods have no original R adapter."
+            )
+        if str(self.config["mnar_method"]).upper() != "QRILC":
+            raise ValueError(
+                "implementation='r' requires mnar_method='QRILC'; "
+                "the preferred alias is s_route_method='QRILC'. "
+                "Python LOD heuristics are not silently substituted."
+            )
+
+    def _method_implementation(self, method: str) -> str:
+        """Resolve AUTO substitutions before execution, never after failure."""
+        key = str(method).replace("-", "").upper()
+        if self.config.get("implementation") == "r" and key in {
+            "BPCA",
+            "QRILC",
+        }:
+            return "r"
+        return "python"
+
+    def _impute_by_r(
+        self,
+        df_log: pd.DataFrame,
+        *,
+        method: str,
+        global_seed: int,
+    ) -> pd.DataFrame:
+        """Call the original R method on log-scale data, without fallback."""
+        if not df_log.isna().any().any():
+            return df_log.copy(deep=True)
+        from ..r_backend import run_r_method
+
+        if method == "BPCA":
+            parameters = {
+                "n_components": self.config.get("bpca_components", 2),
+                "max_iter": self.config.get("bpca_max_iter", 100),
+                "threshold": self.config.get("bpca_tol", 1e-4),
+            }
+        elif method == "QRILC":
+            parameters = {"tune_sigma": 1.0}
+        else:
+            raise ValueError(f"Unsupported R imputation method: {method}.")
+        result, provenance = run_r_method(
+            method, df_log, seed=global_seed, **parameters
+        )
+        roles = []
+        if len(self.qc_data.columns.intersection(df_log.columns)):
+            roles.append("QC")
+        if len(self.actual_data.columns.intersection(df_log.columns)):
+            roles.append("Sample")
+        self._implementation_provenance.append(
+            {
+                **provenance,
+                "phase": self._imputation_phase,
+                "sample_roles": roles,
+                "input_transform": "log2(x + 1); zero treated as missing",
+                "output_transform": "exp2(x) - 1",
+                "feature_count": len(df_log.index),
+                "sample_count": len(df_log.columns),
+            }
+        )
+        return result
 
     # =========================================================================
     # Imputation-related Metrics
@@ -464,60 +357,11 @@ class MissingValueImputer(DatasetProcessor):
         Ref:
             Missing value imputation approach for mass spectrometry-based
             metabolomics data (Scientific reports, 2018)
+        The kernel preserves signed draws. The production stage applies its
+        documented positive-output policy after reconstruction.
+
         """
-
-        rng = np.random.default_rng(global_seed)
-        arr = df_log.to_numpy(dtype=float)
-        res_arr = arr.copy()
-        n_features = arr.shape[0]
-        upper_q = 0.99
-        probs = np.arange(0.001, upper_q + 0.001 + 1e-12, 0.01)
-
-        for col_idx in range(arr.shape[1]):
-            sample_vec = arr[:, col_idx]
-            missing_mask = np.isnan(sample_vec)
-            n_missing = int(np.sum(missing_mask))
-            if n_missing == 0:
-                continue
-
-            observed = sample_vec[~missing_mask]
-            if observed.size < 3:
-                fallback = float(np.nanmin(observed)) if observed.size else 0.0
-                res_arr[missing_mask, col_idx] = fallback
-                continue
-
-            p_missing = n_missing / float(n_features)
-            q_normal = stats.norm.ppf(
-                np.linspace(p_missing + 0.001, upper_q + 0.001, len(probs))
-            )
-            q_sample = np.quantile(observed, probs, method="linear")
-            slope, intercept = np.polyfit(q_normal, q_sample, deg=1)
-
-            center = float(intercept)
-            slope_abs = max(abs(float(slope)), 1e-12)
-            # imputeLCMD passes the fitted scale-like coefficient to rtmvnorm's
-            # covariance argument. In one dimension this corresponds to a
-            # standard deviation of sqrt(scale * tune_sigma).
-            scale = math.sqrt(max(slope_abs * float(tune_sigma), 1e-12))
-            upper = stats.norm.ppf(
-                p_missing + 0.001,
-                loc=center,
-                scale=slope_abs,
-            )
-            upper_std = (upper - center) / scale
-            drawn = stats.truncnorm.rvs(
-                a=-np.inf,
-                b=upper_std,
-                loc=center,
-                scale=scale,
-                size=n_missing,
-                random_state=rng,
-            )
-            res_arr[missing_mask, col_idx] = np.clip(
-                drawn, a_min=0.0, a_max=None
-            )
-
-        return pd.DataFrame(res_arr, index=df_log.index, columns=df_log.columns)
+        return impute_qrilc(df_log, tune_sigma=tune_sigma, seed=global_seed)
 
     @staticmethod
     def impute_by_knn(
@@ -637,8 +481,7 @@ class MissingValueImputer(DatasetProcessor):
 
                 # Predict: x.T * B_mat
                 w_miss = x.T @ B_mat
-                # Prevent negative intensities in log space fallback
-                w_miss = np.clip(w_miss, a_min=0.0, a_max=None)
+                # Retain the model prediction; stage output policy is separate.
                 res_arr[i, missing_mask] = w_miss
             except np.linalg.LinAlgError:
                 # Fallback if matrix is singular or highly collinear
@@ -658,17 +501,14 @@ class MissingValueImputer(DatasetProcessor):
         pcaMethods treats rows as observations and columns as variables. The
         project matrix stores features in rows and samples in columns, so this
         wrapper transposes the matrix before fitting BPCA and restores the
-        original orientation afterward.
+        original orientation afterward. Feature means are removed before the
+        model is initialized. Observed entries and signed reconstructions are
+        preserved: the Gaussian BPCA model has no positivity constraint.
         """
         if df_log.empty or not df_log.isna().any().any():
             return df_log.copy()
 
         arr = df_log.to_numpy(dtype=float)
-        if arr.shape[0] < 2 or arr.shape[1] < 2:
-            return df_log.apply(lambda x: x.fillna(x.median()), axis=1).fillna(
-                0.0
-            )
-
         safe_components = max(
             1, min(int(n_components), arr.shape[0], arr.shape[1])
         )
@@ -680,8 +520,6 @@ class MissingValueImputer(DatasetProcessor):
 
         # BPCA returns an imputed observation-by-variable matrix.
         arr_imp = imputer.fit_transform(arr.T).T
-        arr_imp = np.where(np.isnan(arr), arr_imp, arr)
-        arr_imp = np.clip(arr_imp, a_min=0.0, a_max=None)
 
         return pd.DataFrame(arr_imp, index=df_log.index, columns=df_log.columns)
 
@@ -716,9 +554,6 @@ class MissingValueImputer(DatasetProcessor):
                 loc=shift_mean, scale=shift_std, size=s.isna().sum()
             )
 
-            # Prevent negative intensities in linear space.
-            # Log2 values must be >= 0 so that exp2(x) - 1.0 >= 0
-            drawn = np.clip(drawn, a_min=0.0, a_max=None)
             res_df.loc[s.isna(), col] = drawn
 
         return res_df
@@ -780,6 +615,81 @@ class MissingValueImputer(DatasetProcessor):
             )
             records.append({"role": role, "filled_values": filled})
 
+    def _repair_output(
+        self,
+        output: pd.DataFrame,
+        training: pd.DataFrame,
+        *,
+        target_mask: pd.DataFrame | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Apply the same train-only positive-output policy in every phase."""
+        labels = training.columns.get_level_values(
+            self.dataset.schema.sample_type
+        ).to_numpy()
+        return repair_imputed_log_values(
+            output,
+            training,
+            role_labels=labels,
+            target_mask=target_mask,
+        )
+
+    def _run_mar_method(
+        self,
+        training: pd.DataFrame,
+        method: str,
+        seed: int,
+    ) -> pd.DataFrame:
+        """Run a raw algorithm without the production output policy."""
+        key = IMPUTATION_METHODS.resolve(method).key
+        if self._method_implementation(key) == "r":
+            return self._apply_isolated(
+                training, self._impute_by_r, method=key, global_seed=seed
+            )
+        methods = {
+            "MINPROB": (self.impute_by_minprob, {"global_seed": seed}),
+            "KNN": (
+                self.impute_by_knn,
+                {"n_neighbors": self.config.get("knn_neighbors", 5)},
+            ),
+            "LLS": (
+                self.impute_by_lls,
+                {"n_neighbors": self.config.get("lls_neighbors", 15)},
+            ),
+            "BPCA": (
+                self.impute_by_bpca,
+                {
+                    "n_components": self.config.get("bpca_components", 2),
+                    "max_iter": self.config.get("bpca_max_iter", 100),
+                    "threshold": self.config.get("bpca_tol", 1e-4),
+                },
+            ),
+            "QRILC": (self.impute_by_qrilc, {"global_seed": seed}),
+            "MEDIAN": (
+                lambda frame: frame.apply(
+                    lambda row: row.fillna(row.median()), axis=1
+                ),
+                {},
+            ),
+        }
+        function, kwargs = methods[key]
+        return self._apply_isolated(training, function, **kwargs)
+
+    def _correction_missing_mask(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Identify algorithm-induced gaps without relabeling features."""
+        mask = pd.DataFrame(False, index=frame.index, columns=frame.columns)
+        records = self.dataset.feature_metadata.get(
+            "correction_missing_samples"
+        )
+        if records is None:
+            return mask
+        sample_ids = frame.columns.get_level_values(
+            self.dataset.schema.sample_id
+        )
+        for feature, samples in records.items():
+            if feature in mask.index and isinstance(samples, (tuple, list)):
+                mask.loc[feature, :] = sample_ids.isin(samples)
+        return mask & frame.isna()
+
     # =========================================================================
     # Evaluation Logic (Hybrid Masking & Stratified NRMSE)
     # =========================================================================
@@ -793,8 +703,10 @@ class MissingValueImputer(DatasetProcessor):
         batch_array: Optional[np.ndarray] = None,
     ) -> pd.DataFrame:
         """
-        Generate a MNAR mask using GMM probability scoring, optimized for
-        batch-wise evaluation.
+        Generate a low-intensity-weighted GMM reconstruction benchmark mask.
+
+        This stress test hides observed values for batch-wise evaluation;
+        it does not identify or simulate a proven MAR/MNAR mechanism.
         """
         from sklearn.mixture import GaussianMixture
 
@@ -970,22 +882,25 @@ class MissingValueImputer(DatasetProcessor):
         global_seed: int = DEFAULT_RANDOM_SEED,
         batch_array: Optional[np.ndarray] = None,
     ) -> tuple:
-        """Evaluate one MAR imputation candidate on an artificial mask."""
+        """Evaluate one R-route candidate on an artificial mask."""
         mar_data = df_log.loc[idx_mar, target_cols].astype(float)
         mar_data.attrs["is_logged"] = True
 
-        mask = self.generate_gmm_noise_mask(
-            mar_data,
-            ratio,
-            noise_factor=1.5,
-            global_seed=global_seed,
-            batch_array=batch_array,
-        )
+        mask = getattr(self, "_evaluation_mask", None)
+        if mask is None:
+            mask = self.generate_gmm_noise_mask(
+                mar_data,
+                ratio,
+                noise_factor=1.5,
+                global_seed=global_seed,
+                batch_array=batch_array,
+            )
 
         masked_df = mar_data.copy()
         masked_df[mask] = np.nan
 
         method_key = str(method).replace(" ", "").replace("-", "").upper()
+        provenance_start = len(getattr(self, "_implementation_provenance", []))
         if method_key in (
             "HALFGLOBALMIN",
             "HALFGLOBALMINREFERENCE",
@@ -993,42 +908,15 @@ class MissingValueImputer(DatasetProcessor):
         ):
             imp_res = self._low_value_reference_impute(masked_df)
         else:
-            method_spec = IMPUTATION_METHODS.resolve(method)
-            method_key = method_spec.key
-
-        if method_key == "MINPROB":
-            imp_res = self._apply_isolated(
-                masked_df, self.impute_by_minprob, global_seed=global_seed
-            )
-        elif method_key == "KNN":
-            k_val = self.config.get("knn_neighbors", 5)
-            imp_res = self._apply_isolated(
-                masked_df, self.impute_by_knn, n_neighbors=k_val
-            )
-        elif method_key == "LLS":
-            k_val = self.config.get("lls_neighbors", 15)
-            imp_res = self._apply_isolated(
-                masked_df, self.impute_by_lls, n_neighbors=k_val
-            )
-        elif method_key == "BPCA":
-            imp_res = self._apply_isolated(
-                masked_df,
-                self.impute_by_bpca,
-                n_components=self.config.get("bpca_components", 2),
-                max_iter=self.config.get("bpca_max_iter", 100),
-                threshold=self.config.get("bpca_tol", 1e-4),
-            )
-        elif method_key == "QRILC":
-            imp_res = self._apply_isolated(
-                masked_df,
-                self.impute_by_qrilc,
-                global_seed=global_seed,
-            )
-        elif method_key == "MEDIAN":
-            imp_res = self._apply_isolated(
-                masked_df,
-                lambda df: df.apply(lambda x: x.fillna(x.median()), axis=1),
-            )
+            imp_res = self._run_mar_method(masked_df, method, global_seed)
+        route_targets = getattr(self, "_evaluation_route_targets", None)
+        target_mask = (
+            masked_df.isna() if route_targets is None else mask | route_targets
+        )
+        imp_res, domain = self._repair_output(
+            imp_res, masked_df, target_mask=target_mask
+        )
+        imp_res = imp_res.mask(masked_df.isna() & ~target_mask)
         imp_res.attrs["is_logged"] = True
 
         eval_met, t_vals, p_vals = self.compute_stratified_nrmse(
@@ -1044,6 +932,15 @@ class MissingValueImputer(DatasetProcessor):
         )
         eval_met.update(
             {
+                "status": "ok",
+                "implementation": self._method_implementation(method),
+                "implementation_provenance": list(
+                    getattr(self, "_implementation_provenance", [])[
+                        provenance_start:
+                    ]
+                ),
+                "numerical_domain": domain,
+                "masked_count": int(mask.to_numpy().sum()),
                 "JSD_Total": dist_metrics["jsd"],
                 "Wasserstein_Total": dist_metrics["wasserstein"],
                 "Wasserstein_Normalized": dist_metrics[
@@ -1070,9 +967,11 @@ class MissingValueImputer(DatasetProcessor):
         cache: dict[str, tuple[dict[str, float], np.ndarray, np.ndarray]],
         reference_metrics: dict[str, float],
     ) -> pd.DataFrame:
-        """Score MAR candidates against a half-global-min reference."""
+        """Score R-route candidates against a half-global-min reference."""
         rows = []
         for method, (metrics, _, _) in cache.items():
+            if metrics.get("status", "ok") != "ok":
+                continue
             rows.append(
                 {
                     "method": method,
@@ -1122,24 +1021,45 @@ class MissingValueImputer(DatasetProcessor):
         reconstruction_scores = []
         distribution_scores = []
         auto_scores = []
+
+        def planned_mean(parts: list[tuple[object, float, bool]]) -> float:
+            """Do not reward candidate-specific missing metric values."""
+            denominator = sum(weight for _, weight, active in parts if active)
+            if denominator == 0:
+                return float("nan")
+            numerator = sum(
+                (float(value) if np.isfinite(su.finite_or_nan(value)) else 0)
+                * weight
+                for value, weight, active in parts
+                if active
+            )
+            return numerator / denominator
+
+        active_total = np.isfinite(su.finite_or_nan(ref_nrmse_total))
+        active_low = np.isfinite(su.finite_or_nan(ref_nrmse_low))
+        active_jsd = np.isfinite(su.finite_or_nan(ref_jsd))
+        active_wd = np.isfinite(su.finite_or_nan(ref_wasserstein))
+        active_structure = np.isfinite(
+            su.finite_or_nan(reference_metrics.get("Sample_Structure_Score"))
+        )
         for row in score_df.itertuples():
-            reconstruction_score = su.weighted_mean_score(
+            reconstruction_score = planned_mean(
                 [
-                    (row.nrmse_total_score, 0.70),
-                    (row.nrmse_low_score, 0.30),
+                    (row.nrmse_total_score, 0.70, active_total),
+                    (row.nrmse_low_score, 0.30, active_low),
                 ]
             )
-            distribution_score = su.weighted_mean_score(
+            distribution_score = planned_mean(
                 [
-                    (row.jsd_score, 0.50),
-                    (row.wasserstein_score, 0.50),
+                    (row.jsd_score, 0.50, active_jsd),
+                    (row.wasserstein_score, 0.50, active_wd),
                 ]
             )
-            auto_score = su.weighted_mean_score(
+            auto_score = planned_mean(
                 [
-                    (reconstruction_score, 0.65),
-                    (distribution_score, 0.20),
-                    (row.sample_structure_score, 0.15),
+                    (reconstruction_score, 0.65, active_total or active_low),
+                    (distribution_score, 0.20, active_jsd or active_wd),
+                    (row.sample_structure_score, 0.15, active_structure),
                 ]
             )
             reconstruction_scores.append(reconstruction_score)
@@ -1163,10 +1083,18 @@ class MissingValueImputer(DatasetProcessor):
         global_seed: int = DEFAULT_RANDOM_SEED,
         batch_array: Optional[np.ndarray] = None,
     ) -> tuple:
-        """Select the best MAR imputer from masked-reconstruction benchmarks."""
+        """Select an R-route imputer from masked-reconstruction benchmarks."""
         candidates = ["KNN", "MinProb", "QRILC", "Median", "LLS", "BPCA"]
-        selected_method = "KNN"
+        self._implementation_provenance = getattr(
+            self, "_implementation_provenance", []
+        )
         cache = {}
+        self._evaluation_mask = self.generate_gmm_noise_mask(
+            df_log.loc[idx_mar, target_cols],
+            ratio,
+            global_seed=global_seed,
+            batch_array=batch_array,
+        )
         reference_metrics, _, _ = self._evaluate_imputation_candidate(
             df_log=df_log,
             idx_mar=idx_mar,
@@ -1178,19 +1106,36 @@ class MissingValueImputer(DatasetProcessor):
         )
 
         for cand in candidates:
-            logger.info(f'Simulating "{cand}" on MAR subset...')
-            emet, tv, pv = self._evaluate_imputation_candidate(
-                df_log=df_log,
-                idx_mar=idx_mar,
-                target_cols=target_cols,
-                method=cand,
-                ratio=ratio,
-                global_seed=global_seed,
-                batch_array=batch_array,
-            )
+            logger.info(f'Simulating "{cand}" on the R-route subset...')
+            provenance_start = len(self._implementation_provenance)
+            try:
+                emet, tv, pv = self._evaluate_imputation_candidate(
+                    df_log=df_log,
+                    idx_mar=idx_mar,
+                    target_cols=target_cols,
+                    method=cand,
+                    ratio=ratio,
+                    global_seed=global_seed,
+                    batch_array=batch_array,
+                )
+            except Exception as error:
+                logger.warning(f"Imputation candidate {cand} failed: {error}")
+                emet = {
+                    "status": "failed",
+                    "reason": str(error),
+                    "implementation": self._method_implementation(cand),
+                    "implementation_provenance": list(
+                        self._implementation_provenance[provenance_start:]
+                    ),
+                }
+                tv, pv = np.array([]), np.array([])
             cache[cand] = (emet, tv, pv)
+        self._evaluation_mask = None
+        self._evaluation_route_targets = None
 
         score_df = self._score_imputation_candidates(cache, reference_metrics)
+        if score_df.empty:
+            raise ValueError("All AUTO imputation candidates failed.")
         if not score_df.empty and score_df["auto_score"].notna().any():
             score_df = selection_utils.rank_candidates(
                 score_df,
@@ -1198,6 +1143,7 @@ class MissingValueImputer(DatasetProcessor):
                 tie_breakers=(("nrmse_total", True), ("method", True)),
             )
             selected_method = str(score_df.iloc[0]["method"])
+            self._ranked_imputation_methods = score_df["method"].tolist()
             for row in score_df.itertuples():
                 metrics = cache[row.method][0]
                 metrics["Reconstruction_Score"] = su.finite_or_nan(
@@ -1229,16 +1175,20 @@ class MissingValueImputer(DatasetProcessor):
                     )
                 )
         else:
-            selected_method = min(
-                cache,
-                key=lambda method: cache[method][0].get(
-                    "NRMSE_Total", float("inf")
-                ),
-            )
+            # No input-supported evaluation metric: use a transparent stable
+            # order, still requiring successful final numerical-domain checks.
+            order = ["Median", "KNN", "LLS", "BPCA", "MinProb", "QRILC"]
+            self._ranked_imputation_methods = [
+                method
+                for method in order
+                if cache[method][0].get("status", "ok") == "ok"
+            ]
+            selected_method = self._ranked_imputation_methods[0]
+            self.config["auto_evaluation_status"] = "input_unsupported"
 
         best_score = cache[selected_method][0].get("Auto_Score", float("nan"))
         logger.info(
-            f"Optimal MAR algorithm selected: {selected_method} "
+            f"R-route algorithm selected: {selected_method} "
             f"(score={best_score:.3f})"
         )
         return selected_method, cache
@@ -1294,8 +1244,17 @@ class MissingValueImputer(DatasetProcessor):
             metrics = metrics if isinstance(metrics, dict) else {}
             record = {
                 "method": method,
+                "implementation": metrics.get("implementation", "python"),
+                "implementation_provenance": metrics.get(
+                    "implementation_provenance", []
+                ),
                 "selected": method == selected_method,
-                "status": "ok",
+                "status": metrics.get("status", "ok"),
+                "reason": metrics.get("reason"),
+                "numerical_domain": metrics.get("numerical_domain", {}),
+                "final_numerical_domain": metrics.get(
+                    "final_numerical_domain", {}
+                ),
             }
             record.update(
                 {
@@ -1320,6 +1279,7 @@ class MissingValueImputer(DatasetProcessor):
                 for record in candidate_results
                 if (score := record.get("auto_score")) is not None
                 and np.isfinite(score)
+                and record["status"] == "ok"
             ),
             reverse=True,
         )
@@ -1335,11 +1295,11 @@ class MissingValueImputer(DatasetProcessor):
         else:
             feature_metadata = self.dataset.feature_metadata
             missingness = self._missingness_labels()
-            idx_mar = feature_metadata.index[missingness == "MAR"].intersection(
-                self.frame.index
-            )
+            idx_mar = feature_metadata.index[
+                missingness == R_ROUTE
+            ].intersection(self.frame.index)
             idx_mnar = feature_metadata.index[
-                missingness == "MNAR"
+                missingness == S_ROUTE
             ].intersection(self.frame.index)
 
         # Retrieve the unified QA metrics (JSD) from the data passport
@@ -1348,12 +1308,32 @@ class MissingValueImputer(DatasetProcessor):
         metrics = {
             "imputation_status": status,
             "strategies": {
+                "s_route_method": (
+                    "Not required" if status == "Skipped" else mnar_meth
+                ),
+                "s_route_fraction": reported_mnar_frac,
                 "mnar_method": (
                     "Not required" if status == "Skipped" else mnar_meth
                 ),
                 "mnar_fraction": reported_mnar_frac,
             },
             "selection": {
+                "route": R_ROUTE,
+                "requested_implementation": self.config.get(
+                    "implementation", "python"
+                ),
+                "implementation": (
+                    self._method_implementation(selected_method)
+                    if selected_method not in {"Not required", "Unknown"}
+                    else self.config.get("implementation", "python")
+                ),
+                "mnar_implementation": self._method_implementation(mnar_meth),
+                "s_route_implementation": self._method_implementation(
+                    mnar_meth
+                ),
+                "implementation_provenance": list(
+                    getattr(self, "_implementation_provenance", [])
+                ),
                 "requested_method": requested_method,
                 "selected_method": selected_method,
                 "selected_label": selected_label,
@@ -1361,12 +1341,31 @@ class MissingValueImputer(DatasetProcessor):
                 "selected_score": selected_score,
                 "selection_margin": selection_margin,
                 "candidate_results": candidate_results,
+                "evaluation_status": self.config.get(
+                    "auto_evaluation_status", "evaluated"
+                ),
+                "benchmark_available": self.config.get(
+                    "imputation_benchmark_available", False
+                ),
             },
             "feature_distribution": {
+                "r_route_count": len(idx_mar),
+                "s_route_count": len(idx_mnar),
                 "mar_count": len(idx_mar),
                 "mnar_count": len(idx_mnar),
             },
             "qa_metrics": qa_metrics,
+            "numerical_domain": list(
+                getattr(self, "_numerical_domain_records", [])
+            ),
+            "missingness_routing": {
+                "route_definitions": dict(ROUTE_DEFINITIONS),
+                "feature_labels_unchanged": True,
+                "correction_reconstruction_count": self.config.get(
+                    "correction_reconstruction_count", 0
+                ),
+                "correction_route": "R-route (reconstruction)",
+            },
             "isolation_fallbacks": list(
                 getattr(self, "_isolation_fallback_records", [])
             ),
@@ -1376,27 +1375,19 @@ class MissingValueImputer(DatasetProcessor):
         return metrics
 
     def _missingness_labels(self) -> pd.Series:
-        """Normalize mechanism labels and reject unroutable features."""
-        metadata = self.dataset.feature_metadata
-        labels = (
-            metadata.get(
-                "missingness_type", pd.Series("MAR", index=metadata.index)
-            )
-            .astype("string")
-            .str.strip()
-            .str.upper()
-        )
-        invalid = labels.isna() | ~labels.isin(["MAR", "MNAR"])
-        if invalid.any():
-            raise ValueError(
-                "missingness_type must contain only MAR or MNAR; "
-                f"invalid features: {labels.index[invalid].tolist()}"
-            )
-        return labels
+        """Read canonical operational routes, accepting legacy data labels."""
+        return routes_from_metadata(self.dataset.feature_metadata)
 
     def transform_imputation(self) -> StageResult[MetaboDataset]:
         """Perform imputation without writing files or rendering figures."""
         self._isolation_fallback_records = []
+        self._implementation_provenance = []
+        self._numerical_domain_records = []
+        self._evaluation_mask = None
+        self._evaluation_route_targets = None
+        self._ranked_imputation_methods = []
+        self._imputation_phase = "final_mnar"
+        self._validate_implementation()
         # =====================================================================
         # Parameter Extraction
         # =====================================================================
@@ -1415,8 +1406,25 @@ class MissingValueImputer(DatasetProcessor):
 
         _seed = self.config.get("global_seed", DEFAULT_RANDOM_SEED)
         target_cols = self.frame.columns.difference(self.blank_data.columns)
-        target_matrix = self.frame.loc[:, target_cols]
+        target_matrix = self.frame.loc[:, target_cols].replace(0, np.nan)
         missingness = self._missingness_labels()
+        routed_metadata = self.dataset.feature_metadata.copy(deep=True)
+        routed_metadata["imputation_route"] = missingness
+        observed = target_matrix.to_numpy(dtype=float)
+        if np.isinf(observed).any() or (observed < 0).any():
+            raise ValueError(
+                "Imputation requires finite, nonnegative observed "
+                "intensities; missing observations may be NaN."
+            )
+        if self.dataset.context.is_logged or self.dataset.context.is_scaled:
+            raise ValueError("Imputation requires unlogged, unscaled data.")
+        context_updates = {
+            "pipeline_stage": "Imputation",
+            "extra_attrs": {
+                **self.dataset.context.extra_attrs,
+                "value_scale": "raw_positive",
+            },
+        }
 
         if not target_matrix.isna().any().any():
             logger.info(
@@ -1440,7 +1448,8 @@ class MissingValueImputer(DatasetProcessor):
             )
             imputed_dataset = self._to_dataset(
                 self.frame,
-                context_updates={"pipeline_stage": "Imputation"},
+                context_updates=context_updates,
+                feature_metadata=routed_metadata,
             )
 
             logger.success(
@@ -1488,56 +1497,108 @@ class MissingValueImputer(DatasetProcessor):
 
         logger.info(
             f"Hybrid Imputation Engine Initialized. "
-            f"MAR: {mar_info} | MNAR: {mnar_info} | Sim_Mask: {_ratio}"
+            f"R-route: {mar_info} | S-route: {mnar_info} | Sim_Mask: {_ratio}"
         )
 
-        df_log = np.log2(self.frame.astype(float).replace({0: np.nan}) + 1.0)
+        df_log = np.log1p(
+            self.frame.astype(float).replace({0: np.nan})
+        ) / np.log(2.0)
+        training_log = df_log.copy(deep=True)
+        correction_missing = self._correction_missing_mask(training_log)
+        mnar_targets = training_log.isna() & ~correction_missing
+        mnar_targets.loc[missingness != S_ROUTE, :] = False
+        mar_targets = training_log.isna() & ~mnar_targets
+        self.config["correction_reconstruction_count"] = int(
+            correction_missing.loc[:, target_cols].to_numpy().sum()
+        )
 
         # =====================================================================
-        # MNAR Route: Localized LOD Imputation or QRILC
+        # S-route: Localized LOD Imputation or QRILC
         # =====================================================================
         feature_metadata = self.dataset.feature_metadata
-        idx_mnar = feature_metadata.index[missingness == "MNAR"].intersection(
+        idx_mnar = feature_metadata.index[missingness == S_ROUTE].intersection(
             df_log.index
         )
 
-        if len(idx_mnar) > 0:
-            logger.info(f"Applying {_mnar} to {len(idx_mnar)} MNAR features.")
+        if mnar_targets.loc[idx_mnar, target_cols].to_numpy().any():
+            logger.info(
+                f"Applying {_mnar} to {len(idx_mnar)} S-route features."
+            )
 
-            if str(_mnar).upper() == "QRILC":
+            mnar_training = training_log.loc[idx_mnar, target_cols]
+            # QRILC fits each sample's distribution across all features.
+            # Keep original missingness; R-route fills are not evidence.
+            qrilc_training = training_log.loc[:, target_cols]
+            if self.config.get("implementation", "python") == "r":
+                mnar_imp = self._impute_by_r(
+                    qrilc_training,
+                    method="QRILC",
+                    global_seed=_seed,
+                )
+            elif str(_mnar).upper() == "QRILC":
                 mnar_imp = MissingValueImputer.impute_by_qrilc(
-                    df_log=df_log.loc[idx_mnar, target_cols], global_seed=_seed
+                    df_log=qrilc_training, global_seed=_seed
                 )
             else:
                 mnar_imp = MissingValueImputer.impute_by_constant(
-                    df_log=df_log.loc[idx_mnar, target_cols],
+                    df_log=mnar_training,
                     fraction=_frac,
                     imp_mode=_mnar,
                 )
 
-            df_log.loc[idx_mnar, target_cols] = mnar_imp
+            mnar_imp = mnar_imp.loc[idx_mnar, target_cols]
+            mnar_mask = mnar_targets.loc[idx_mnar, target_cols]
+            try:
+                mnar_imp, domain = self._repair_output(
+                    mnar_imp, mnar_training, target_mask=mnar_mask
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"Fixed S-route failed output validation: {error}"
+                ) from error
+            self._numerical_domain_records.append(
+                {"phase": "final_mnar", "method": _mnar, **domain}
+            )
+            df_log.loc[idx_mnar, target_cols] = mnar_training.where(
+                ~mnar_mask, mnar_imp
+            )
         else:
-            logger.info("MNAR index empty. Bypassing MNAR imputation.")
+            logger.info("S-route index empty. Bypassing special handling.")
 
         # =====================================================================
-        # MAR Route: Candidate Evaluation and Imputation
+        # R-route: Candidate Evaluation and Imputation
         # =====================================================================
-        idx_mar = feature_metadata.index[missingness == "MAR"].intersection(
+        idx_mar = feature_metadata.index[missingness == R_ROUTE].intersection(
             df_log.index
+        )
+        idx_mar = idx_mar.union(
+            correction_missing.index[
+                correction_missing.loc[:, target_cols].any(axis=1)
+            ],
+            sort=False,
         )
         cache, eval_met, t_vals, p_vals = {}, {}, [], []
         is_auto = mar_spec.key == "AUTO"
 
         if len(idx_mar) > 0:
+            self._imputation_phase = "evaluation_mar"
+            self._evaluation_route_targets = mar_targets.loc[
+                idx_mar, target_cols
+            ]
             if is_auto:
                 _mar, cache = self._select_best_imputation_method(
-                    df_log, idx_mar, target_cols, _ratio, _seed, batch_array
+                    training_log,
+                    idx_mar,
+                    target_cols,
+                    _ratio,
+                    _seed,
+                    batch_array,
                 )
                 eval_met, t_vals, p_vals = cache[_mar]
                 mar_spec = IMPUTATION_METHODS.resolve(_mar)
             else:
                 eval_met, t_vals, p_vals = self._evaluate_imputation_candidate(
-                    df_log,
+                    training_log,
                     idx_mar,
                     target_cols,
                     _mar,
@@ -1547,42 +1608,52 @@ class MissingValueImputer(DatasetProcessor):
                 )
 
             self._isolation_fallback_records = []
-            logger.info(f"Executing isolated '{_mar}' on MAR features.")
-            mar_slice = df_log.loc[idx_mar, target_cols]
-
-            if mar_spec.key == "MINPROB":
-                mar_imp = self._apply_isolated(
-                    mar_slice, self.impute_by_minprob, global_seed=_seed
+            self._imputation_phase = "final_mar"
+            logger.info(f"Executing isolated '{_mar}' on R-route features.")
+            mar_slice = training_log.loc[idx_mar, target_cols]
+            mar_mask = mar_targets.loc[idx_mar, target_cols]
+            ranked = self._ranked_imputation_methods or [_mar]
+            for candidate in ranked if is_auto else [_mar]:
+                provenance_start = len(self._implementation_provenance)
+                try:
+                    mar_imp = self._run_mar_method(mar_slice, candidate, _seed)
+                    mar_imp, domain = self._repair_output(
+                        mar_imp, mar_slice, target_mask=mar_mask
+                    )
+                except Exception as error:
+                    if not is_auto:
+                        raise
+                    metrics = cache[candidate][0]
+                    metrics["status"] = "final_fit_failed"
+                    metrics["reason"] = str(error)
+                    metrics.setdefault("implementation_provenance", []).extend(
+                        self._implementation_provenance[provenance_start:]
+                    )
+                    logger.warning(
+                        f"Final {candidate} fit failed; trying next eligible "
+                        f"AUTO candidate: {error}"
+                    )
+                    continue
+                _mar = candidate
+                if cache:
+                    eval_met, t_vals, p_vals = cache[candidate]
+                self._numerical_domain_records.append(
+                    {"phase": "final_mar", "method": candidate, **domain}
                 )
-            elif mar_spec.key == "KNN":
-                mar_imp = self._apply_isolated(
-                    mar_slice, self.impute_by_knn, n_neighbors=_knn_k
+                if cache:
+                    cache[candidate][0]["final_numerical_domain"] = domain
+                eval_met.setdefault("implementation_provenance", []).extend(
+                    self._implementation_provenance[provenance_start:]
                 )
-            elif mar_spec.key == "LLS":
-                mar_imp = self._apply_isolated(
-                    mar_slice, self.impute_by_lls, n_neighbors=_lls_k
-                )
-            elif mar_spec.key == "BPCA":
-                mar_imp = self._apply_isolated(
-                    mar_slice,
-                    self.impute_by_bpca,
-                    n_components=_bpca_k,
-                    max_iter=_bpca_max_iter,
-                    threshold=_bpca_tol,
-                )
-            elif mar_spec.key == "QRILC":
-                mar_imp = self._apply_isolated(
-                    mar_slice,
-                    self.impute_by_qrilc,
-                    global_seed=_seed,
-                )
+                df_log.loc[idx_mar, target_cols] = df_log.loc[
+                    idx_mar, target_cols
+                ].where(~mar_mask, mar_imp)
+                break
             else:
-                mar_imp = self._apply_isolated(
-                    mar_slice,
-                    lambda df: df.apply(lambda x: x.fillna(x.median()), axis=1),
+                raise ValueError(
+                    "All eligible AUTO imputation candidates failed final "
+                    "output validation. Fixed S-route fills were not changed."
                 )
-
-            df_log.loc[idx_mar, target_cols] = mar_imp
 
         # =====================================================================
         # Matrix Reconstruction and Passport Update
@@ -1596,7 +1667,19 @@ class MissingValueImputer(DatasetProcessor):
                 "Imputation could not fill all target values. Check feature "
                 "coverage and sample roles; no completed result was produced."
             )
-        res_val = np.exp2(final_log) - 1.0
+        with np.errstate(over="ignore", invalid="ignore"):
+            res_val = np.expm1(final_log * np.log(2.0))
+        # Preserve actual observations exactly, not a log/exp round trip.
+        observed_mask = self.frame.notna() & self.frame.gt(0)
+        res_val = res_val.where(~observed_mask, self.frame)
+        res_val.loc[:, self.blank_data.columns] = self.blank_data
+        target_values = res_val.loc[:, target_cols].to_numpy(dtype=float)
+        if not np.isfinite(target_values).all() or (target_values <= 0).any():
+            implementation = self.config.get("implementation", "python")
+            raise ValueError(
+                f"{implementation} imputation produced nonfinite or "
+                "nonpositive intensities after the output policy."
+            )
         imputed_frame = pd.DataFrame(res_val).copy(deep=True)
         imputed_frame.attrs.update(self.config)
 
@@ -1614,6 +1697,18 @@ class MissingValueImputer(DatasetProcessor):
         cand_mets = {}
         for m_name, (m_eval, _, _) in eval_source.items():
             cand_mets[m_name] = {
+                "implementation": m_eval.get(
+                    "implementation", self._method_implementation(m_name)
+                ),
+                "implementation_provenance": m_eval.get(
+                    "implementation_provenance", []
+                ),
+                "status": m_eval.get("status", "ok"),
+                "reason": m_eval.get("reason"),
+                "numerical_domain": m_eval.get("numerical_domain", {}),
+                "final_numerical_domain": m_eval.get(
+                    "final_numerical_domain", {}
+                ),
                 "nrmse_low": m_eval.get("NRMSE_Low", float("nan")),
                 "nrmse_high": m_eval.get("NRMSE_High", float("nan")),
                 "nrmse_total": m_eval.get("NRMSE_Total", float("nan")),
@@ -1672,13 +1767,21 @@ class MissingValueImputer(DatasetProcessor):
 
         imputed_dataset = self._to_dataset(
             imputed_frame,
-            context_updates={"pipeline_stage": "Imputation"},
+            context_updates=context_updates,
+            feature_metadata=routed_metadata,
         )
 
         benchmark_results = (
             (cache if cache else {_mar: (eval_met, t_vals, p_vals)})
             if len(idx_mar) > 0
             else {}
+        )
+        selected_benchmark = benchmark_results.get(_mar)
+        self.config["imputation_benchmark_available"] = bool(
+            selected_benchmark is not None
+            and selected_benchmark[0].get("status", "ok") == "ok"
+            and len(selected_benchmark[1]) > 0
+            and len(selected_benchmark[2]) > 0
         )
         return StageResult(
             data=imputed_dataset,
@@ -1716,10 +1819,13 @@ class MissingValueImputer(DatasetProcessor):
         """Return the structured missing-value imputation stage result.
 
         Keyword settings use the same names as the imputation configuration,
-        such as ``mar_method``, ``mnar_method``, ``knn_neighbors``,
+        such as ``r_route_method``, ``s_route_method``, ``knn_neighbors``,
         ``bpca_components``, ``sim_mask_ratio``, and ``global_seed``. They
         take precedence over TOML settings and built-in defaults for this
         processor instance.
+
+        Historical ``mar_method``/``mnar_method`` remain accepted aliases;
+        saved configuration uses these legacy keys for compatibility.
         """
         runner = ImputationStageRunner(
             processor=self,

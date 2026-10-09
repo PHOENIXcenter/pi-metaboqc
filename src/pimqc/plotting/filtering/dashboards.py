@@ -27,7 +27,7 @@ class FilteringDashboardMixin:
         """Assemble the high-missing-value filtering dashboard.
 
         The layout adapts to biological-group metadata and combines sample
-        filtering, rescue diagnostics, MAR eligibility, and the stage
+        filtering, rescue diagnostics, R-route eligibility, and the stage
         decision flowchart.
         """
         try:
@@ -38,7 +38,7 @@ class FilteringDashboardMixin:
         pw.clear()
 
         # Initialize data copy and evaluate the three orthogonal layout states.
-        df_curr = tracking_df.copy()
+        df_curr = self._route_tracking(tracking_df)
         has_group_info = self.payload.biological_groups_available and (
             "Max_Group_MV_Pct" in df_curr.columns
         )
@@ -111,7 +111,7 @@ class FilteringDashboardMixin:
                 mnar_group_mv_tol,
                 active_base_tol,
                 ax_group_rescue,
-                "Group-level MNAR Rescue",
+                "Group-level S-route Rescue",
                 article_compact=True,
             )
             # Cascade remaining features downward
@@ -128,7 +128,7 @@ class FilteringDashboardMixin:
                 mnar_qc_mv_tol,
                 mnar_int_threshold,
                 ax_qc_rescue,
-                "QC-level MNAR Rescue",
+                "QC-level S-route Rescue",
                 mnar_intensity_pct=mnar_intensity_pct,
                 article_compact=True,
             )
@@ -146,10 +146,13 @@ class FilteringDashboardMixin:
                 "Min_Group_MV_Pct",
                 "Stage1_Status",
                 active_base_tol,
-                {"MAR": pu.PRIMARY_ACCENT_COLOR, "INVALID": pu.NEUTRAL_COLOR},
-                ["MAR", "INVALID"],
+                {
+                    "R-route": pu.PRIMARY_ACCENT_COLOR,
+                    "INVALID": pu.NEUTRAL_COLOR,
+                },
+                ["R-route", "INVALID"],
                 ax_base_check,
-                ("MAR Eligibility Check"),
+                ("R-route Eligibility Check"),
                 "Min Group-level MV (%)",
                 article_compact=True,
             )
@@ -202,7 +205,7 @@ class FilteringDashboardMixin:
                 mnar_qc_mv_tol,
                 mnar_int_threshold,
                 ax_qc_rescue,
-                "QC-level MNAR Rescue",
+                "QC-level S-route Rescue",
                 mnar_intensity_pct=mnar_intensity_pct,
                 article_compact=True,
             )
@@ -223,8 +226,11 @@ class FilteringDashboardMixin:
                 "QC_MV_Pct",
                 "Stage1_Status",
                 active_base_tol,
-                {"MAR": pu.PRIMARY_ACCENT_COLOR, "INVALID": pu.NEUTRAL_COLOR},
-                ["MAR", "INVALID"],
+                {
+                    "R-route": pu.PRIMARY_ACCENT_COLOR,
+                    "INVALID": pu.NEUTRAL_COLOR,
+                },
+                ["R-route", "INVALID"],
                 ax_base_check,
                 "QC-level MV Check",
                 "QC-level MV (%)",
@@ -241,10 +247,11 @@ class FilteringDashboardMixin:
     def plot_high_mv_filter_article_dashboard(self) -> object | None:
         """Create a compact three-panel summary of high-MV feature screening.
 
-        Experimental: The manuscript layout retains three decision diagnostics
-        to classify group-rescued MNAR, QC-rescued MNAR, and MAR features. It
-        is deliberately independent of the full Stage 1 dashboard so the
-        standard report layout and its typography remain unchanged.
+        The three diagnostics show group rescue, QC rescue, and the remaining
+        reconstruction route (R-route) from the saved filtering payload.
+        S-route denotes special handling after group-pattern or low-intensity
+        QC rescue. These are processing routes, not missingness mechanisms.
+        This layout remains independent of the standard Stage 1 dashboard.
         """
         try:
             import patchworklib as pw
@@ -255,19 +262,40 @@ class FilteringDashboardMixin:
             return None
 
         tracking_df = self.audit_tables.get("stage1_tracking", pd.DataFrame())
-        if tracking_df.empty:
+        tracking_df = self._route_tracking(tracking_df)
+        if (
+            self.payload.stage_status == "skipped"
+            or not self.payload.missing_values_detected
+            or tracking_df.empty
+        ):
             logger.warning(
-                "Stage 1 tracking data are unavailable for article export."
+                "Active Stage 1 tracking data are unavailable "
+                "for article export."
+            )
+            return None
+
+        required_columns = {
+            "Stage1_Status",
+            "Max_Group_MV_Pct",
+            "Min_Group_MV_Pct",
+            "QC_MV_Pct",
+            "Log2_Intensity",
+        }
+        if not required_columns.issubset(tracking_df.columns):
+            logger.warning(
+                "High-MV article diagnostics require tracking columns: {}",
+                sorted(required_columns - set(tracking_df.columns)),
             )
             return None
 
         has_group_info = (
-            "Max_Group_MV_Pct" in tracking_df.columns
+            self.payload.biological_groups_available
             and tracking_df["Max_Group_MV_Pct"].notna().any()
+            and tracking_df["Min_Group_MV_Pct"].notna().any()
         )
         if not has_group_info:
             logger.warning(
-                "Group-level MNAR rescue is unavailable; skipping high-MV "
+                "Group-level S-route rescue is unavailable; skipping high-MV "
                 "article dashboard."
             )
             return None
@@ -279,8 +307,7 @@ class FilteringDashboardMixin:
         mnar_intensity_pct = self.payload.mnar_intensity_percentile
 
         pw.clear()
-        # Patchworklib adds fixed label/legend padding. This width yields an
-        # approximately 17.7 cm export, within the ACS double-column limit.
+        # The shared finalizer sets the composed width without scaling text.
         panel_size = pu.article_brick_size(1.72, 1.72)
         ax_group = pw.Brick(figsize=panel_size, label="article_group_rescue")
         ax_qc = pw.Brick(figsize=panel_size, label="article_qc_rescue")
@@ -293,10 +320,34 @@ class FilteringDashboardMixin:
             mnar_group_mv_tol,
             active_base_tol,
             ax_group,
-            "Group-level MNAR Rescue",
+            "Group-Pattern\nS-route",
             article_compact=True,
         )
-        self._apply_article_panel_format(ax_group, "Group-level MNAR Rescue")
+        self._apply_article_panel_format(
+            ax_group, "Group-Pattern\nS-route"
+        )
+        # The general annotation solver can place this label below the axes.
+        # Keep the article label beside its guide and inside the top edge so
+        # the narrow manuscript panel never crosses its x-axis label.
+        for annotation in list(ax_group.texts):
+            if annotation.get_text().startswith("Max group MV ="):
+                text = annotation.get_text()
+                fontsize = annotation.get_fontsize()
+                annotation.remove()
+                ax_group.annotate(
+                    text,
+                    xy=(mnar_group_mv_tol * 100, 0.97),
+                    xycoords=ax_group.get_xaxis_transform(),
+                    xytext=(-3, 0),
+                    textcoords="offset points",
+                    ha="right",
+                    va="top",
+                    rotation=90,
+                    fontsize=fontsize,
+                    clip_on=True,
+                    zorder=5,
+                )
+                break
 
         after_group = tracking_df[
             ~tracking_df["Stage1_Status"].str.contains("Group", na=False)
@@ -306,11 +357,11 @@ class FilteringDashboardMixin:
             mnar_qc_mv_tol,
             mnar_int_threshold,
             ax_qc,
-            "QC-level MNAR Rescue",
+            "Low-Intensity QC\nS-route",
             mnar_intensity_pct=mnar_intensity_pct,
             article_compact=True,
         )
-        self._apply_article_panel_format(ax_qc, "QC-level MNAR Rescue")
+        self._apply_article_panel_format(ax_qc, "Low-Intensity QC\nS-route")
 
         after_qc = after_group[
             ~after_group["Stage1_Status"].str.contains("QC", na=False)
@@ -320,16 +371,18 @@ class FilteringDashboardMixin:
             "Min_Group_MV_Pct",
             "Stage1_Status",
             active_base_tol,
-            {"MAR": pu.PRIMARY_ACCENT_COLOR, "INVALID": pu.NEUTRAL_COLOR},
-            ["MAR", "INVALID"],
+            {"R-route": pu.PRIMARY_ACCENT_COLOR, "INVALID": pu.NEUTRAL_COLOR},
+            ["R-route", "INVALID"],
             ax_mar,
-            "MAR Eligibility Check",
+            "R-route\nEligibility",
             "Min group MV (%)",
             article_compact=True,
         )
-        self._apply_article_panel_format(ax_mar, "MAR Eligibility Check")
+        self._apply_article_panel_format(
+            ax_mar, "R-route\nEligibility"
+        )
 
-        return ax_group | ax_qc | ax_mar
+        return self._finalize_article_dashboard(ax_group | ax_qc | ax_mar)
 
     def plot_quality_filtering_dashboard(self) -> object | None:
         """Assemble the low-quality feature-filtering dashboard.
@@ -351,7 +404,7 @@ class FilteringDashboardMixin:
 
         idx_mar = self.audit_tables.get("idx_mar", pd.Index([]))
         if self.audit_tables.get("quality_filter_mode") == "quality_only":
-            # Quality-only runs have no MAR labels.  The QC-RSD diagnostic
+            # Quality-only runs have no R-route labels.  The QC-RSD diagnostic
             # still covers every feature that reached the quality stage.
             qc_rsd_all = self.audit_tables.get("qc_rsd_all")
             if qc_rsd_all is not None:
@@ -400,9 +453,10 @@ class FilteringDashboardMixin:
         """
         Create a compact three-panel summary of low-quality feature filtering.
 
-        Experimental: The QC-RSD panel reuses the MAR-only distribution used by
-        the filtering engine. MNAR features remain absent from this diagnostic
-        because they are exempt from the QC-RSD reproducibility filter.
+        The QC-RSD panel uses the same eligible feature set as the filtering
+        engine: R-route features in the combined workflow, or all features
+        in a quality-only run. S-route is exempt from this QC-RSD check,
+        without implying a statistical missingness mechanism.
 
         """
         try:
@@ -421,15 +475,13 @@ class FilteringDashboardMixin:
                 idx_mar = qc_rsd_all.index
         if blank_mean is None or blank_mean.empty or len(idx_mar) == 0:
             logger.warning(
-                "Blank/QC and MAR QC-RSD inputs are required for the "
+                "Blank/QC and eligible QC-RSD inputs are required for the "
                 "article dashboard."
             )
             return None
 
         pw.clear()
-        # Compensate for the smaller low-quality layout margin so the exported
-        # dashboard matches the high-MV article dashboard at approximately 17.7
-        # cm.
+        # The shared finalizer sets the composed width without scaling text.
         panel_size = pu.article_brick_size(1.72, 1.72)
         ax_blank = pw.Brick(figsize=panel_size, label="article_blank_qc")
         ax_rsd = pw.Brick(figsize=panel_size, label="article_qc_rsd")
@@ -456,7 +508,9 @@ class FilteringDashboardMixin:
             article_compact=True,
         )
         self._apply_article_panel_format(
-            ax_retention, "Feature Retention Across Filtering Steps"
+            ax_retention, "Feature Retention Across\nFiltering Steps"
         )
 
-        return ax_blank | ax_rsd | ax_retention
+        return self._finalize_article_dashboard(
+            ax_blank | ax_rsd | ax_retention
+        )

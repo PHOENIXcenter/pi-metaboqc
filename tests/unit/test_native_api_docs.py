@@ -6,6 +6,7 @@ import importlib
 import inspect
 from pathlib import Path
 import re
+from urllib.parse import urldefrag
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,78 @@ from pimqc.config import PipelineConfig
 
 ROOT = Path(__file__).parents[2]
 DOCUMENT = ROOT / "docs" / "native_api.md"
+
+
+def _markdown_anchors(source):
+    """Return heading anchors outside fenced code for local navigation."""
+    prose = re.sub(
+        r"^```.*?^```", "", source, flags=re.MULTILINE | re.DOTALL
+    )
+    return {
+        re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
+        for title in re.findall(r"^#{1,6} (.+)$", prose, re.MULTILINE)
+    }
+
+
+def test_project_documentation_links():
+    """Keep installation, API and developer guides linked after migration."""
+    documents = [ROOT / "README.md", ROOT / "tests" / "README.md"]
+    documents.extend((ROOT / "docs").glob("*.md"))
+    prefixes = [
+        "https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/",
+        "https://github.com/PHOENIXcenter/pi-metaboqc/tree/main/",
+        "https://github.com/PHOENIXcenter/pi-metaboqc/raw/main/",
+    ]
+    for document in documents:
+        source = document.read_text(encoding="utf-8")
+        for target in re.findall(r"\]\(([^)]+)\)", source):
+            base = document.parent
+            for prefix in prefixes:
+                if target.startswith(prefix):
+                    target, base = target[len(prefix):], ROOT
+                    break
+            if target.startswith(("https://", "http://", "mailto:")):
+                continue
+            path, fragment = urldefrag(target)
+            linked = base / path if path else document
+            assert linked.is_file(), (document, target)
+            if fragment and linked.suffix == ".md":
+                assert fragment in _markdown_anchors(
+                    linked.read_text(encoding="utf-8")
+                ), (document, target)
+
+
+def test_current_guides_identify_package_version():
+    """Distinguish current reference guides from historical release notes."""
+    metadata = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    version = re.search(r'^version = "([^"]+)"', metadata, re.MULTILINE)[1]
+    for name in (
+        "native_api.md", "r_backend.md", "vscode_conda_troubleshooting_guide.md"
+    ):
+        text = (ROOT / "docs" / name).read_text(encoding="utf-8")
+        title = text.splitlines()[0]
+        assert version in title, name
+
+
+def test_r_installation_guide_matches_source_pin():
+    """Verify the documented SERRF source identity without loading R."""
+    from pimqc.processing.correction.serrf_r import (
+        SERRF_UPSTREAM_APP_SHA256,
+        SERRF_UPSTREAM_COMMIT,
+    )
+
+    guide = (ROOT / "docs" / "r_backend.md").read_text(encoding="utf-8")
+    assert SERRF_UPSTREAM_APP_SHA256 in guide
+    assert SERRF_UPSTREAM_COMMIT in guide
+    assert ".[test,r]" in guide
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "](docs/r_backend.md)" in readme
+    assert "BiocManager::install" not in readme
+    for text in (guide, DOCUMENT.read_text(encoding="utf-8")):
+        assert "original_model_seed=1" in text
+        assert "effective_model_seed" in text
+        assert "runtime_seed_adaptation" in text
+        assert "does not change the original model" not in text
 
 
 def _examples():
@@ -130,7 +203,20 @@ def test_reference_headings_and_links():
         if target.startswith("#"):
             assert target[1:] in anchors
         elif not target.startswith("https://"):
-            assert (DOCUMENT.parent / target).is_file()
+            path, fragment = urldefrag(target)
+            linked = DOCUMENT.parent / path
+            assert linked.is_file()
+            if fragment:
+                titles = re.findall(
+                    r"^#{1,6} (.+)$",
+                    linked.read_text(encoding="utf-8"),
+                    re.MULTILINE,
+                )
+                linked_anchors = {
+                    re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
+                    for title in titles
+                }
+                assert fragment in linked_anchors
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     prefix = "https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/"
@@ -144,7 +230,12 @@ def test_reference_headings_and_links():
 
 
 def test_reference_filter_and_normalization_examples(tmp_path, monkeypatch):
-    """Run selected documentation examples on a small real dataset."""
+    """Run native examples; original R examples belong to reference tests."""
+    def unexpected_r():
+        """Keep optional R initialization out of native documentation tests."""
+        raise AssertionError("Native documentation smoke must not invoke R")
+
+    monkeypatch.setattr("pimqc.processing.r_backend._load_r", unexpected_r)
     rng = np.random.default_rng(42)
     ids = [f"S{i}" for i in range(12)]
     samples = pd.DataFrame(
@@ -171,7 +262,18 @@ def test_reference_filter_and_normalization_examples(tmp_path, monkeypatch):
         "from pimqc.serialization import",
     )
     for marker in markers:
-        source = next(s for s in _examples() if marker in s)
+        source = next(
+            s
+            for s in _examples()
+            if marker in s
+            and not any(
+                isinstance(node, ast.keyword)
+                and node.arg == "implementation"
+                and isinstance(node.value, ast.Constant)
+                and node.value.value == "r"
+                for node in ast.walk(ast.parse(s))
+            )
+        )
         tree = ast.parse(source)
         # Keep the published argument shape; disable rendering in this smoke.
         for node in ast.walk(tree):

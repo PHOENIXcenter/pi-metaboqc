@@ -35,7 +35,6 @@ def _blank_policy_data() -> tuple[
 def test_serrf_blank_prediction_does_not_use_raw_blank_correlates() -> None:
     """Exclude raw blank correlates from fitted SERRF predictors."""
     data, qc_mask, blank_mask, order = _blank_policy_data()
-    corr = np.array([[1.0, 0.99, 0.50], [0.99, 1.0, 0.50], [0.50, 0.50, 1.0]])
     engine = SERRFCorrector(
         n_estimators=30,
         cv_folds=2,
@@ -49,23 +48,21 @@ def test_serrf_blank_prediction_does_not_use_raw_blank_correlates() -> None:
         batch_array=np.repeat("B1", data.shape[1]),
         qc_mask=qc_mask,
         order_array=order,
-        corr_mat=corr.copy(),
         blank_mask=blank_mask,
     )["SERRF"][0]
-    legacy = engine.fit_transform(
-        data,
+    changed_blanks = data.copy()
+    changed_blanks.loc[:, blank_mask] *= 1000.0
+    changed = engine.fit_transform(
+        changed_blanks,
         batch_array=np.repeat("B1", data.shape[1]),
         qc_mask=qc_mask,
         order_array=order,
-        corr_mat=corr.copy(),
+        blank_mask=blank_mask,
     )["SERRF"][0]
 
     np.testing.assert_allclose(
-        protected.loc[:, qc_mask].to_numpy(), legacy.loc[:, qc_mask].to_numpy()
-    )
-    assert not np.allclose(
-        protected.loc[:, blank_mask].to_numpy(),
-        legacy.loc[:, blank_mask].to_numpy(),
+        protected.loc[:, ~blank_mask].to_numpy(),
+        changed.loc[:, ~blank_mask].to_numpy(),
     )
     assert np.isfinite(protected.loc[:, blank_mask].to_numpy()).all()
 

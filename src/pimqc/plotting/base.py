@@ -14,6 +14,7 @@ from typing import Optional, Union
 from pathlib import Path
 
 from matplotlib import font_manager
+from matplotlib.transforms import Bbox
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -447,7 +448,10 @@ class BasePlotter:
             axis_label_fontsize=label_fontsize,
             title_fontsize=title_fontsize,
         )
-        ax.tick_params(axis="both", pad=1.0, length=2.0, width=0.6)
+        ax.tick_params(
+            axis="both", labelsize=tick_fontsize,
+            pad=1.0, length=2.0, width=0.6,
+        )
         for label in [ax.xaxis.get_offset_text(), ax.yaxis.get_offset_text()]:
             label.set_fontsize(tick_fontsize)
         for text_artist in ax.texts:
@@ -1012,6 +1016,68 @@ class BasePlotter:
 
         return [final_leg]
 
+    @staticmethod
+    def _finalize_article_dashboard(dashboard: object) -> object:
+        """Fit manuscript axes to one physical width without scaling text.
+
+        Patchwork's tight bounds include tick labels and legends, not just the
+        sum of brick widths. Adjust axes horizontally against those measured
+        bounds; font sizes, marker sizes and row heights remain unchanged.
+        Only article builders opt in. Standard dashboards retain their layout.
+        """
+        target = pu.ARTICLE_TARGET_WIDTH_IN
+        padding = pu.ARTICLE_EXPORT_PAD_IN
+        dashboard._pimqc_article_width_in = target
+        for _ in range(12):
+            figure = dashboard.savefig()
+            figure.canvas.draw()
+            extent = figure.get_tightbbox(figure.canvas.get_renderer())
+            error = target - 2 * padding - extent.width
+            if abs(error) < 0.002:
+                break
+            bricks = list(dashboard.bricks_dict.values())
+            left = min(ax.get_position().x0 for ax in bricks)
+            right = max(ax.get_position().x1 for ax in bricks)
+            span = (right - left) * figure.get_figwidth()
+            # Bounded steps also handle label/tick locator changes on resize.
+            factor = max(0.5, min(1.5, 1.0 + error / span))
+            for ax in bricks:
+                pos = ax.get_position()
+                ax.set_position([
+                    left + (pos.x0 - left) * factor,
+                    pos.y0,
+                    pos.width * factor,
+                    pos.height,
+                ])
+            # Patchwork restores these positions whenever savefig is called.
+            dashboard.set_originalpositions()
+        return dashboard
+
+    @classmethod
+    def _save_patchwork(cls, dashboard: object, destination, **kwargs) -> None:
+        """Use a fixed-width physical canvas only for article compositions."""
+        target = getattr(dashboard, "_pimqc_article_width_in", None)
+        if target is not None:
+            # Export preparation may change text extents (e.g. vector dashes).
+            cls._finalize_article_dashboard(dashboard)
+            figure = dashboard.savefig()
+            figure.canvas.draw()
+            extent = figure.get_tightbbox(figure.canvas.get_renderer())
+            padding = pu.ARTICLE_EXPORT_PAD_IN
+            if extent.width > target:
+                raise ValueError(
+                    "Article labels exceed the manuscript width; adjust the "
+                    "panel layout instead of shrinking fonts or cropping text."
+                )
+            kwargs["bbox_inches"] = Bbox.from_bounds(
+                (extent.x0 + extent.x1 - target) / 2,
+                extent.y0 - padding,
+                target,
+                extent.height + 2 * padding,
+            )
+            kwargs["pad_inches"] = 0
+        dashboard.savefig(destination, **kwargs)
+
     def _render_jupyter_display(
         self,
         obj: object,
@@ -1070,7 +1136,9 @@ class BasePlotter:
                 if display_fmt == "svg":
                     self._prepare_open_figures_for_vector_export()
                     # Maintain SVG transparency for HTML rendering
-                    obj.savefig(tmp_path, transparent=transparent)
+                    self._save_patchwork(
+                        obj, tmp_path, transparent=transparent
+                    )
                     self._clean_svg_fonts_for_ai(
                         tmp_path, target_font=self._svg_font_family_stack()
                     )
@@ -1103,7 +1171,8 @@ class BasePlotter:
                     # Force white background and opaque rendering for the
                     # runtime
                     # preview image to ensure visibility in dark-themed IDEs
-                    obj.savefig(
+                    self._save_patchwork(
+                        obj,
                         tmp_path,
                         transparent=False,
                         facecolor="white",
@@ -1221,6 +1290,8 @@ class BasePlotter:
         """
         if width is not None and str(width).lower() != "auto":
             return width
+        if getattr(obj, "_pimqc_article_width_in", None) is not None:
+            return pu.DEFAULT_DASHBOARD_DISPLAY_WIDTH
         rows, columns = cls._dashboard_grid_shape(obj)
         return pu.dashboard_display_width(rows, columns)
 
@@ -1379,7 +1450,9 @@ class BasePlotter:
                 clean_fmt = fmt.lower().strip(".")
                 out_path = f"{base_path}.{clean_fmt}"
 
-                pw_obj.savefig(out_path, transparent=transparent)
+                self._save_patchwork(
+                    pw_obj, out_path, transparent=transparent
+                )
 
                 if clean_fmt == "svg":
                     self._clean_svg_fonts_for_ai(

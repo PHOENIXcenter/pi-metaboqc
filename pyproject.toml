@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 # ==============================================================================
 [project]
 name = "pi-metaboqc"           # Distribution name used by PyPI and pip
-version = "1.4.0"              # Release version following PEP 440
+version = "1.5.0"              # Release version following PEP 440
 dynamic = ["readme"]           # README content is loaded from README.md
 
 # Maintainer information displayed in package metadata.
@@ -70,6 +70,7 @@ dependencies = [
     "pandas>=2.0.0",         # Core DataFrame structures for metabolomics data
     "scipy>=1.7.0",          # Scientific algorithms and statistical testing
     "scikit-learn>=1.0.2",   # Machine learning for PCA and imputation tasks
+    "scikit-misc>=0.3.1",    # Native Cleveland LOESS for MetaNorm rLOESS
     
     # --- Performance & Engineering ---
     "numba>=0.56.0",         # JIT compilation for high-performance math engines
@@ -134,9 +135,11 @@ readme = {file = "README.md", content-type = "text/markdown"}  # PyPI README
 # Requirements for testing and specific R-integration workflows.
 # ==============================================================================
 [project.optional-dependencies]
+r = [
+    "rpy2>=3.5.0",              # Optional original R-package implementations
+]
 test = [
     "pytest>=7.0.0",            # Core testing framework
-    "rpy2>=3.5.0",              # R-interface for algorithm benchmarking
 ]
 pdf = [
     "weasyprint>=61.0",         # Primary HTML-to-PDF rendering engine

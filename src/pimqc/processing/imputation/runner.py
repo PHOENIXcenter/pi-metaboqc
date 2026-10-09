@@ -45,14 +45,27 @@ class ImputationStageRunner(StageRunner["MissingValueImputer", MetaboDataset]):
         plotter = ImputationPlotter(audit.plot_payload)
         selected_method = audit.selected_method
         selected_label = audit.selected_label
+        renderable = {
+            method: candidate
+            for method, candidate in audit.candidate_results.items()
+            if candidate[0].get("status", "ok") == "ok"
+            and len(candidate[1]) > 0
+            and len(candidate[2]) > 0
+        }
+        if selected_method not in renderable:
+            logger.info(
+                "No supported masked benchmark for the selected imputer; "
+                "skipping its benchmark dashboard. See the audit instead."
+            )
+            return
         if audit.is_auto:
-            # AUTO retains all benchmark candidates for comparative rendering.
+            # Failed candidates remain in the audit, not empty plot panels.
             dashboard = plotter.plot_imputation_auto_dashboard(
-                audit.candidate_results,
+                renderable,
                 selected_method=selected_method,
             )
         else:
-            metrics, true_values, predicted_values = audit.candidate_results[
+            metrics, true_values, predicted_values = renderable[
                 selected_method
             ]
             dashboard = plotter.plot_imputation_method_dashboard(
@@ -75,7 +88,7 @@ class ImputationStageRunner(StageRunner["MissingValueImputer", MetaboDataset]):
             # The appendix requires the complete candidate cache and therefore
             # has no meaningful fixed-method equivalent.
             plotter.plot_imputation_nrmse_appendix_dashboard(
-                audit.candidate_results
+                renderable
             )
             if audit.is_auto and audit.has_candidate_cache
             else None

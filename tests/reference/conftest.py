@@ -1,8 +1,8 @@
-"""Configure R only for optional cross-language reference tests.
+"""Configure R only for optional production-backend reference tests.
 
-The reference suite compares Python algorithms with their R counterparts. This
-configuration locates R, prepares rpy2's Windows ABI mode, and quiets R console
-logging without affecting unit or integration test collection.
+The reference suite verifies original-package adapters and backend contracts.
+This configuration locates R, prepares rpy2's Windows ABI mode, and quiets R
+console logging without affecting unit or integration test collection.
 """
 
 import argparse
@@ -13,11 +13,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import pytest
 
-from pimqc.constants import DEFAULT_RANDOM_SEED
+
+# Check the optional Python dependency before resolving or initializing R.
+# In particular, the Windows compatibility import below must not turn an
+# unavailable optional backend into a test-collection error.
+pytest.importorskip(
+    "rpy2", reason="rpy2 is not installed; reference tests are optional."
+)
 
 
 def _resolve_r_home() -> Path:
@@ -40,7 +44,10 @@ def _resolve_r_home() -> Path:
 
     executable = shutil.which("R")
     if executable is None:
-        pytest.skip("R is not installed; reference tests are optional.")
+        pytest.skip(
+            "R is not installed; reference tests are optional.",
+            allow_module_level=True,
+        )
     result = subprocess.run(
         [executable, "RHOME"],
         check=True,
@@ -91,30 +98,9 @@ else:
 try:
     from rpy2.rinterface_lib.callbacks import logger as rpy2_logger
 except ImportError:
-    pytest.skip("rpy2 is not installed; reference tests are optional.")
+    pytest.skip(
+        "rpy2 is not installed; reference tests are optional.",
+        allow_module_level=True,
+    )
 
 rpy2_logger.setLevel(logging.ERROR)
-
-
-@pytest.fixture
-def mock_ms_data() -> pd.DataFrame:
-    """Generate deterministic heteroscedastic data for R normalization tests."""
-    rng = np.random.default_rng(DEFAULT_RANDOM_SEED)
-    feature_count, sample_count = 500, 20
-    base_signal = np.logspace(2, 5, feature_count).reshape(-1, 1)
-    multiplicative_noise = base_signal * rng.normal(
-        0.0,
-        0.15,
-        (feature_count, sample_count),
-    )
-    additive_noise = rng.normal(50.0, 10.0, (feature_count, sample_count))
-    values = base_signal + multiplicative_noise + additive_noise
-
-    missing_count = int(values.size * 0.25)
-    missing_indices = rng.choice(values.size, size=missing_count, replace=False)
-    values.flat[missing_indices] = np.nan
-    return pd.DataFrame(
-        values,
-        index=[f"Met_{index + 1}" for index in range(feature_count)],
-        columns=[f"Sample_{index + 1}" for index in range(sample_count)],
-    )

@@ -68,6 +68,7 @@ class FilteringFlowchartMixin:
         compact or full-width Brick without maintaining a second set of edge
         coordinates.
         """
+        df = self._route_tracking(df)
         statuses = df["Stage1_Status"].astype(str)
         total = len(df)
         group_mask = statuses.str.contains("Group", na=False)
@@ -80,7 +81,7 @@ class FilteringFlowchartMixin:
         )
         count_qc = int(qc_mask.sum())
         after_qc = after_group.loc[~qc_mask]
-        count_mar = int((after_qc["Stage1_Status"] == "MAR").sum())
+        count_mar = int((after_qc["Stage1_Status"] == "R-route").sum())
         count_inv = int((after_qc["Stage1_Status"] == "INVALID").sum())
 
         ax.axis("off")
@@ -130,7 +131,7 @@ class FilteringFlowchartMixin:
                     "group_mnar",
                     0.29,
                     0.85,
-                    f"MNAR Group\n(n={count_group})",
+                    f"S-route Group\n(n={count_group})",
                     color_mnar,
                     0.15,
                     0.14,
@@ -155,7 +156,7 @@ class FilteringFlowchartMixin:
                     "qc_mnar",
                     0.50,
                     0.85,
-                    f"MNAR QC\n(n={count_qc})",
+                    f"S-route QC\n(n={count_qc})",
                     color_mnar,
                     0.15,
                     0.14,
@@ -164,7 +165,7 @@ class FilteringFlowchartMixin:
                     "eligibility",
                     0.72,
                     0.50,
-                    "MAR Eligibility\n"
+                    "R-route Eligibility\n"
                     f"Min group MV <= {active_base_tol * 100:.0f}%",
                     color_pass,
                     0.17,
@@ -178,7 +179,7 @@ class FilteringFlowchartMixin:
                     "mar",
                     0.94,
                     0.73,
-                    f"MAR\n(n={count_mar})",
+                    f"R-route\n(n={count_mar})",
                     color_mar,
                     0.12,
                     0.14,
@@ -228,7 +229,7 @@ class FilteringFlowchartMixin:
                     "qc_mnar",
                     0.37,
                     0.85,
-                    f"MNAR QC\n(n={count_qc})",
+                    f"S-route QC\n(n={count_qc})",
                     color_mnar,
                     0.17,
                     0.14,
@@ -246,7 +247,7 @@ class FilteringFlowchartMixin:
                     "mar",
                     0.92,
                     0.73,
-                    f"MAR\n(n={count_mar})",
+                    f"R-route\n(n={count_mar})",
                     color_mar,
                     0.14,
                     0.14,

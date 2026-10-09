@@ -116,10 +116,7 @@ def fit_predict_intra_batch_safely(
         pred_all_full = _run_model(x_qc, y_qc, x_all)
         # Training predictions are not cross-validation evidence.
         pred_qc_oof = np.full(n_qc, np.nan)
-        return (
-            np.clip(pred_all_full, a_min=1e-6, a_max=None),
-            np.clip(pred_qc_oof, a_min=1e-6, a_max=None),
-        )
+        return pred_all_full, pred_qc_oof
 
     kf = KFold(n_splits=safe_folds, shuffle=True, random_state=random_state)
     for train_idx, test_idx in kf.split(x_qc):
@@ -131,10 +128,7 @@ def fit_predict_intra_batch_safely(
 
     pred_all_full = _run_model(x_train=x_qc, y_train=y_qc, x_test=x_all)
 
-    return (
-        np.clip(pred_all_full, a_min=1e-6, a_max=None),
-        np.clip(pred_qc_oof, a_min=1e-6, a_max=None),
-    )
+    return pred_all_full, pred_qc_oof
 
 
 # =============================================================================

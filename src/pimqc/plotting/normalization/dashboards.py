@@ -22,7 +22,9 @@ class NormalizationDashboardMixin:
         title_fontsize: float = pu.DEFAULT_LEGEND_TITLE_FONTSIZE,
         article_compact: bool = False,
         layout_cols: int = 1,
-    ) -> plt.Axes:
+        diagnostic_panels: set[str] | None = None,
+        show_score_components: bool = True,
+    ) -> plt.Axes | None:
         """Draw grouped score-component and stage legends for the dashboard."""
         import matplotlib.lines as mlines
         import matplotlib.patches as mpatches
@@ -103,14 +105,25 @@ class NormalizationDashboardMixin:
             ),
         ]
 
+        legend_groups = []
+        if show_score_components:
+            legend_groups.append(
+                ("Normalization score components", score_handles)
+            )
+        for panel, title, handles in (
+            ("QC_Alignment", "QC RLE alignment stage", rle_handles),
+            ("QC_Variance", "QC variance stabilization stage", variance_handles),
+            ("QC_Structure", "QC structure distance stage", distance_handles),
+        ):
+            if diagnostic_panels is None or panel in diagnostic_panels:
+                legend_groups.append((title, handles))
+        if not legend_groups:
+            ax.set_visible(False)
+            return None
+
         self._plot_grouped_standalone_legends(
             ax=ax,
-            legend_groups=[
-                ("Normalization score components", score_handles),
-                ("QC RLE alignment stage", rle_handles),
-                ("QC variance stabilization stage", variance_handles),
-                ("QC structure distance stage", distance_handles),
-            ],
+            legend_groups=legend_groups,
             loc="upper left",
             start_bbox=(0.0, 1.0),
             row_gap=0.035,
@@ -133,7 +146,12 @@ class NormalizationDashboardMixin:
             )
         return ax
 
-    def plot_normalization_article_legend(self, ax: plt.Axes) -> plt.Axes:
+    def plot_normalization_article_legend(
+        self,
+        ax: plt.Axes,
+        diagnostic_panels: set[str] | None = None,
+        show_score_components: bool = True,
+    ) -> plt.Axes | None:
         """
         Draw an experimental manuscript legend for normalization. This
         revision-oriented interface is excluded from the default pipeline.
@@ -144,7 +162,33 @@ class NormalizationDashboardMixin:
             title_fontsize=pu.ARTICLE_LEGEND_TITLE_FONTSIZE,
             article_compact=True,
             layout_cols=1,
+            diagnostic_panels=diagnostic_panels,
+            show_score_components=show_score_components,
         )
+
+    @staticmethod
+    def _compose_normalization_panels(
+        panels: list[object], max_columns: int
+    ) -> object | None:
+        """Pack available panels into rows without empty placeholder bricks."""
+        if not panels:
+            return None
+        if len(panels) == 1:
+            import patchworklib as pw
+
+            return pw.Bricks({panels[0].get_label(): panels[0]})
+        row_count = (len(panels) + max_columns - 1) // max_columns
+        column_count = (len(panels) + row_count - 1) // row_count
+        rows = []
+        for start in range(0, len(panels), column_count):
+            row = panels[start]
+            for panel in panels[start + 1 : start + column_count]:
+                row = row | panel
+            rows.append(row)
+        dashboard = rows[0]
+        for row in rows[1:]:
+            dashboard = dashboard / row
+        return dashboard
 
     def plot_normalization_dashboard(self) -> object | None:
         """
@@ -160,137 +204,89 @@ class NormalizationDashboardMixin:
 
         auto_summary = self.payload.selection.get("candidate_results")
         is_auto = bool(auto_summary)
-
-        if is_auto:
-            layout_width = 13.7
-            ax_auto = self.plot_normalization_score_summary(
-                auto_summary=auto_summary,
-                figsize=pu.dashboard_brick_size(6.2, 4.0, layout_width),
-                show_legend=False,
+        layout_width = 13.7 if is_auto else 8.0
+        panel_size = (
+            pu.dashboard_brick_size(3.0, 4.0, layout_width)
+            if is_auto
+            else pu.dashboard_brick_size(
+                4.0,
+                4.0,
+                layout_width,
+                target_width=pu.TWO_BY_TWO_DASHBOARD_TARGET_WIDTH_IN,
             )
-            if ax_auto is None:
-                ax_auto = pw.Brick(
-                    figsize=pu.dashboard_brick_size(4.5, 4.0, layout_width),
-                    label="Auto_Score_Spacer",
+        )
+        diagnostics = {}
+        for label, draw in (
+            ("QC_Alignment", self._plot_qc_rle_boxplot),
+            ("QC_Variance", self._plot_qc_variance_stabilization),
+            ("QC_Structure", self._plot_qc_structure_improvement),
+            ("Sample_Structure", self._plot_sample_structure_preservation),
+        ):
+            panel = pw.Brick(figsize=panel_size, label=label)
+            if label == "Sample_Structure":
+                result = draw(ax_geom=panel, compact_style=True)
+            else:
+                result = draw(
+                    ax=panel, show_legend=not is_auto, article_compact=True
                 )
-                ax_auto.axis("off")
+            if result is not None:
+                diagnostics[label] = panel
 
-            ax_scorecard = pw.Brick(
-                figsize=pu.dashboard_brick_size(4.9, 4.0, layout_width),
-                label="Norm_Preservation_Scorecard",
-            )
-            self.plot_normalization_preservation_scorecard(
-                auto_summary=auto_summary,
-                ax=ax_scorecard,
-            )
-            ax_legend = pw.Brick(
-                figsize=pu.dashboard_brick_size(2.6, 4.0, layout_width),
-                label="normalization_dashboard_legend",
-            )
-            self.plot_normalization_dashboard_legend(ax=ax_legend)
-            row1 = ax_auto | ax_scorecard | ax_legend
-
-            ax_qc_variance = pw.Brick(
-                figsize=pu.dashboard_brick_size(3.0, 4.0, layout_width),
-                label="QC_Variance",
-            )
-            self._plot_qc_variance_stabilization(
-                ax=ax_qc_variance,
-                show_legend=False,
-                article_compact=True,
-            )
-            ax_qc_structure = pw.Brick(
-                figsize=pu.dashboard_brick_size(3.0, 4.0, layout_width),
-                label="QC_Structure",
-            )
-            self._plot_qc_structure_improvement(
-                ax=ax_qc_structure,
-                show_legend=False,
-                article_compact=True,
-            )
-            ax_sample_structure = pw.Brick(
-                figsize=pu.dashboard_brick_size(3.0, 4.0, layout_width),
-                label="Sample_Structure",
-            )
-            self._plot_sample_structure_preservation(
-                ax_geom=ax_sample_structure, compact_style=True
-            )
-            ax_qc_alignment = pw.Brick(
-                figsize=pu.dashboard_brick_size(3.0, 4.0, layout_width),
-                label="QC_Alignment",
-            )
-            self._plot_qc_rle_boxplot(
-                ax=ax_qc_alignment,
-                show_legend=False,
-                article_compact=True,
-            )
-            row2 = (
-                ax_qc_alignment
-                | ax_qc_variance
-                | ax_qc_structure
-                | ax_sample_structure
+        if not is_auto:
+            return self._compose_normalization_panels(
+                list(diagnostics.values()), max_columns=2
             )
 
-            return row1 / row2
+        summary_panels = []
+        ax_auto = self.plot_normalization_score_summary(
+            auto_summary=auto_summary,
+            figsize=pu.dashboard_brick_size(6.2, 4.0, layout_width),
+            show_legend=False,
+        )
+        if ax_auto is not None:
+            summary_panels.append(ax_auto)
 
-        layout_width = 8.0
-        target_width = pu.TWO_BY_TWO_DASHBOARD_TARGET_WIDTH_IN
-        ax_qc_alignment = pw.Brick(
-            figsize=pu.dashboard_brick_size(
-                4.0,
-                4.0,
-                layout_width,
-                target_width=target_width,
-            ),
-            label="QC_Alignment",
+        ax_scorecard = pw.Brick(
+            figsize=pu.dashboard_brick_size(4.9, 4.0, layout_width),
+            label="Norm_Preservation_Scorecard",
         )
-        self._plot_qc_rle_boxplot(ax=ax_qc_alignment, article_compact=True)
-        ax_qc_variance = pw.Brick(
-            figsize=pu.dashboard_brick_size(
-                4.0,
-                4.0,
-                layout_width,
-                target_width=target_width,
-            ),
-            label="QC_Variance",
+        scorecard = self.plot_normalization_preservation_scorecard(
+            auto_summary=auto_summary, ax=ax_scorecard
         )
-        self._plot_qc_variance_stabilization(
-            ax=ax_qc_variance, article_compact=True
-        )
-        row1 = ax_qc_alignment | ax_qc_variance
+        if scorecard is not None and ax_scorecard.axison:
+            summary_panels.append(ax_scorecard)
+        else:
+            ax_scorecard.set_visible(False)
 
-        ax_qc_structure = pw.Brick(
-            figsize=pu.dashboard_brick_size(
-                4.0,
-                4.0,
-                layout_width,
-                target_width=target_width,
-            ),
-            label="QC_Structure",
+        ax_legend = pw.Brick(
+            figsize=pu.dashboard_brick_size(2.6, 4.0, layout_width),
+            label="normalization_dashboard_legend",
         )
-        self._plot_qc_structure_improvement(
-            ax=ax_qc_structure, article_compact=True
-        )
-        ax_sample_structure = pw.Brick(
-            figsize=pu.dashboard_brick_size(
-                4.0,
-                4.0,
-                layout_width,
-                target_width=target_width,
-            ),
-            label="Sample_Structure",
-        )
-        self._plot_sample_structure_preservation(
-            ax_geom=ax_sample_structure, compact_style=True
-        )
-        row2 = ax_qc_structure | ax_sample_structure
+        if self.plot_normalization_dashboard_legend(
+            ax=ax_legend,
+            diagnostic_panels=set(diagnostics),
+            show_score_components=ax_auto is not None,
+        ) is not None:
+            summary_panels.append(ax_legend)
 
-        return row1 / row2
+        summary_row = self._compose_normalization_panels(
+            summary_panels, max_columns=3
+        )
+        diagnostic_row = self._compose_normalization_panels(
+            list(diagnostics.values()), max_columns=4
+        )
+        if summary_row is None:
+            return diagnostic_row
+        if diagnostic_row is None:
+            return summary_row
+        return summary_row / diagnostic_row
 
     def plot_normalization_article_dashboard(self) -> object | None:
-        """Create an experimental AUTO normalization manuscript panel.
+        """Show AUTO selection and available score-aligned diagnostics.
 
-        This revision-oriented interface is excluded from the default pipeline.
+        Two rows retain readable article typography: selection, QC RLE and
+        shared legends above QC variance, QC structure and sample preservation.
+        All diagnostics consume saved 1.5 payloads without fitting new models.
         """
         try:
             import patchworklib as pw
@@ -305,72 +301,83 @@ class NormalizationDashboardMixin:
             return None
 
         pw.clear()
-        panel_height = pu.ARTICLE_PANEL_HEIGHT_IN
+        # Three columns avoid squeezing six panels into one manuscript row.
+        # The shared finalizer sets the total width without shrinking fonts.
+        panel_height = max(pu.ARTICLE_PANEL_HEIGHT_IN, 2.1)
+        panel_size = pu.article_brick_size(1.72, panel_height)
 
         summary_ax = self.plot_normalization_score_summary(
             auto_summary=auto_summary,
-            figsize=pu.article_brick_size(1.42, panel_height),
+            figsize=panel_size,
             show_legend=False,
         )
-        if summary_ax is None:
-            summary_ax = pw.Brick(
-                figsize=pu.article_brick_size(1.42, panel_height),
-                label="article_normalization_summary",
+        if summary_ax is not None:
+            self._apply_article_panel_format(
+                summary_ax,
+                title="AUTO Normalization\nMethod Selection",
             )
-            summary_ax.axis("off")
-        self._apply_article_panel_format(
-            summary_ax,
-            title="Auto Normalization Method Selection",
-        )
 
-        rle_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.20, panel_height),
-            label="article_normalization_rle",
-        )
-        self._plot_qc_rle_boxplot(
-            ax=rle_ax,
-            show_legend=False,
-            article_compact=True,
-        )
-        self._apply_article_panel_format(
-            rle_ax,
-            title="QC RLE\nAlignment Change",
-        )
-
-        variance_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.20, panel_height),
-            label="article_normalization_variance",
-        )
-        self._plot_qc_variance_stabilization(
-            ax=variance_ax,
-            show_legend=False,
-            article_compact=True,
-        )
-        self._apply_article_panel_format(
-            variance_ax,
-            title="QC Variance Stabilization",
-        )
-        variance_ax.set_xlabel("Mean QC log2 Intensity")
-        variance_ax.set_ylabel("QC dispersion")
-
-        structure_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.20, panel_height),
-            label="article_normalization_structure",
-        )
-        self._plot_qc_structure_improvement(
-            ax=structure_ax,
-            show_legend=False,
-            article_compact=True,
-        )
-        self._apply_article_panel_format(
-            structure_ax,
-            title="QC Structure Distance Change",
-        )
-        structure_ax.set_ylabel("QC distance (log scale)")
+        diagnostics = {}
+        for key, label, title, draw in (
+            (
+                "QC_Alignment",
+                "article_normalization_rle",
+                "QC RLE\nAlignment Change",
+                self._plot_qc_rle_boxplot,
+            ),
+            (
+                "QC_Variance",
+                "article_normalization_variance",
+                "QC Variance\nStabilization",
+                self._plot_qc_variance_stabilization,
+            ),
+            (
+                "QC_Structure",
+                "article_normalization_structure",
+                "QC Structure\nDistance Change",
+                self._plot_qc_structure_improvement,
+            ),
+            (
+                "Sample_Structure",
+                "article_normalization_sample_structure",
+                "Sample Structure\nPreservation",
+                self._plot_sample_structure_preservation,
+            ),
+        ):
+            panel = pw.Brick(figsize=panel_size, label=label)
+            if key == "Sample_Structure":
+                result = draw(ax_geom=panel, compact_style=True)
+            else:
+                result = draw(ax=panel, show_legend=False, article_compact=True)
+            if result is None:
+                continue
+            self._apply_article_panel_format(panel, title=title)
+            if key == "QC_Structure":
+                panel.set_ylabel("QC distance (log scale)")
+            diagnostics[key] = panel
 
         legend_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.30, panel_height),
+            figsize=panel_size,
             label="article_normalization_legend",
         )
-        self.plot_normalization_article_legend(ax=legend_ax)
-        return summary_ax | rle_ax | variance_ax | structure_ax | legend_ax
+        legend = self.plot_normalization_article_legend(
+            ax=legend_ax,
+            diagnostic_panels=set(diagnostics),
+            show_score_components=summary_ax is not None,
+        )
+        panels = [
+            panel
+            for panel in (
+                summary_ax,
+                diagnostics.get("QC_Alignment"),
+                legend,
+                diagnostics.get("QC_Variance"),
+                diagnostics.get("QC_Structure"),
+                diagnostics.get("Sample_Structure"),
+            )
+            if panel is not None
+        ]
+        dashboard = self._compose_normalization_panels(panels, max_columns=3)
+        if dashboard is None:
+            return None
+        return self._finalize_article_dashboard(dashboard)

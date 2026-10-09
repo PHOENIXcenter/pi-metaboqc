@@ -231,6 +231,35 @@ def weighted_mean_score(
     return float(weighted_sum / weight_sum)
 
 
+def fixed_weighted_mean_score(
+    score_weights: list[tuple[float, float]],
+    clip_values: bool = True,
+) -> float:
+    """Score against the planned denominator without rewarding omissions.
+
+    Descriptive summaries may renormalize over available components, but
+    AUTO selection must penalize an unavailable component while retaining its
+    planned weight.  ``nan`` is returned only when no component is finite.
+    """
+    weighted_sum = 0.0
+    planned_weight = 0.0
+    finite_count = 0
+    for score, weight in score_weights:
+        if weight <= 0:
+            continue
+        planned_weight += weight
+        score_val = finite_or_nan(score)
+        if not np.isfinite(score_val):
+            continue
+        finite_count += 1
+        if clip_values:
+            score_val = float(np.clip(score_val, 0.0, 1.0))
+        weighted_sum += score_val * weight
+    if planned_weight <= 0 or finite_count == 0:
+        return float("nan")
+    return float(weighted_sum / planned_weight)
+
+
 def relative_change_lower_better(before: object, after: object) -> float:
     """Return relative before-to-after change for a lower-is-better metric."""
     before_val = finite_or_nan(before)

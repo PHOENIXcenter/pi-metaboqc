@@ -160,7 +160,7 @@ def run_pipeline(
     # samples are screened by sample-level missingness; Blank and other
     # non-target roles remain intact. Second, the retained sample matrix is
     # evaluated for global, pooled-QC, and biological-group missingness.
-    # Feature routing applies MAR eligibility, group/QC MNAR rescue, or
+    # Feature routing applies R-route eligibility, group/QC S-route rescue, or
     # exclusion. The independent sample and feature Audits retain counts,
     # reasons, thresholds, and plot payloads. The complete feature tracking
     # table is reused later by quality filtering and imputation.
@@ -188,7 +188,7 @@ def run_pipeline(
     # QA-Step 02: Quality Assessment of High-MV Filtered Data
     # **Evaluation Logic**:
     # Compares the post-filter matrix with the raw baseline to reveal the
-    # effect of sample attrition and MAR/MNAR routing on QC consistency, RSD,
+    # effect of sample attrition and R/S routing on QC consistency, RSD,
     # PCA geometry, multivariate outliers, and reference-feature behaviour.
     # Filtering labels and attrition reasons remain authoritative in the
     # preceding processing Audits; this checkpoint describes only the state
@@ -259,10 +259,10 @@ def run_pipeline(
     # =========================================================================
     # Step 04: Low-Quality Feature Filtering
     # **Purpose & Function**:
-    # Uses the previous pass's explicit MAR/MNAR labels. It first removes
+    # Uses the previous pass's explicit R/S-route labels. It first removes
     # features whose mean Blank/QC ratio exceeds its tolerance, then removes
-    # technically irreproducible MAR features whose pooled-QC RSD exceeds its
-    # tolerance. MNAR features are exempt from the RSD screen; both checks and
+    # technically irreproducible R-route features whose QC RSD exceeds its
+    # tolerance. S-route features bypass the RSD screen; both checks and
     # their drop reasons are retained in the StageResult audit table.
     # =========================================================================
     logger.info("Step 04: Low-Quality Feature Filtering...")
@@ -301,9 +301,9 @@ def run_pipeline(
     # =========================================================================
     # Step 05: Missing Value Imputation
     # **Purpose & Function**:
-    # Applies label-aware routes to non-Blank samples. MNAR features use QRILC
-    # or row-, column-, or global LOD-fraction constants. MAR features use
-    # KNN, LLS, BPCA, MinProb, Median, or `Auto`; Auto benchmarks the MAR
+    # Applies operational routes to non-Blank samples. S-route uses QRILC
+    # or row-, column-, or global low-value constants. R-route uses
+    # KNN, LLS, BPCA, MinProb, Median, or `Auto`; Auto benchmarks reconstruction
     # candidates with stratified masking, reconstruction/distribution metrics,
     # and sample-structure preservation before applying the selected method.
     # Blank columns are preserved without imputation, and the stage records a

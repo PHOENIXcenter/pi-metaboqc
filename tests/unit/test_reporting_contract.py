@@ -164,8 +164,8 @@ def test_reporter_renders_markdown_from_report_input(tmp_path: Path) -> None:
     assert "MV_Classification_Dashboard.svg" in comprehensive
     assert "Missing-Value Classification Dashboard" in comprehensive
     assert "MV_Feature_Classification_Dashboard.svg" not in comprehensive
-    assert "**Imputation of MNAR Features**\n\nFor" in comprehensive
-    assert "**Configured MAR Imputation Method**\n\nFor" in comprehensive
+    assert "**Imputation of S-route Features**\n\nFor" in comprehensive
+    assert "**Configured R-route Imputation Method**\n\nFor" in comprehensive
     assert "Jensen-Shannon distance of **0.125**" in comprehensive
     assert "normalized Wasserstein distance of **0.375**" in comprehensive
 
@@ -191,7 +191,7 @@ def test_skipped_mv_and_mnar_only_reports_omit_unproduced_figures(
     assert "MV_Classification_Dashboard.svg" not in text
     assert "Imputation_Dashboard_" not in text
     assert "Imputation_Candidate_Dashboard_" not in text
-    assert "Automatic MAR Imputation Selection" not in text
+    assert "Automatic R-route Imputation Selection" not in text
 
 
 def test_missing_pandoc_never_downloads_or_installs(tmp_path, monkeypatch):
@@ -222,10 +222,10 @@ def test_partial_markdown_generation_cannot_claim_export_success(
     reporter.generate_markdown(_report_input(), report_folder="report")
     original = reporter.env.get_template
 
-    def template(name):
+    def template(name, *args, **kwargs):
         if "brief" in name:
             raise ValueError("Broken template")
-        return original(name)
+        return original(name, *args, **kwargs)
 
     monkeypatch.setattr(reporter.env, "get_template", template)
     monkeypatch.setattr(reporter, "_debug_template_errors", lambda *args: None)
@@ -281,7 +281,7 @@ def test_all_comprehensive_tables_have_pandoc_captions(
     )
 
     assert "Table: Correction Candidate Comparison" in comprehensive
-    assert "Table: MAR Imputation Candidate Comparison" in comprehensive
+    assert "Table: R-route Imputation Candidate Comparison" in comprehensive
     assert "Table: Normalization Candidate Comparison" in comprehensive
     lines = comprehensive.splitlines()
     table_count = sum(
@@ -348,13 +348,13 @@ def test_imputation_dashboards_follow_selection_evidence(
         encoding="utf-8"
     )
     assert comprehensive.index("Masked-Value Distribution Fidelity") < (
-        comprehensive.index("MAR Imputation Candidate Comparison")
+        comprehensive.index("R-route Imputation Candidate Comparison")
     )
-    assert comprehensive.index("MAR Imputation Candidate Comparison") < (
-        comprehensive.index("MAR Imputation Dashboard: KNN")
+    assert comprehensive.index("R-route Imputation Candidate Comparison") < (
+        comprehensive.index("R-route Imputation Dashboard: KNN")
     )
-    assert comprehensive.index("MAR Imputation Candidate Dashboard") < (
-        comprehensive.index("MAR Imputation Dashboard: KNN")
+    assert comprehensive.index("R-route Imputation Candidate Dashboard") < (
+        comprehensive.index("R-route Imputation Dashboard: KNN")
     )
     assert "Imputation_Candidate_Dashboard_KNN.svg" in comprehensive
     assert "KNN (selected)" in comprehensive
@@ -437,4 +437,64 @@ def test_reporter_does_not_render_missing_metrics_as_zero(
     assert "QC RSD metrics are unavailable" in brief
     assert "without a reportable QC RSD summary" in comprehensive
     assert "0.000e+00" not in comprehensive
-    assert "structural scale factor of **N/A**" in comprehensive
+    assert "geometric mean of sample slopes" in comprehensive
+    assert "Optimization convergence was not recorded" in comprehensive
+    assert "structural scale factor" not in comprehensive
+
+
+@pytest.mark.parametrize("kind", ["Brief", "Comprehensive"])
+def test_report_names_vsn_rsd_view_without_claiming_raw_inverse(tmp_path, kind):
+    """Label the positive VSN RSD view without calling it a raw-intensity
+    inverse.
+    """
+    report = _report_input()
+    distribution = {
+        "qc": {"0-10%": 2, ">30%": 1},
+        "actual": {"0-10%": 1, ">30%": 2},
+    }
+    report.qa_metrics["raw_dataset"].update(
+        rsd_distribution=distribution,
+        rsd_evaluation={
+            "qc": {
+                "input_scale": "raw_positive",
+                "evaluation_scale": "raw intensity",
+            }
+        },
+    )
+    report.qa_metrics["normalization"] = {
+        "rsd_distribution": distribution,
+        "rsd_evaluation": {
+            "qc": {
+                "input_scale": "vsn_glog",
+                "evaluation_scale": (
+                    "exponentiated VSN diagnostic (not raw inverse)"
+                ),
+            }
+        },
+    }
+    NarrativeStatsReporter(base_dir=str(tmp_path)).generate_markdown(
+        report, report_folder="report"
+    )
+    text = (tmp_path / "report" / f"Report_{kind}.md").read_text("utf-8")
+    assert "exponentiated VSN diagnostic (not raw inverse)" in text
+    assert "not a direct precision" in text
+    assert "consistent with preservation" not in text
+
+
+def test_report_handles_correction_gaps_on_mnar_only_features(tmp_path):
+    """Report correction-created gaps when only the low-detection route
+    remains.
+    """
+    report = _report_input()
+    imputation = report.pipeline_metrics["missing_value_imputation"]
+    imputation["feature_distribution"] = {"mar_count": 0, "mnar_count": 2}
+    imputation["missingness_routing"] = {"correction_reconstruction_count": 3}
+    imputation["selection"]["benchmark_available"] = False
+    NarrativeStatsReporter(base_dir=str(tmp_path)).generate_markdown(
+        report, report_folder="report"
+    )
+    text = (tmp_path / "report" / "Report_Comprehensive.md").read_text("utf-8")
+    assert "introduced **3** missing intensity cells" in text
+    assert "not automatically assigned a lower-tail imputation strategy" in text
+    assert "Imputation_Dashboard_" not in text
+    assert "Imputation_Candidate_Dashboard_" not in text

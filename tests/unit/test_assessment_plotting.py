@@ -11,6 +11,27 @@ from pimqc.plotting import plot_utils as pu
 from pimqc.plotting.payloads import AssessmentPlotPayload
 
 
+def test_rsd_label_uses_payload_value_scale_without_recalculation():
+    """Signed VSN coordinates use an explicitly named positive diagnostic."""
+    from tests.unit.test_saved_diagnostics import _dataset
+
+    dataset = _dataset()
+    dataset = dataset.with_intensity(
+        dataset.intensity,
+        context_updates={"extra_attrs": {"value_scale": "vsn_glog"}},
+    )
+    plotter = AssessmentPlotter(AssessmentPlotPayload(
+        data=dataset, is_multi_batch=False,
+    ))
+    figure = plotter.plot_rsd_bar(
+        {"qc": {"0-10%": 1}, "actual": {">30%": 2}}, "QC", "Sample"
+    )
+    try:
+        assert "VSN exp2 diagnostic view" in figure.axes[0].get_xlabel()
+    finally:
+        plt.close(figure)
+
+
 def _assert_standard_heatmap_colorbar_edge(colorbar_ax) -> None:
     """Check the visible colorbar outline against the heatmap grid style."""
     outline = colorbar_ax.spines["outline"]

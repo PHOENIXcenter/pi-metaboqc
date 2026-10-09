@@ -14,6 +14,7 @@ import pandas as pd
 import seaborn as sns
 from matplotlib.patches import Patch
 
+from ...statistics.value_scale import resolve_value_scale
 from .. import annotation_layout as al
 from .. import plot_utils as pu
 
@@ -212,10 +213,21 @@ class AssessmentOutlierMixin:
             rsd_title, append_stage = self._panel_title(
                 "Feature RSD Distribution", title_mode
             )
+            scale = resolve_value_scale(getattr(self, "attrs", {}))
+            scale_label = {
+                "raw_positive": "raw intensity",
+                "log2": "inverse log2 intensity",
+                "log2p1": "inverse log2p1 intensity",
+                "vsn_glog": "VSN exp2 diagnostic view",
+                "centered_scaled": "centered/scaled values",
+            }.get(scale)
+            xlabel = "RSD Bin"
+            if scale_label:
+                xlabel = f"RSD Bin\n({scale_label})"
             self._apply_standard_format(
                 ax=current_ax,
                 title=rsd_title,
-                xlabel="RSD Bin",
+                xlabel=xlabel,
                 ylabel="Feature Count",
                 append_stage=append_stage,
             )

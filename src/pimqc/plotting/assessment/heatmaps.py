@@ -486,8 +486,10 @@ class AssessmentHeatmapMixin:
         ax_heatmap.set_xticklabels(
             x_tick_labels,
             rotation=x_rot,
-            ha="center" if x_rot in {0, 90} else "right",
-            va="top",
+            # With anchor rotation, right/center puts the end of a vertical
+            # label below its tick instead of centering half inside the cells.
+            ha="center" if x_rot == 0 else "right",
+            va="center" if x_rot == 90 else "top",
             fontsize=x_tick_size,
             rotation_mode="anchor",
         )
@@ -745,8 +747,8 @@ class AssessmentHeatmapMixin:
         current_ax.set_xticklabels(
             x_tick_labels,
             rotation=x_rot,
-            ha="center" if x_rot in {0, 90} else "right",
-            va="top",
+            ha="center" if x_rot == 0 else "right",
+            va="center" if x_rot == 90 else "top",
             fontsize=x_tick_size,
             rotation_mode="anchor",
         )

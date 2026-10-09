@@ -70,7 +70,7 @@ def test_tutorial_report_cell_uses_current_api(correction_names, tmp_path):
         "OUTPUT_DIR": tmp_path,
         "EXPORT_PDF": False,
         "datetime": datetime,
-        "pimqc": SimpleNamespace(__version__="1.4.0"),
+        "pimqc": SimpleNamespace(__version__="test-version"),
         "params": {},
         "raw_dataset": SimpleNamespace(
             dataset_metrics={"input": 12},
@@ -141,7 +141,9 @@ def test_tutorial_explanations_match_selected_methods():
     assert "## Step 02: Missing-Value Filtering\n" in markdown
     assert "two independent actions" not in markdown
     assert 'base_est="Auto"' in markdown
-    assert "MAR features use the selected" in markdown
+    assert "R-route targets use a fixed reconstruction method" in markdown
+    assert "special-handling route (S-route)" in markdown
+    assert "not the R programming language" in markdown
     assert "QRILC" in markdown
     assert 'norm_method="Auto"' in markdown
     assert "patchworklib" in markdown
@@ -157,5 +159,37 @@ def test_tutorial_initialization_documents_developer_and_runtime_context():
     assert "%load_ext autoreload" in code
     assert "%autoreload 2" in code
     assert "pimqc.__version__" in code
-    assert "os.path.join" in code
-    assert "Path(" not in code
+    initialization = next(
+        "".join(cell["source"])
+        for cell in _cells()
+        if cell["cell_type"] == "code"
+        and "pimqc.init(" in "".join(cell["source"])
+    )
+    assert "os.path.join" in initialization
+    assert "Path(" not in initialization
+
+
+def test_tutorial_respects_loaded_configuration():
+    """Use file settings without study-specific parameter or worker caps."""
+    for cell in _cells():
+        if cell["cell_type"] != "code":
+            continue
+        for node in ast.walk(ast.parse(_python_source(cell))):
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.ctx, ast.Store)
+            ):
+                root = node.value
+                while isinstance(root, ast.Subscript):
+                    root = root.value
+                assert not (isinstance(root, ast.Name) and root.id == "params")
+
+
+def test_tutorial_does_not_depend_on_private_manuscript_exports():
+    """Keep the public tutorial independent of author-only figure assembly."""
+    source = "\n".join("".join(cell["source"]) for cell in _cells())
+    for private_marker in (
+        "TEMPORARY ARTICLE DASHBOARD", "EXPORT_ARTICLE_DASHBOARDS",
+        "ARTICLE_FIGURE_DIR", "manuscript_figure_drafts.ipynb",
+    ):
+        assert private_marker not in source

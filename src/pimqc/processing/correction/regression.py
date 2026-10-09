@@ -28,6 +28,7 @@ from .algorithms import (
     _select_batch_loess_spans,
     fit_predict_intra_batch_safely,
 )
+from .rloess import RobustRLSCCorrector
 
 
 class RegressionCorrector:
@@ -73,8 +74,52 @@ class RegressionCorrector:
         batch_array: np.ndarray,
         qc_mask: np.ndarray,
         order_array: np.ndarray,
+        blank_mask: np.ndarray | None = None,
     ) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]:
         """Execute core mathematical fitting using pure arrays and masks."""
+        if self.method in ("LOESS", "LOWESS", "QC-RLSC", "ROBUST QC-RLSC"):
+            robust = self.params.get(
+                "robust", self.params.get("rlsc_robust", True)
+            )
+            if self.method == "ROBUST QC-RLSC":
+                robust = True
+            if robust:
+                if any(
+                    self.params.get(key) is not None
+                    for key in ("robust_iterations", "rlsc_robust_iterations")
+                ):
+                    raise ValueError(
+                        "Use rloess_iterations for MetaNorm rLOESS; "
+                        "legacy robust_iterations is no longer supported."
+                    )
+                engine = RobustRLSCCorrector(
+                    implementation=str(
+                        self.params.get("implementation", "python")
+                    ),
+                    span_selection=str(
+                        self.params.get("rloess_span_selection", "gcv")
+                    ),
+                    span=float(self.params.get("rloess_span", 0.75)),
+                    iterations=int(self.params.get("rloess_iterations", 4)),
+                    cv_folds=int(self.params.get("cv_folds", 5)),
+                    random_state=int(self.params.get(
+                        "global_seed", DEFAULT_RANDOM_SEED
+                    )),
+                    validation_strategy=str(self.params.get(
+                        "qc_validation_strategy", "random"
+                    )),
+                )
+                result = engine.fit_transform(
+                    intensity_df, batch_array, qc_mask, order_array,
+                    blank_mask=blank_mask,
+                )
+                self.provenance = engine.provenance
+                self.diagnostics = engine.diagnostics
+                return result
+        if self.params.get("implementation", "python") != "python":
+            raise ValueError(
+                "R regression is available only for robust QC-RLSC."
+            )
         stages_output = {}
         logger.info(
             "Phase 1: Executing Intra-batch drift correction with "
@@ -99,21 +144,7 @@ class RegressionCorrector:
             if self.method in ("LOESS", "LOWESS", "QC-RLSC"):
                 # Numba execution remains internal
                 loess_span = self.params.get("loess_span", 0.3)
-                robust = bool(
-                    self.params.get(
-                        "robust", self.params.get("rlsc_robust", True)
-                    )
-                )
-                robust_iterations = max(
-                    1,
-                    int(
-                        self.params.get(
-                            "robust_iterations",
-                            self.params.get("rlsc_robust_iterations", 3),
-                        )
-                    ),
-                )
-                max_iter = robust_iterations if robust else 0
+                max_iter = 0
                 cv_folds = self.params.get("cv_folds", 5)
                 seed = self.params.get("global_seed", DEFAULT_RANDOM_SEED)
                 loess_degree = max(
@@ -258,9 +289,24 @@ class RegressionCorrector:
                         [p_oof for _, _, p_oof in results]
                     )
 
-        # Mathematical division with broadcasted QC means
-        pred_df[pred_df <= 0] = np.nan
-        oof_pred_df[oof_pred_df <= 0] = np.nan
+        # Record invalid prediction denominators before discarding them.
+        self.diagnostics = {"invalid_baseline_predictions": {}}
+        for name, predicted in (("full", pred_df), ("oof", oof_pred_df)):
+            values = predicted.to_numpy(dtype=float)
+            invalid = ~np.isfinite(values) | (values <= 0)
+            self.diagnostics["invalid_baseline_predictions"][name] = {
+                "count": int(invalid.sum()),
+                "nonpositive_count": int((values <= 0).sum()),
+                "nonfinite_count": int((~np.isfinite(values)).sum()),
+                "cells": [
+                    {
+                        "feature": str(predicted.index[row]),
+                        "sample": str(predicted.columns[col]),
+                    }
+                    for row, col in zip(*np.where(invalid))
+                ],
+            }
+            predicted.iloc[:, :] = np.where(invalid, np.nan, values)
 
         qc_intensity = intensity_df.loc[:, qc_mask]
         batch_qc_means = qc_intensity.T.groupby(batch_array[qc_mask]).mean().T

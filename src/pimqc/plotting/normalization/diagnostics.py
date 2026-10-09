@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from loguru import logger
 
 from ...statistics import metrics as su
 from .. import annotation_layout as al
@@ -22,13 +23,27 @@ from ..sample_structure import plot_sample_structure_change_map
 class NormalizationDiagnosticsMixin:
     """Render distribution, variance, and structure diagnostics."""
 
+    def _skip_normalization_panel(
+        self, ax: plt.Axes, panel: str, reason: str, *, standalone: bool
+    ) -> None:
+        """Omit unavailable diagnostics without an in-figure error message."""
+        warned = getattr(self, "_warned_normalization_panels", set())
+        key = (panel, reason)
+        if key not in warned:
+            logger.warning("Skipping normalization panel '{}': {}", panel, reason)
+            warned.add(key)
+        self._warned_normalization_panels = warned
+        ax.set_visible(False)
+        if standalone:
+            plt.close(ax.figure)
+
     def _plot_qc_rle_boxplot(
         self,
         ax: plt.Axes | None = None,
         max_points: int = 50000,
         show_legend: bool = True,
         article_compact: bool = False,
-    ) -> plt.Figure | plt.Axes:
+    ) -> plt.Figure | plt.Axes | None:
         """
         Plot QC-sample RLE center offset and spread before/after normalization.
         """
@@ -46,6 +61,7 @@ class NormalizationDiagnosticsMixin:
             record
             for diagnostic in self.payload.qc_diagnostics.values()
             for record in diagnostic.get("rle_records", [])
+            if np.isfinite(su.finite_or_nan(record.get("Value")))
         ]
         pvalues = self.payload.qc_diagnostics.get(
             "After Norm", {}
@@ -165,6 +181,8 @@ class NormalizationDiagnosticsMixin:
                     f"{value:.3f}",
                     ha="center",
                     va=va,
+                    rotation=0,
+                    rotation_mode="anchor",
                     fontsize=pu.DEFAULT_ANNOTATION_FONTSIZE,
                     color=text_color,
                     zorder=4,
@@ -233,16 +251,10 @@ class NormalizationDiagnosticsMixin:
                 if clean_note_lines:
                     annotation_note = "\n".join(clean_note_lines)
         else:
-            current_ax.text(
-                0.5,
-                0.5,
-                "Insufficient QC data",
-                transform=current_ax.transAxes,
-                ha="center",
-                va="center",
-                fontsize=pu.DEFAULT_ANNOTATION_FONTSIZE,
-                bbox=pu.ai_ready_text_bbox(),
-                zorder=10,
+            return self._skip_normalization_panel(
+                current_ax, "QC RLE Alignment Change",
+                "no finite QC RLE summaries are available",
+                standalone=ax is None,
             )
 
         self._apply_standard_format(
@@ -401,7 +413,7 @@ class NormalizationDiagnosticsMixin:
         ax: plt.Axes | None = None,
         show_legend: bool = True,
         article_compact: bool = False,
-    ) -> plt.Figure | plt.Axes:
+    ) -> plt.Figure | plt.Axes | None:
         """Plot QC mean-dispersion dependence before/after normalization."""
         if ax is None:
             fig, current_ax = plt.subplots(
@@ -416,10 +428,15 @@ class NormalizationDiagnosticsMixin:
 
         stage_records = []
         for label, diagnostic in self.payload.qc_diagnostics.items():
-            variance_metrics = diagnostic["variance"]
-            feature_stats = variance_metrics["feature_stats"]
-            trend_df = variance_metrics["trend"]
+            variance_metrics = diagnostic.get("variance", {})
+            feature_stats = variance_metrics.get("feature_stats", pd.DataFrame())
+            trend_df = variance_metrics.get("trend", pd.DataFrame())
             if feature_stats.empty or trend_df.empty:
+                continue
+            trend_df = trend_df.replace([np.inf, -np.inf], np.nan).dropna(
+                subset=["mean_intensity", "dispersion_median"]
+            )
+            if trend_df.empty:
                 continue
 
             stage_records.append(
@@ -431,25 +448,12 @@ class NormalizationDiagnosticsMixin:
             )
 
         if not stage_records:
-            current_ax.text(
-                0.5,
-                0.5,
-                "Insufficient QC data",
-                transform=current_ax.transAxes,
-                ha="center",
-                va="center",
-                fontsize=pu.DEFAULT_ANNOTATION_FONTSIZE,
-                bbox=pu.ai_ready_text_bbox(),
-                zorder=10,
+            return self._skip_normalization_panel(
+                current_ax, "QC Variance Stabilization",
+                "no finite QC mean-dispersion trend is available; scalar "
+                "scores may still be valid with fewer features",
+                standalone=ax is None,
             )
-            self._apply_standard_format(
-                ax=current_ax,
-                title="QC Variance Stabilization",
-                xlabel="Mean QC log2 Intensity",
-                ylabel="QC dispersion",
-                append_stage=False,
-            )
-            return fig if ax is None else current_ax
 
         line_style_map = {
             "Before Norm": {"color": pu.NEUTRAL_COLOR, "linestyle": "--"},
@@ -584,7 +588,7 @@ class NormalizationDiagnosticsMixin:
         max_pair_points: int = 300,
         show_legend: bool = True,
         article_compact: bool = False,
-    ) -> plt.Figure | plt.Axes:
+    ) -> plt.Figure | plt.Axes | None:
         """Plot before/after multivariate QC-distance distributions."""
         if ax is None:
             fig, current_ax = plt.subplots(
@@ -598,8 +602,10 @@ class NormalizationDiagnosticsMixin:
 
         summary_by_stage = {}
         for label, diagnostic in self.payload.qc_diagnostics.items():
-            qc_structure = diagnostic["structure"]
-            distances = qc_structure["qc_centroid_distance"]
+            qc_structure = diagnostic.get("structure", {})
+            distances = qc_structure.get(
+                "qc_centroid_distance", pd.Series(dtype=float)
+            )
             if distances.empty:
                 continue
 
@@ -608,25 +614,11 @@ class NormalizationDiagnosticsMixin:
         before_summary = summary_by_stage.get("Before Norm", {})
         after_summary = summary_by_stage.get("After Norm", {})
         if not before_summary or not after_summary:
-            current_ax.text(
-                0.5,
-                0.5,
-                "Insufficient QC data",
-                transform=current_ax.transAxes,
-                ha="center",
-                va="center",
-                fontsize=pu.DEFAULT_ANNOTATION_FONTSIZE,
-                bbox=pu.ai_ready_text_bbox(),
-                zorder=10,
+            return self._skip_normalization_panel(
+                current_ax, "QC Structure Distance Change",
+                "before/after QC-distance summaries are unavailable",
+                standalone=ax is None,
             )
-            self._apply_standard_format(
-                ax=current_ax,
-                title="QC Structure Distance Change",
-                xlabel="QC distance metric",
-                ylabel="Robust QC distance",
-                append_stage=False,
-            )
-            return fig if ax is None else current_ax
 
         def _clean_distance_series(values: object) -> pd.Series:
             """Convert a stored QC-distance vector to finite numeric values."""
@@ -676,23 +668,11 @@ class NormalizationDiagnosticsMixin:
             if not spec["before"].empty and not spec["after"].empty
         ]
         if not distance_specs:
-            current_ax.text(
-                0.5,
-                0.5,
-                "Insufficient QC-distance data",
-                transform=current_ax.transAxes,
-                ha="center",
-                va="center",
-                fontsize=pu.DEFAULT_ANNOTATION_FONTSIZE,
+            return self._skip_normalization_panel(
+                current_ax, "QC Structure Distance Change",
+                "no finite before/after QC-distance values are available",
+                standalone=ax is None,
             )
-            self._apply_standard_format(
-                ax=current_ax,
-                title="QC Structure Distance Change",
-                xlabel="QC distance metric",
-                ylabel="Robust QC distance",
-                append_stage=False,
-            )
-            return fig if ax is None else current_ax
 
         rng = np.random.default_rng(self.payload.global_seed)
         stage_order = ["Before Norm", "After Norm"]
@@ -893,7 +873,7 @@ class NormalizationDiagnosticsMixin:
         ax_geom: plt.Axes | None = None,
         max_features: int = 5000,
         compact_style: bool = False,
-    ) -> plt.Axes | plt.Figure:
+    ) -> plt.Axes | plt.Figure | None:
         """
         Plot score-aligned sample-structure preservation after normalization.
         """
@@ -901,6 +881,19 @@ class NormalizationDiagnosticsMixin:
             created_fig, ax_geom = plt.subplots(figsize=(4, 4))
         else:
             created_fig = None
+
+        samples = self.payload.sample_structure.get("samples", pd.DataFrame())
+        coordinates = ["scale_shift", "rank_rho"]
+        if (
+            samples.empty
+            or not set(coordinates).issubset(samples.columns)
+            or not np.isfinite(samples[coordinates].to_numpy(dtype=float)).all(axis=1).any()
+        ):
+            return self._skip_normalization_panel(
+                ax_geom, "Sample Structure Change Map",
+                "no finite paired sample-structure coordinates are available",
+                standalone=created_fig is not None,
+            )
 
         plot_sample_structure_change_map(
             ax=ax_geom,

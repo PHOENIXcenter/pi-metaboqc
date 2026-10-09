@@ -19,6 +19,29 @@ from pydantic import (
 from ..constants import DEFAULT_RANDOM_SEED
 
 
+def normalize_imputation_route_options(values):
+    """Accept preferred route options while preserving serialized old keys.
+
+Normalize each input layer before merging, so a constructor/runtime alias
+can override a legacy TOML key without being mistaken for a conflict.
+"""
+    normalized = dict(values)
+    for alias, legacy in (
+        ("r_route_method", "mar_method"),
+        ("s_route_method", "mnar_method"),
+    ):
+        if alias not in normalized:
+            continue
+        value = normalized.pop(alias)
+        if value is None:
+            continue
+        old = normalized.get(legacy)
+        if old is not None and str(old).casefold() != str(value).casefold():
+            raise ValueError(f"Conflicting {alias} and legacy {legacy}.")
+        normalized[legacy] = value
+    return normalized
+
+
 class _StrictConfigModel(BaseModel):
     """Base class that rejects misspelled or legacy configuration fields."""
 
@@ -166,7 +189,7 @@ class FeatureFilterConfig(_StrictConfigModel):
     mv_qc_tol: float = Field(default=0.3, ge=0.0, le=1.0)
     mv_group_tol: float = Field(default=0.5, ge=0.0, le=1.0)
 
-    # MNAR rescue thresholds
+    # S-route rescue thresholds (legacy configuration names retained).
     mnar_group_mv_tol: float = Field(default=0.8, ge=0.0, le=1.0)
     mnar_qc_mv_tol: float = Field(default=0.2, ge=0.0, le=1.0)
     mnar_intensity_pct: float = Field(default=0.1, ge=0.0, le=1.0)
@@ -179,11 +202,14 @@ class FeatureFilterConfig(_StrictConfigModel):
 class SignalCorrectorConfig(_StrictConfigModel):
     """Signal Drift Correction Schema."""
 
+    implementation: Literal["python", "r"] = "python"
     base_est: Literal[
         "QC-SVR",
         "QC-RFSC",
         "QC-RLSC",
+        "robust QC-RLSC",
         "SERRF",
+        "Metanorm-rLOESS",
         "RUV",
         "RUV-III",
         "WaveICA 2.0",
@@ -217,11 +243,11 @@ class SignalCorrectorConfig(_StrictConfigModel):
         default=0.3,
         gt=0.0,
         le=1.0,
-        description="LOESS span fraction for QC-RLSC fits",
+        description="Fixed span for nonrobust QC-RLSC only",
     )
     loess_degree: Literal[1, 2] = Field(
         default=1,
-        description="Local polynomial degree for QC-RLSC LOESS fits",
+        description="Local polynomial degree for nonrobust QC-RLSC only",
     )
     rlsc_span_selection: Literal["fixed", "gcv"] = Field(
         default="fixed",
@@ -254,19 +280,27 @@ class SignalCorrectorConfig(_StrictConfigModel):
 
     rlsc_robust: bool = Field(
         default=True,
-        description="Apply Tukey-bisquare residual reweighting for QC-RLSC",
+        description="Use QC-only MetaNorm rLOESS for robust QC-RLSC",
     )
-    rlsc_robust_iterations: int = Field(
-        default=3,
-        ge=1,
-        description=(
-            "Tukey-bisquare residual-reweighting iterations for robust QC-RLSC"
-        ),
+    rloess_span_selection: Literal["gcv", "fixed"] = Field(
+        default="gcv",
+        description="MetaNorm rLOESS continuous fANCOVA GCV or fixed span",
+    )
+    rloess_span: float = Field(
+        default=0.75, gt=0.0, le=1.0,
+        description="MetaNorm rLOESS span for fixed span selection",
+    )
+    rloess_iterations: int = Field(
+        default=4, ge=1,
+        description="Symmetric LOESS iterations, shared by Python and R",
     )
     rf_n_tree: int = Field(default=500, gt=0, description="Trees for QC-RFSC")
     serrf_n_tree: int = Field(default=100, gt=0, description="Trees for SERRF")
     serrf_corr_features: int = Field(
         default=10, ge=0, description="Correlated features for SERRF"
+    )
+    serrf_r_source: Optional[str] = Field(
+        default=None, description="Local pinned Shiny-SERRF source for R"
     )
     serrf_backend: Literal["threading", "loky"] = Field(
         default="loky",
@@ -285,8 +319,15 @@ class SignalCorrectorConfig(_StrictConfigModel):
     ruv_k: int = Field(
         default=5, gt=0, description="K-factors to remove for RUV-III"
     )
+    ruv_control_features: Optional[List[str]] = Field(
+        default=None, description="Explicit RUV controls (required for R)"
+    )
+    ruv_replicate_column: Optional[str] = Field(
+        default=None, description="Sample metadata column of technical repeats"
+    )
     waveica_components: int = Field(default=10, gt=0)
     waveica_cutoff: float = Field(default=0.1, ge=0.0, le=1.0)
+    waveica_alpha: float = Field(default=0.0, ge=0.0, le=1.0)
     waveica_levels: Optional[int] = Field(default=None, gt=0)
     waveica_spline_knots: int = Field(default=5, ge=3)
     waveica_max_iter: int = Field(default=1000, gt=0)
@@ -318,6 +359,7 @@ class SignalCorrectorConfig(_StrictConfigModel):
 class DataNormalizerConfig(_StrictConfigModel):
     """Configuration for global normalization."""
 
+    implementation: Literal["python", "r"] = "python"
     norm_method: Literal[
         "Auto",
         "ROBUST_LOG_ONLY",
@@ -337,8 +379,17 @@ class DataNormalizerConfig(_StrictConfigModel):
 
 
 class MissingValueImputerConfig(_StrictConfigModel):
-    """Missing Value Imputation Schema."""
+    """R/S-route settings with historical MAR/MNAR serialization keys."""
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_choices(cls, values):
+        """Accept route-named options before validating method choices."""
+        if isinstance(values, dict):
+            values = normalize_imputation_route_options(values)
+        return super().normalize_choices(values)
+
+    implementation: Literal["python", "r"] = "python"
     mnar_method: Literal["Row-wise", "Column-wise", "Global", "QRILC"] = "QRILC"
     mnar_fraction: float = Field(default=0.5, gt=0.0)
     mar_method: Literal["Auto", "MinProb", "KNN", "LLS", "BPCA", "Median"] = (

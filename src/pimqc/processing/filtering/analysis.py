@@ -1,6 +1,6 @@
 """Missing-value triage and low-quality feature filtering calculations.
 
-FeatureFilter removes high-missing samples, classifies features as MAR, MNAR,
+FeatureFilter removes high-missing samples, assigns R-route, S-route,
 or invalid, applies biological-group and QC rescue rules, then filters features
 by blank-to-QC abundance and QC RSD. It stores retained indices and tracking
 tables required by imputation, assessment, and reporting.
@@ -17,6 +17,7 @@ from typing import Dict, Any, Optional
 
 from ...runtime import log_execution_time
 from ...core import DatasetProcessor, MetaboDataset
+from ...core.routes import R_ROUTE, S_ROUTE, routes_from_metadata
 from ...config import resolve_stage_config
 from ...plotting.payloads import FilteringPlotPayload, snapshot_dataset
 from ..audit import (
@@ -92,9 +93,9 @@ class FeatureFilter(DatasetProcessor):
             mv_global_tol: Max missing rate across all retained samples.
             mv_group_tol: Base missing rate tolerance within bio groups.
             mv_qc_tol: Base missing rate tolerance in QC samples.
-            mnar_group_mv_tol: Max missing rate for group MNAR rescue.
-            mnar_qc_mv_tol: Max missing rate for QC MNAR rescue.
-            mnar_intensity_pct: Intensity percentile threshold for MNAR QC.
+            mnar_group_mv_tol: Legacy name for the S-route group threshold.
+            mnar_qc_mv_tol: Legacy S-route QC missingness threshold name.
+            mnar_intensity_pct: Legacy name for the S-route QC intensity cutoff.
             qc_rsd_tol: Max relative standard deviation in QC.
             blank_qc_ratio_tol: Max allowable blank to QC intensity ratio.
         """
@@ -145,7 +146,10 @@ class FeatureFilter(DatasetProcessor):
 
     def _audit_snapshot(self) -> dict[str, Any]:
         """Copy runtime audit values into the explicit stage result."""
-        return copy.deepcopy(self.stats)
+        snapshot = copy.deepcopy(self.stats)
+        snapshot["idx_r_route"] = snapshot.get("idx_mar", pd.Index([]))
+        snapshot["idx_s_route"] = snapshot.get("idx_mnar", pd.Index([]))
+        return snapshot
 
     # =========================================================================
     # Sample-Level Filtering
@@ -281,18 +285,28 @@ class FeatureFilter(DatasetProcessor):
         return valid_bio_groups
 
     def classify_missing_types(self) -> tuple[pd.Index, pd.Index, pd.Index]:
-        """Classifies features with strict QC enforcement and dynamic tol."""
+        """Compatibility alias for operational route assignment."""
+        return self.classify_imputation_routes()
+
+    def classify_imputation_routes(self) -> tuple[pd.Index, pd.Index, pd.Index]:
+        """Return reconstruction, special-handling, and rejected feature IDs.
+
+        Detection patterns, group information and QC intensity determine the
+        routes. They do not infer statistical missingness mechanisms.
+        """
         total_missing = self.frame.isna().sum().sum()
         empty_idx = self.frame.index[:0]
         if total_missing == 0:
             logger.info(
-                "No missing values detected. Missingness classification is "
+                "No missing values detected. Imputation routing is "
                 "not required."
             )
             self.stats.update(
                 {
                     "idx_mar": empty_idx,
                     "idx_mnar": empty_idx,
+                    "idx_r_route": empty_idx,
+                    "idx_s_route": empty_idx,
                     "idx_mnar_group": empty_idx,
                     "idx_mnar_qc": empty_idx,
                     "idx_dropped_stage1": empty_idx,
@@ -388,6 +402,8 @@ class FeatureFilter(DatasetProcessor):
                 {
                     "idx_mar": idx_mar,
                     "idx_mnar": idx_mnar_all,
+                    "idx_r_route": idx_mar,
+                    "idx_s_route": idx_mnar_all,
                     "idx_mnar_group": idx_mnar_group,
                     "idx_mnar_qc": idx_mnar_qc,
                     "idx_dropped_stage1": idx_dropped,
@@ -499,7 +515,7 @@ class FeatureFilter(DatasetProcessor):
         )
 
         if missing_values_detected:
-            idx_mar, idx_mnar, idx_dropped = self.classify_missing_types()
+            idx_mar, idx_mnar, idx_dropped = self.classify_imputation_routes()
             retained_idx = idx_mar.union(idx_mnar)
             df_final = self.frame.loc[retained_idx].copy(deep=True)
 
@@ -510,6 +526,10 @@ class FeatureFilter(DatasetProcessor):
             ].copy()
             feature_metadata["missingness_type"] = "MAR"
             feature_metadata.loc[idx_mnar, "missingness_type"] = "MNAR"
+            # The canonical column drives downstream processing; retain the
+            # historical aliases for older clients and saved-dataset readers.
+            feature_metadata["imputation_route"] = R_ROUTE
+            feature_metadata.loc[idx_mnar, "imputation_route"] = S_ROUTE
             feature_metadata["mnar_group_rescued"] = (
                 feature_metadata.index.isin(idx_mnar_group)
             )
@@ -679,17 +699,17 @@ class FeatureFilter(DatasetProcessor):
             elif feat in idx_dropped:
                 status, reason, sort_order = "INVALID", "Fail MV rules", 0
             elif feat in idx_mar:
-                status, reason, sort_order = "MAR", "Health passed", 1
+                status, reason, sort_order = R_ROUTE, "Health passed", 1
             elif feat in idx_mnar_group and feat in idx_mnar_qc:
                 status, reason, sort_order = (
-                    "MNAR (Group & QC)",
+                    "S-route (Group & QC)",
                     "Dual rescue",
                     2,
                 )
             elif feat in idx_mnar_group:
-                status, reason, sort_order = "MNAR (Group)", "Group pass", 3
+                status, reason, sort_order = "S-route (Group)", "Group pass", 3
             elif feat in idx_mnar_qc:
-                status, reason, sort_order = "MNAR (QC)", "QC pass", 4
+                status, reason, sort_order = "S-route (QC)", "QC pass", 4
             else:
                 status, reason, sort_order = "Unknown", "Logic gap", 5
 
@@ -807,6 +827,8 @@ class FeatureFilter(DatasetProcessor):
                 "mnar_qc_mv_tol": self.config.get("mnar_qc_mv_tol", 0.2),
             },
             "missing_classification": {
+                "r_route_count": int(len(idx_mar)),
+                "s_route_count": int(len(idx_mnar)),
                 "mar_count": int(len(idx_mar)),
                 "mnar_total": int(len(idx_mnar)),
                 "mnar_group": int(len(idx_mnar_group)),
@@ -835,32 +857,28 @@ class FeatureFilter(DatasetProcessor):
 
         The quality stage is intentionally runnable without a preceding
         missing-value stage.  When both ``idx_mar`` and ``idx_mnar`` (or a
-        ``missingness_type`` column in feature metadata) are available, the
-        normal missingness-aware policy is used: MAR features are subject to
-        QC-RSD and MNAR features are exempt from that check.  When the
+        ``imputation_route`` or legacy ``missingness_type`` column) are
+        available, R-route features are subject to QC-RSD and S-route
+        features are exempt from that check. When the
         missingness labels are unavailable, this method enters explicit
         ``quality_only`` mode and applies Blank/QC and QC-RSD to every input
         feature.  It never re-runs ``classify_missing_types`` and therefore
-        cannot manufacture MAR/MNAR labels at an independent action boundary.
+        cannot manufacture route labels at an independent action boundary.
         """
         feature_metadata = self.dataset.feature_metadata
-        metadata_has_missingness = False
-        if "missingness_type" in feature_metadata:
-            normalized_missingness = (
-                feature_metadata["missingness_type"].astype(str).str.upper()
-            )
-            metadata_has_missingness = normalized_missingness.isin(
-                {"MAR", "MNAR"}
-            ).any()
+        normalized_missingness = routes_from_metadata(
+            feature_metadata, default=None, strict=False
+        )
+        metadata_has_missingness = normalized_missingness.isin(
+            {R_ROUTE, S_ROUTE}
+        ).any()
         if idx_mar is None and metadata_has_missingness:
             idx_mar = feature_metadata.index[
-                feature_metadata["missingness_type"].astype(str).str.upper()
-                == "MAR"
+                normalized_missingness == R_ROUTE
             ]
         if idx_mnar is None and metadata_has_missingness:
             idx_mnar = feature_metadata.index[
-                feature_metadata["missingness_type"].astype(str).str.upper()
-                == "MNAR"
+                normalized_missingness == S_ROUTE
             ]
 
         # A quality action must not infer upstream missingness state.  Both
@@ -977,7 +995,7 @@ class FeatureFilter(DatasetProcessor):
             self.stats["qc_rsd_all"] = std_qc / mean_qc
             if quality_only:
                 # No upstream labels: QC-RSD applies to every feature that
-                # passed Blank/QC.  Do not encode these as MAR.
+                # passed Blank/QC. Do not invent an R-route assignment.
                 pass_quality = self.stats["qc_rsd_all"].loc[current_idx]
                 final_idx = pass_quality[pass_quality <= qc_rsd_tol].index
             else:
@@ -1044,8 +1062,8 @@ class FeatureFilter(DatasetProcessor):
     ) -> StageResult[MetaboDataset]:
         """Return the structured quality-filtering stage result.
 
-        This stage accepts ``qc_rsd_tol`` and ``blank_qc_ratio_tol``. MAR and
-        MNAR indices remain explicit data inputs rather than configuration.
+        This stage accepts ``qc_rsd_tol`` and ``blank_qc_ratio_tol``. Route
+        indices remain explicit data inputs rather than configuration.
         """
         runner = QualityFilteringStageRunner(
             self,
@@ -1071,7 +1089,7 @@ class FeatureFilter(DatasetProcessor):
 
         In ``quality_only`` mode the ``Base_Type`` is deliberately reported
         as ``UNCLASSIFIED``.  This distinguishes an independently executed
-        quality action from a feature that was actually classified as MAR.
+        quality action from a feature assigned to the reconstruction route.
         """
         idx_dropped_blank = self.stats.get("idx_dropped_blank", pd.Index([]))
         idx_dropped_rsd = self.stats.get("idx_dropped_rsd", pd.Index([]))
@@ -1085,7 +1103,7 @@ class FeatureFilter(DatasetProcessor):
             if quality_only:
                 base_type = "UNCLASSIFIED"
             else:
-                base_type = "MNAR" if feat in idx_mnar else "MAR"
+                base_type = S_ROUTE if feat in idx_mnar else R_ROUTE
             val_blank = blank_mean.get(feat, np.nan)
             val_qc = qc_mean.get(feat, np.nan)
             ratio_val = np.nan
@@ -1137,8 +1155,8 @@ class FeatureFilter(DatasetProcessor):
                     2,
                 )
 
-            if base_type == "MNAR" and feat not in idx_dropped_blank:
-                rsd_check_status = "Exempted (MNAR)"
+            if base_type == S_ROUTE and feat not in idx_dropped_blank:
+                rsd_check_status = "Exempted (S-route)"
 
             track_data.append(
                 {

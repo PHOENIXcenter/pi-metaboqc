@@ -11,6 +11,7 @@ from .dataset import (
     SampleRoleLabels,
 )
 from .processor import DatasetProcessor
+from .routes import R_ROUTE, S_ROUTE, normalize_route, routes_from_metadata
 
 __all__ = [
     "DatasetSchema",
@@ -18,4 +19,8 @@ __all__ = [
     "DatasetProcessor",
     "ProcessingContext",
     "SampleRoleLabels",
+    "R_ROUTE",
+    "S_ROUTE",
+    "normalize_route",
+    "routes_from_metadata",
 ]

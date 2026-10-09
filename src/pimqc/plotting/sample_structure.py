@@ -152,6 +152,19 @@ def plot_sample_structure_change_map(
     pu.change_fontsize(ax)
     pu.change_weight(ax)
     pu.format_colorbar_axes(colorbar.ax)
+    # Keep the inset colour legend visually consistent with the article
+    # panels.  ``drawedges=True`` creates a divider collection in addition
+    # to the colourbar spines, so both need the shared publication linewidth.
+    colorbar.dividers.set_linewidth(pu.DEFAULT_AXIS_LINEWIDTH)
+    colorbar.dividers.set_color("k")
+    for spine in ax.spines.values():
+        if spine.get_visible():
+            spine.set_linewidth(pu.DEFAULT_AXIS_LINEWIDTH)
+    ax.tick_params(
+        axis="both",
+        width=pu.DEFAULT_AXIS_LINEWIDTH,
+        length=2,
+    )
 
     note_lines = []
     if np.isfinite(trust_score):

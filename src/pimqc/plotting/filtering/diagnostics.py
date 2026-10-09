@@ -1,7 +1,7 @@
 """Diagnostic panels for sample and feature filtering.
 
-The module renders sample missingness, MNAR rescue, MAR eligibility, blank/QC,
-QC-RSD, and feature-retention panels from precomputed filtering statistics.
+The module renders sample missingness, S-route rescue, R-route eligibility,
+blank/QC, QC-RSD, and feature-retention panels from filtering statistics.
 """
 
 from __future__ import annotations
@@ -176,7 +176,7 @@ class FilteringDiagnosticsMixin:
         title: str,
         article_compact: bool = False,
     ) -> None:
-        """Scatter plot visualizing the 2D logic of Group MNAR rescue."""
+        """Scatter plot visualizing the 2D logic of Group S-route rescue."""
 
         if df.empty:
             ax.axis("off")
@@ -189,13 +189,13 @@ class FilteringDiagnosticsMixin:
 
         df_plot["Step_Status"] = np.where(
             df_plot["Stage1_Status"].str.contains("Group"),
-            "MNAR (Group)",
+            "S-route (Group)",
             "Pending",
         )
 
         df_plot = df_plot.sort_values(by="Step_Status", ascending=False)
 
-        marker_map = {"MNAR (Group)": "X", "Pending": "o"}
+        marker_map = {"S-route (Group)": "X", "Pending": "o"}
         for status, sub_df in df_plot.groupby("Step_Status", sort=False):
             ax.scatter(
                 sub_df[max_col].to_numpy(dtype=float),
@@ -207,7 +207,7 @@ class FilteringDiagnosticsMixin:
                 ),
                 marker=marker_map[status],
                 facecolor={
-                    "MNAR (Group)": color_mnar,
+                    "S-route (Group)": color_mnar,
                     "Pending": color_pending,
                 }[status],
                 edgecolor="k",
@@ -254,7 +254,7 @@ class FilteringDiagnosticsMixin:
                 color=color_mnar,
                 marker="X",
                 linestyle="",
-                label="MNAR (Group)",
+                label="S-route (Group)",
                 markeredgecolor="k",
                 markersize=pu.DEFAULT_LEGEND_MARKER_SIZE,
                 markeredgewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
@@ -357,7 +357,7 @@ class FilteringDiagnosticsMixin:
 
         def _determine_status(row: pd.Series) -> str:
             if "QC" in row["Stage1_Status"]:
-                return "MNAR (QC)"
+                return "S-route (QC)"
             elif (
                 has_group_info
                 and (row["QC_MV_Pct"] > mnar_qc_mv_tol * 100)
@@ -403,12 +403,12 @@ class FilteringDiagnosticsMixin:
             )
 
         color_map = {
-            "MNAR (QC)": color_mnar,
+            "S-route (QC)": color_mnar,
             "Blocked by Group Valid": color_blocked,
             "Pending": color_pending,
         }
         marker_map = {
-            "MNAR (QC)": "X",
+            "S-route (QC)": "X",
             "Blocked by Group Valid": "v",
             "Pending": "o",
         }
@@ -481,7 +481,7 @@ class FilteringDiagnosticsMixin:
                 color=color_mnar,
                 marker="X",
                 linestyle="",
-                label="MNAR (QC)",
+                label="S-route (QC)",
                 markeredgecolor="k",
                 markersize=pu.DEFAULT_LEGEND_MARKER_SIZE,
                 markeredgewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
@@ -624,6 +624,11 @@ class FilteringDiagnosticsMixin:
         bin_edges = np.arange(0, 105, 5)
         bin_width = float(np.diff(bin_edges).min())
         plot_df = df[[x_col, hue_col]].copy()
+        if hue_col == "Stage1_Status":
+            plot_df = self._route_tracking(plot_df)
+            palette = {"R-route" if k == "MAR" else k: v
+                       for k, v in palette.items()}
+            hue_order = ["R-route" if k == "MAR" else k for k in hue_order]
         plot_df[x_col] = pd.to_numeric(plot_df[x_col], errors="coerce")
         plot_df = plot_df.dropna(subset=[x_col])
 
@@ -707,7 +712,7 @@ class FilteringDiagnosticsMixin:
         ax: plt.Axes | None = None,
         article_compact: bool = False,
     ) -> plt.Figure | plt.Axes:
-        """Plot feature attrition cascade stacked bar chart by MAR/MNAR."""
+        """Plot the feature attrition cascade by operational route."""
 
         if ax is None:
             fig, current_ax = plt.subplots(
@@ -762,9 +767,8 @@ class FilteringDiagnosticsMixin:
         idx_dropped_rsd = stats.get("idx_dropped_rsd", pd.Index([]))
         quality_only = stats.get("quality_filter_mode") == "quality_only"
 
-        # In an independent quality action no MAR/MNAR labels exist.  Render
-        # one explicit quality-only series instead of presenting all input
-        # features as synthetic MAR.
+        # Independent quality actions have no route labels. Render one
+        # quality-only series rather than assigning all inputs to R-route.
         if quality_only:
             mar_base = int(stats.get("quality_pre_stage2_count", 0))
             mnar_base = 0
@@ -780,7 +784,7 @@ class FilteringDiagnosticsMixin:
             blank_drop_mnar = len(idx_dropped_blank.intersection(idx_mnar))
             rsd_drop_mar = len(idx_dropped_rsd.intersection(idx_mar))
             rsd_drop_mnar = len(idx_dropped_rsd.intersection(idx_mnar))
-            quality_label = "MAR"
+            quality_label = "R-route"
 
         mar_all = np.array(
             [
@@ -835,7 +839,7 @@ class FilteringDiagnosticsMixin:
                 x,
                 mnar_counts,
                 bottom=current_bottom,
-                label="MNAR",
+                label="S-route",
                 color=color_mnar,
                 edgecolor="k",
                 width=width,
@@ -943,10 +947,10 @@ class FilteringDiagnosticsMixin:
         if df_plot.empty:
             return None if ax is None else ax
 
-        df_plot["Feature Type"] = "UNCLASSIFIED" if quality_only else "MAR"
+        df_plot["Feature Type"] = "UNCLASSIFIED" if quality_only else "R-route"
         valid_mnar = idx_mnar.intersection(df_plot.index)
         if not valid_mnar.empty:
-            df_plot.loc[valid_mnar, "Feature Type"] = "MNAR"
+            df_plot.loc[valid_mnar, "Feature Type"] = "S-route"
 
         # Use blank_safe for ratios to match the filtering engine.
         # NaN <= 0.2 evaluates to False, falsely flagging them as Filtered.
@@ -960,9 +964,9 @@ class FilteringDiagnosticsMixin:
             "Filtered",
         )
 
-        # Sort DataFrame so MNAR points remain visible on top.
-        # Alphabetical sorting ("MAR" < "MNAR") pushes MNAR to the bottom of
-        # the DataFrame, causing seaborn to render them last and on top.
+        # Sort DataFrame so S-route points remain visible on top.
+        # Alphabetical sorting ("R-route" < "S-route") places S-route last,
+        # causing seaborn to render these points on top.
         df_plot = df_plot.sort_values(by="Feature Type", ascending=True)
 
         if ax is None:
@@ -987,8 +991,8 @@ class FilteringDiagnosticsMixin:
             },
             style="Feature Type",
             markers={
-                "MAR": "o",
-                "MNAR": "X",
+                "R-route": "o",
+                "S-route": "X",
                 "UNCLASSIFIED": "o",
             },
             s=(
@@ -1082,7 +1086,7 @@ class FilteringDiagnosticsMixin:
                 markeredgecolor="k",
                 markeredgewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
                 markersize=pu.DEFAULT_LEGEND_MARKER_SIZE,
-                label="MAR",
+                label="R-route",
             ),
             mlines.Line2D(
                 [],
@@ -1093,7 +1097,7 @@ class FilteringDiagnosticsMixin:
                 markeredgecolor="k",
                 markeredgewidth=pu.DEFAULT_MARKER_EDGEWIDTH,
                 markersize=pu.DEFAULT_LEGEND_MARKER_SIZE,
-                label="MNAR",
+                label="S-route",
             ),
         ]
         current_ax.legend(handles=legend_handles)
@@ -1143,7 +1147,7 @@ class FilteringDiagnosticsMixin:
         article_compact: bool = False,
     ) -> plt.Figure | plt.Axes | None:
         """
-        Plot the MAR-only QC-RSD distribution used for reproducibility
+        Plot the R-route-only QC-RSD distribution used for reproducibility
         filtering.
         """
         qc_rsd_all = self.audit_tables.get("qc_rsd_all")
@@ -1205,7 +1209,7 @@ class FilteringDiagnosticsMixin:
                 label=(
                     "Quality-only input features"
                     if quality_only
-                    else "MAR features"
+                    else "R-route features"
                 ),
             ),
         ]

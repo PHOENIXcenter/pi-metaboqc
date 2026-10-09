@@ -322,7 +322,7 @@ def test_feature_mv_dashboard_composes_all_degradation_states(
     flow_text = "\n".join(text.get_text() for text in flowchart.texts)
     if has_biological_groups:
         assert "Group Rescue" in flow_text
-        assert "MAR Eligibility" in flow_text
+        assert "R-route Eligibility" in flow_text
     else:
         assert "Group Rescue" not in flow_text
         assert "QC MV Check" in flow_text
@@ -458,7 +458,7 @@ def test_quality_filter_uses_explicit_missingness_labels_when_present() -> None:
     }
     assert (
         result.audit.feature_tracking.loc["f_unstable", "RSD_Check"]
-        == "Exempted (MNAR)"
+        == "Exempted (S-route)"
     )
 
 

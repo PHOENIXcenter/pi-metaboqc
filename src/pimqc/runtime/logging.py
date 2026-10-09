@@ -54,10 +54,15 @@ def _configure_external_log_bridges() -> None:
 def _format_record(record: dict[str, Any]) -> str:
     """Return the package console format for one Loguru record."""
     record["extra"]["submodule"] = record["name"].split(".")[-1]
+    backend_label = {
+        "python": "<bold><blue>[PYTHON]</blue></bold> ",
+        "r": "<bold><magenta>[R ORIGINAL]</magenta></bold> ",
+    }.get(record["extra"].get("implementation"), "")
     return (
         "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
         "<level>{level: <8}</level> | "
         "<cyan>{extra[submodule]}:{function}</cyan>:<cyan>{line}</cyan> - "
+        f"{backend_label}"
         "<level>{message}</level>\n"
     )
 

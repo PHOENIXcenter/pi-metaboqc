@@ -1,9 +1,8 @@
-"""Implement SERRF-style random-forest signal correction.
+"""Batch-wise native SERRF with independently refitted QC validation.
 
-The engine constructs feature-wise predictors from correlated reference
-features, uses cross-validation for QC diagnostics, and projects fitted
-corrections onto eligible samples. Scoring, export, and plotting remain
-external.
+The workflow follows the author's correlation selection, role-specific
+standardization and multiplicative batch alignment. Forests use sklearn,
+not ranger. Random imputation and post-hoc outlier replacement are omitted.
 """
 
 import os
@@ -14,14 +13,20 @@ import pandas as pd
 from joblib import Parallel, delayed
 from loguru import logger
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import KFold
 
 from ...constants import DEFAULT_RANDOM_SEED
 from ...runtime import joblib_execution_context, joblib_progress
+from .qc_validation import assign_qc_folds
 
 
 class SERRFCorrector:
-    """Pure mathematical engine for Hybrid SERRF correction."""
+    """Native SERRF with within-batch held-out QC validation.
+
+    Biological predictor and batch location/scale estimates use the available
+    cohort, as in the original. This is transductive correction, not a model
+    for unseen biological cohorts. QC folds refit selection, standardization,
+    forests and response scaling without the held-out QC measurements.
+    """
 
     def __init__(
         self,
@@ -32,115 +37,335 @@ class SERRFCorrector:
         n_jobs: int = -1,
         joblib_backend: str = "loky",
         joblib_batch_size: Union[str, int] = "auto",
+        cv_strategy: str = "random",
     ) -> None:
-        """Initialize SERRF model and parallel-execution settings.
+        """Configure forests and validation.
 
-        Args:
-            n_estimators: Number of trees fitted per feature.
-            cv_folds: Folds used for QC out-of-fold prediction.
-            n_corr_features: Correlated features supplied as predictors.
-            random_state: Seed for deterministic model fitting.
-            n_jobs: Number of parallel feature workers.
-            joblib_backend: Joblib backend used for parallel execution.
-            joblib_batch_size: Joblib task batching policy.
+        ``cv_strategy='random'`` preserves the production splitter. The
+        optional ``'blocked'`` strategy sorts QC observations by injection
+        order within each batch before assigning contiguous folds.
         """
+        if n_estimators < 1 or cv_folds < 2 or n_corr_features < 0:
+            raise ValueError(
+                "Require n_estimators >= 1, cv_folds >= 2 and "
+                "n_corr_features >= 0."
+            )
+        if n_jobs == 0 or n_jobs < -1:
+            raise ValueError("n_jobs must be -1 or a positive integer.")
+        if cv_strategy not in {"random", "blocked"}:
+            raise ValueError("cv_strategy must be random or blocked.")
         self.n_estimators = n_estimators
         self.cv_folds = cv_folds
+        self.cv_strategy = cv_strategy
         self.n_corr_features = n_corr_features
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.joblib_backend = str(joblib_backend).lower()
         self.joblib_batch_size = joblib_batch_size
 
-    def _prepare_base_features(
-        self, batch_array: np.ndarray, order_array: np.ndarray
+    @staticmethod
+    def _correlation(values: np.ndarray) -> np.ndarray:
+        """Pairwise Spearman correlation on positive finite observations."""
+        frame = pd.DataFrame(
+            np.where(np.isfinite(values) & (values > 0), values, np.nan)
+        )
+        return frame.corr(method="spearman", min_periods=3).to_numpy()
+
+    def _select_predictors(
+        self,
+        feature: int,
+        qc_corr: np.ndarray,
+        sample_corr: np.ndarray,
     ) -> np.ndarray:
-        x_df = pd.DataFrame({"Order": order_array, "Batch": batch_array})
-        x_df["Order"] = pd.to_numeric(x_df["Order"], errors="coerce")
-        x_encoded = pd.get_dummies(x_df, columns=["Batch"], drop_first=False)
-        return np.nan_to_num(x_encoded.values, nan=0.0)
+        """Expand ranked lists until their overlap is sufficiently large."""
+        qc_scores = qc_corr[:, feature]
+        sample_scores = sample_corr[:, feature]
+        valid = np.isfinite(qc_scores) & np.isfinite(sample_scores)
+        valid[feature] = False
+        available = np.flatnonzero(valid)
+        count = min(self.n_corr_features, available.size)
+        if count == 0:
+            return np.empty(0, dtype=int)
+        qc_rank = available[
+            np.argsort(-np.abs(qc_scores[available]), kind="stable")
+        ]
+        sample_rank = available[
+            np.argsort(-np.abs(sample_scores[available]), kind="stable")
+        ]
+        # The author's first overlap can contain more than the requested num.
+        for cutoff in range(count, available.size + 1):
+            selected = qc_rank[:cutoff][
+                np.isin(qc_rank[:cutoff], sample_rank[:cutoff])
+            ]
+            if selected.size >= count:
+                return selected
+        return available
+
+    @staticmethod
+    def _scale_fit(
+        values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Estimate predictor scale using only the supplied training role."""
+        clean = np.where(np.isfinite(values) & (values > 0), values, np.nan)
+        means = pd.DataFrame(clean).mean().to_numpy()
+        scales = pd.DataFrame(clean).std(ddof=1).to_numpy()
+        good = np.isfinite(means) & np.isfinite(scales) & (scales > 0)
+        return means, scales, good
+
+    @staticmethod
+    def _transform(
+        values: np.ndarray, means: np.ndarray, scales: np.ndarray
+    ) -> np.ndarray:
+        """Map missing predictors to their training-role mean."""
+        clean = np.where(np.isfinite(values) & (values > 0), values, means)
+        return (clean - means) / scales
+
+    @staticmethod
+    def _ratio(
+        values: np.ndarray, baseline: np.ndarray, anchor: float
+    ) -> np.ndarray:
+        """Return missing when no positive finite denominator is available."""
+        result = np.full_like(values, np.nan, dtype=float)
+        valid = (
+            np.isfinite(values)
+            & (values > 0)
+            & np.isfinite(baseline)
+            & (baseline > 0)
+        )
+        result[valid] = values[valid] / baseline[valid] * anchor
+        return result
+
+    def _fit_feature_pass(
+        self,
+        feature: int,
+        values: np.ndarray,
+        orders: np.ndarray,
+        qc_mask: np.ndarray,
+        sample_mask: np.ndarray,
+        training_qc: np.ndarray,
+        contexts: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+        diagnostics: dict,
+    ) -> np.ndarray:
+        """Fit all batches using one full-data or fold-specific QC set."""
+        y = values[:, feature]
+        result = np.full_like(y, np.nan, dtype=float)
+        invalid_baseline = np.zeros(y.size, dtype=bool)
+        valid_y = np.isfinite(y) & (y > 0)
+        global_train = training_qc & valid_y
+        if global_train.sum() < 2:
+            diagnostics["unsupported_feature_batch_fits"] += len(contexts)
+            return result
+        qc_anchor = float(np.median(y[global_train]))
+        valid_samples = sample_mask & valid_y
+        sample_anchor = (
+            float(np.median(y[valid_samples]))
+            if valid_samples.any()
+            else qc_anchor
+        )
+        for in_batch, qc_corr, sample_corr in contexts:
+            train = in_batch & global_train
+            query_qc = in_batch & qc_mask
+            samples = in_batch & sample_mask
+            if train.sum() < 2:
+                diagnostics["unsupported_feature_batch_fits"] += 1
+                result[query_qc] = np.nan
+                continue
+            selected = self._select_predictors(feature, qc_corr, sample_corr)
+            if self.n_corr_features == 0:
+                x_train = orders[train, None]
+                x_qc = orders[query_qc, None]
+                x_sample = orders[samples, None]
+            elif selected.size:
+                predictors = values[:, selected]
+                qc_mean, qc_scale, good = self._scale_fit(predictors[train])
+                if samples.sum() >= 2:
+                    sm_mean, sm_scale, sm_good = self._scale_fit(
+                        predictors[samples]
+                    )
+                    good &= sm_good
+                else:
+                    sm_mean, sm_scale = qc_mean, qc_scale
+                predictors = predictors[:, good]
+                x_train = self._transform(
+                    predictors[train], qc_mean[good], qc_scale[good]
+                )
+                x_qc = self._transform(
+                    predictors[query_qc], qc_mean[good], qc_scale[good]
+                )
+                x_sample = self._transform(
+                    predictors[samples], sm_mean[good], sm_scale[good]
+                )
+            else:
+                x_train = np.empty((train.sum(), 0))
+                x_qc = np.empty((query_qc.sum(), 0))
+                x_sample = np.empty((samples.sum(), 0))
+
+            center = float(np.mean(y[train]))
+            response = y[train] - center
+            good_samples = samples & valid_y
+            # Match the author's amplitude guard in QC-heavy batches.
+            if good_samples.sum() >= 2 and 2 * train.sum() >= samples.sum():
+                sample_sd = float(np.std(y[good_samples], ddof=1))
+                qc_sd = float(np.std(y[train], ddof=1))
+                if sample_sd > 0 and qc_sd > sample_sd:
+                    response = response / (qc_sd / sample_sd)
+            if x_train.shape[1]:
+                diagnostics["forest_feature_batch_fits"] += 1
+                forest = RandomForestRegressor(
+                    n_estimators=self.n_estimators,
+                    max_features="sqrt",
+                    min_samples_split=5,
+                    min_samples_leaf=1,
+                    random_state=self.random_state,
+                    n_jobs=1,
+                )
+                forest.fit(x_train, response)
+                pred_train = forest.predict(x_train)
+                pred_qc = forest.predict(x_qc)
+                pred_sample = (
+                    forest.predict(x_sample) if samples.any() else np.empty(0)
+                )
+            else:
+                diagnostics["location_only_feature_batch_fits"] += 1
+                # Insufficient covariates permit location alignment only.
+                pred_train = np.zeros(train.sum())
+                pred_qc = np.zeros(query_qc.sum())
+                pred_sample = np.zeros(samples.sum())
+
+            train_ratio = self._ratio(y[train], center + pred_train, qc_anchor)
+            valid_train = np.isfinite(train_ratio) & (train_ratio > 0)
+            train_median = (
+                float(np.median(train_ratio[valid_train]))
+                if valid_train.any()
+                else float("nan")
+            )
+            qc_factor = qc_anchor / train_median
+            qc_baseline = center + pred_qc
+            invalid_baseline[query_qc] = ~np.isfinite(qc_baseline) | (
+                qc_baseline <= 0
+            )
+            result[query_qc] = (
+                self._ratio(y[query_qc], center + pred_qc, qc_anchor)
+                * qc_factor
+            )
+            if good_samples.any():
+                sample_center = float(np.mean(y[good_samples]))
+                baseline = sample_center + pred_sample - np.mean(pred_sample)
+                invalid_baseline[samples] = ~np.isfinite(baseline) | (
+                    baseline <= 0
+                )
+                normalized = self._ratio(y[samples], baseline, sample_anchor)
+                usable = np.isfinite(normalized) & (normalized > 0)
+                if usable.any():
+                    normalized *= sample_anchor / np.median(normalized[usable])
+                result[samples] = normalized
+
+        # Preserve QC's standardized position relative to the sample cohort.
+        # Each fold recomputes this scalar with its own fitted sample output.
+        mapping_samples = valid_samples & np.isfinite(result) & (result > 0)
+        corrected_samples = result[mapping_samples]
+        if corrected_samples.size >= 2:
+            raw_sd = float(np.std(y[mapping_samples], ddof=1))
+            corrected_sd = float(np.std(corrected_samples, ddof=1))
+            if raw_sd > 0:
+                desired_qc = (
+                    np.median(corrected_samples)
+                    + (qc_anchor - np.median(y[mapping_samples]))
+                    / raw_sd * corrected_sd
+                )
+                mapping_qc = global_train & np.isfinite(result) & (result > 0)
+                train_median = (
+                    float(np.median(result[mapping_qc]))
+                    if mapping_qc.any()
+                    else float("nan")
+                )
+                if (
+                    np.isfinite(desired_qc)
+                    and desired_qc > 0
+                    and np.isfinite(train_median)
+                    and train_median > 0
+                ):
+                    result[qc_mask] *= desired_qc / train_median
+        diagnostics["invalid_baseline_predictions"] += int(
+            invalid_baseline.sum()
+        )
+        diagnostics["invalid_qc_baseline_predictions"] += int(
+            (invalid_baseline & qc_mask).sum()
+        )
+        diagnostics["invalid_sample_baseline_predictions"] += int(
+            (invalid_baseline & sample_mask).sum()
+        )
+        diagnostics["invalid_sample_indices"].extend(
+            np.flatnonzero(invalid_baseline & sample_mask).tolist()
+        )
+        result[~valid_y | invalid_baseline] = np.nan
+        return result
 
     def _process_single_feature(
         self,
-        feat_idx: int,
-        y_mat: np.ndarray,
-        x_base: np.ndarray,
-        is_qc: np.ndarray,
-        top_idx_row: np.ndarray | None,
-        blank_mask: np.ndarray | None,
-        blank_predictor_values: np.ndarray | None,
-    ) -> tuple[int, np.ndarray, np.ndarray]:
-        """Worker function using pre-sliced indices for memory efficiency."""
-        y_all = y_mat[:, feat_idx]
-
-        # Feature Construction using pre-computed indices
-        if top_idx_row is not None:
-            x_corr = np.nan_to_num(y_mat[:, top_idx_row], nan=0.0)
-            if blank_mask is not None and blank_predictor_values is not None:
-                # SERRF is trained only on QC rows.  Blank rows should receive a
-                # frozen technical prediction rather than supplying their
-                # low-intensity correlated-feature values to the forest.
-                x_corr[blank_mask, :] = np.nan_to_num(
-                    blank_predictor_values[blank_mask, :][:, top_idx_row],
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
+        feature: int,
+        values: np.ndarray,
+        orders: np.ndarray,
+        qc_mask: np.ndarray,
+        sample_mask: np.ndarray,
+        blank_mask: np.ndarray,
+        folds: np.ndarray,
+        contexts: list[list[tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    ) -> tuple[int, np.ndarray, np.ndarray, dict]:
+        """Refit every estimated operation before predicting held-out QCs."""
+        diagnostics = {
+            stage: {
+                "forest_feature_batch_fits": 0,
+                "location_only_feature_batch_fits": 0,
+                "unsupported_feature_batch_fits": 0,
+                "invalid_baseline_predictions": 0,
+                "invalid_qc_baseline_predictions": 0,
+                "invalid_sample_baseline_predictions": 0,
+                "invalid_sample_indices": [],
+            }
+            for stage in ("full", "oof")
+        }
+        full = self._fit_feature_pass(
+            feature,
+            values,
+            orders,
+            qc_mask,
+            sample_mask,
+            qc_mask,
+            contexts[0],
+            diagnostics["full"],
+        )
+        # Project fitted QC correction factors onto blanks by injection order.
+        y = values[:, feature]
+        for in_batch, _, _ in contexts[0]:
+            reference = in_batch & qc_mask & np.isfinite(full) & (y > 0)
+            targets = in_batch & blank_mask
+            if reference.any() and targets.any():
+                idx = np.flatnonzero(reference)
+                idx = idx[np.argsort(orders[idx], kind="stable")]
+                factor = np.interp(
+                    orders[targets], orders[idx], full[idx] / y[idx]
                 )
-            x_current = np.hstack([x_base, x_corr])
-        else:
-            x_current = x_base
-
-        # Extract and validate QC
-        y_qc = y_all[is_qc]
-        valid_qc = ~np.isnan(y_qc) & (y_qc > 0)
-
-        if valid_qc.sum() < self.cv_folds:
-            unavailable_oof = y_all.copy()
-            unavailable_oof[is_qc] = np.nan
-            return feat_idx, y_all, unavailable_oof
-
-        x_qc_valid = x_current[is_qc][valid_qc]
-        y_qc_valid = y_qc[valid_qc]
-
-        # K-Fold Out-Of-Fold Prediction
-        kf = KFold(
-            n_splits=self.cv_folds, shuffle=True, random_state=self.random_state
-        )
-        y_pred_qc = np.zeros(len(y_qc_valid))
-
-        rf_oof = RandomForestRegressor(
-            n_estimators=self.n_estimators,
-            random_state=self.random_state,
-            n_jobs=1,
-        )
-        for train_idx, test_idx in kf.split(x_qc_valid):
-            rf_oof.fit(x_qc_valid[train_idx], y_qc_valid[train_idx])
-            y_pred_qc[test_idx] = rf_oof.predict(x_qc_valid[test_idx])
-
-        # Predict Expected Baselines for ALL Samples
-        rf_full = RandomForestRegressor(
-            n_estimators=self.n_estimators,
-            random_state=self.random_state,
-            n_jobs=1,
-        )
-        rf_full.fit(x_qc_valid, y_qc_valid)
-        y_pred_all_full = rf_full.predict(x_current)
-
-        # Global Assembly for OOF Baseline
-        y_pred_all_oof = y_pred_all_full.copy()
-        pred_qc_oof_arr = y_all[is_qc].copy()
-        pred_qc_oof_arr[valid_qc] = y_pred_qc
-        pred_qc_oof_arr[~valid_qc] = np.nanmedian(y_qc_valid)
-        y_pred_all_oof[is_qc] = pred_qc_oof_arr
-
-        y_pred_all_full[y_pred_all_full <= 0] = 1e-6
-        y_pred_all_oof[y_pred_all_oof <= 0] = 1e-6
-
-        qc_median = np.nanmedian(y_qc_valid)
-        res_full = (y_all / y_pred_all_full) * qc_median
-        res_oof = (y_all / y_pred_all_oof) * qc_median
-
-        return feat_idx, res_full, res_oof
+                full[targets] = y[targets] * factor
+        oof = full.copy()
+        oof[qc_mask] = np.nan
+        for fold, fold_context in enumerate(contexts[1:]):
+            held_out = qc_mask & (folds == fold)
+            if not held_out.any():
+                continue
+            prediction = self._fit_feature_pass(
+                feature,
+                values,
+                orders,
+                qc_mask,
+                sample_mask,
+                qc_mask & ~held_out,
+                fold_context,
+                diagnostics["oof"],
+            )
+            valid = held_out & np.isfinite(y) & (y > 0)
+            oof[valid] = prediction[valid]
+        return feature, full, oof, diagnostics
 
     def fit_transform(
         self,
@@ -148,152 +373,190 @@ class SERRFCorrector:
         batch_array: np.ndarray,
         qc_mask: np.ndarray,
         order_array: np.ndarray,
-        corr_mat: Optional[np.ndarray] = None,
         blank_mask: Optional[np.ndarray] = None,
     ) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]:
-        """Fit feature-wise SERRF models and return corrected matrices.
+        """Return full correction and independent held-out QC correction.
 
-        Args:
-            intensity_df: Feature-by-sample intensity matrix.
-            batch_array: Batch label for each sample.
-            qc_mask: Boolean mask identifying pooled-QC samples.
-            order_array: Injection order for each sample.
-            corr_mat: Optional feature-correlation matrix.
-            blank_mask: Optional mask excluding blanks from fitted predictors.
-
-        Returns:
-            Mapping containing full-fit and out-of-fold corrected matrices.
-
-        Raises:
-            ValueError: If the masks are invalid or QCs are insufficient.
+        Correlations are estimated separately within each batch and QC fold.
+        Missing/nonpositive responses remain missing and are omitted
+        from validation. At least two training QCs are needed per feature.
         """
-
-        logger.info("Initializing High-Performance Hybrid SERRF Corrector...")
-        y_mat = intensity_df.T.to_numpy(dtype=float, copy=False)
-        x_base = self._prepare_base_features(batch_array, order_array)
-        n_features = y_mat.shape[1]
-        if blank_mask is None:
-            blank_mask = np.zeros(y_mat.shape[0], dtype=bool)
-        else:
-            blank_mask = np.asarray(blank_mask, dtype=bool)
-            if blank_mask.shape != qc_mask.shape:
-                raise ValueError("blank_mask must match the sample dimension.")
-
-        if sum(qc_mask) < self.cv_folds:
-            raise ValueError("Insufficient QCs for configured CV.")
-
-        # Extract top features globally to avoid memory leak in parallel workers
-        top_indices = None
-        blank_predictor_values = None
-        if self.n_corr_features > 0 and corr_mat is not None:
-            # Prevent feature from selecting itself as highly correlated
-            np.fill_diagonal(corr_mat, -1.0)
-            top_indices = np.argsort(corr_mat, axis=1)[
-                :, -self.n_corr_features :
-            ]
-            if blank_mask.any():
-                blank_predictor_values = self._interpolate_qc_reference_values(
-                    y_mat=y_mat,
-                    batch_array=batch_array,
-                    order_array=order_array,
-                    qc_mask=qc_mask,
-                )
-
-        y_corrected = np.zeros_like(y_mat)
-        y_corrected_oof = np.zeros_like(y_mat)
-
-        actual_cores = (
-            (os.cpu_count() or 1) if self.n_jobs == -1 else self.n_jobs
-        )
-        safe_n_jobs = max(1, int(actual_cores / 2))
-        joblib_backend = self.joblib_backend
-        if joblib_backend not in {"threading", "loky"}:
-            logger.warning(
-                f"Unsupported serrf_backend='{joblib_backend}'. "
-                "Falling back to 'loky'."
-            )
-            joblib_backend = "loky"
-        joblib_batch_size = self.joblib_batch_size
-        if isinstance(joblib_batch_size, str):
-            if joblib_batch_size.lower() == "auto":
-                joblib_batch_size = "auto"
-            else:
-                joblib_batch_size = int(joblib_batch_size)
-
-        # Use the configured joblib context for SERRF feature models.
-        with joblib_execution_context(joblib_backend):
-            with joblib_progress(total=n_features, desc="SERRF"):
-                results = Parallel(
-                    n_jobs=safe_n_jobs,
-                    batch_size=joblib_batch_size,
-                )(
-                    delayed(self._process_single_feature)(
-                        feat_idx,
-                        y_mat,
-                        x_base,
-                        qc_mask,
-                        None if top_indices is None else top_indices[feat_idx],
-                        blank_mask,
-                        blank_predictor_values,
-                    )
-                    for feat_idx in range(n_features)
-                )
-
-        if results:
-            feat_order = [feat_idx for feat_idx, _, _ in results]
-            y_corrected[:, feat_order] = np.column_stack(
-                [res_full for _, res_full, _ in results]
-            )
-            y_corrected_oof[:, feat_order] = np.column_stack(
-                [res_oof for _, _, res_oof in results]
-            )
-
-        res_df_full = pd.DataFrame(
-            y_corrected.T,
-            index=intensity_df.index,
-            columns=intensity_df.columns,
-        )
-        res_df_oof = pd.DataFrame(
-            y_corrected_oof.T,
-            index=intensity_df.index,
-            columns=intensity_df.columns,
-        )
-        return {"SERRF": (res_df_full, res_df_oof)}
-
-    @staticmethod
-    def _interpolate_qc_reference_values(
-        y_mat: np.ndarray,
-        batch_array: np.ndarray,
-        order_array: np.ndarray,
-        qc_mask: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Build per-feature QC-only reference values at each injection order.
-        """
-        reference = y_mat.copy()
+        logger.info("Fitting batch-wise native SERRF with refitted QC folds...")
+        values = intensity_df.T.to_numpy(dtype=float, copy=True)
+        n_samples, n_features = values.shape
+        batches = np.asarray(batch_array)
         orders = np.asarray(order_array, dtype=float)
-        for batch in pd.unique(batch_array):
-            batch_mask = batch_array == batch
-            batch_qc = batch_mask & qc_mask
-            x_qc = orders[batch_qc]
-            if x_qc.size == 0:
-                continue
+        qc_mask = np.asarray(qc_mask)
+        if qc_mask.dtype != np.bool_:
+            raise ValueError("qc_mask must be boolean.")
+        if blank_mask is None:
+            blank_mask = np.zeros(n_samples, dtype=bool)
+        blank_mask = np.asarray(blank_mask)
+        if blank_mask.dtype != np.bool_:
+            raise ValueError("blank_mask must be boolean.")
+        if any(
+            array.shape != (n_samples,)
+            for array in (batches, orders, qc_mask, blank_mask)
+        ):
+            raise ValueError("Batch, order and masks must match sample count.")
+        if pd.isna(batches).any() or not np.isfinite(orders).all():
+            raise ValueError("Batch labels and injection orders must be valid.")
+        if np.any(qc_mask & blank_mask):
+            raise ValueError("QC and blank masks cannot overlap.")
+        if qc_mask.sum() < 3:
+            raise ValueError("SERRF requires at least three QCs.")
+        sample_mask = ~(qc_mask | blank_mask)
+        folds = assign_qc_folds(
+            batches, qc_mask, self.cv_folds, self.random_state,
+            strategy=self.cv_strategy, order_array=orders,
+        )
+        batch_masks = [batches == batch for batch in pd.unique(batches)]
+        sample_corrs = [
+            self._correlation(values[in_batch & sample_mask])
+            if (in_batch & sample_mask).sum() >= 3
+            else self._correlation(values[in_batch & qc_mask])
+            for in_batch in batch_masks
+        ]
+        contexts = []
+        for fold in range(-1, int(folds.max()) + 1):
+            train = qc_mask if fold < 0 else qc_mask & (folds != fold)
+            context = []
+            for in_batch, sample_corr in zip(batch_masks, sample_corrs):
+                qc_corr = self._correlation(values[in_batch & train])
+                if (in_batch & sample_mask).sum() < 3:
+                    sample_corr = qc_corr
+                context.append((in_batch, qc_corr, sample_corr))
+            contexts.append(context)
 
-            order_idx = np.argsort(x_qc, kind="mergesort")
-            x_qc = x_qc[order_idx]
-            qc_values = y_mat[batch_qc, :][order_idx, :]
-            target_orders = orders[batch_mask]
-            for feat_idx in range(y_mat.shape[1]):
-                y_qc = qc_values[:, feat_idx]
-                valid = np.isfinite(y_qc) & (y_qc > 0)
-                if valid.sum() == 0:
-                    continue
-                if valid.sum() == 1:
-                    reference[batch_mask, feat_idx] = y_qc[valid][0]
-                else:
-                    # np.interp holds endpoint values outside the QC range,
-                    # giving a deterministic frozen-model fallback.
-                    reference[batch_mask, feat_idx] = np.interp(
-                        target_orders, x_qc[valid], y_qc[valid]
+        workers = (os.cpu_count() or 1) if self.n_jobs == -1 else self.n_jobs
+        workers = min(workers, max(1, n_features))
+        backend = self.joblib_backend
+        if backend not in {"threading", "loky"}:
+            logger.warning(f"Unknown SERRF backend {backend}; using loky.")
+            backend = "loky"
+        batch_size = self.joblib_batch_size
+        if isinstance(batch_size, str) and batch_size.lower() != "auto":
+            batch_size = int(batch_size)
+        elif isinstance(batch_size, str):
+            batch_size = "auto"
+        with joblib_execution_context(backend):
+            with joblib_progress(total=n_features, desc="SERRF"):
+                results = Parallel(n_jobs=workers, batch_size=batch_size)(
+                    delayed(self._process_single_feature)(
+                        feature,
+                        values,
+                        orders,
+                        qc_mask,
+                        sample_mask,
+                        blank_mask,
+                        folds,
+                        contexts,
                     )
-        return reference
+                    for feature in range(n_features)
+                )
+        full_values = np.empty_like(values)
+        oof_values = np.empty_like(values)
+        for feature, full, oof, _ in results:
+            full_values[:, feature] = full
+            oof_values[:, feature] = oof
+        full_frame = pd.DataFrame(
+            full_values.T,
+            index=intensity_df.index,
+            columns=intensity_df.columns,
+        )
+        oof_frame = pd.DataFrame(
+            oof_values.T,
+            index=intensity_df.index,
+            columns=intensity_df.columns,
+        )
+        self.diagnostics = {
+            "workflow": "batch-wise role-scaled native SERRF",
+            "cv_strategy": self.cv_strategy,
+            "forest": "sklearn; sqrt mtry; min_samples_split=5",
+            "validation": (
+                "within-batch held-out QCs; fold-refitted selection, scaling "
+                "and forests; biological cohort remains transductive"
+            ),
+            "fold_assignments": folds.tolist(),
+            "effective_folds_by_batch": {
+                str(batches[in_batch][0]): int(
+                    np.unique(folds[in_batch & (folds >= 0)]).size
+                )
+                for in_batch in batch_masks
+            },
+            "qc_oof_value_coverage": float(
+                np.isfinite(oof_values[qc_mask]).sum()
+                / max(1, oof_values[qc_mask].size)
+            ),
+            "qc_oof_coverage_denominator": "all QC intensity cells",
+            "qc_oof_eligible_value_coverage": float(
+                np.isfinite(oof_values[qc_mask]).sum()
+                / max(
+                    1,
+                    (
+                        np.isfinite(values[qc_mask]) & (values[qc_mask] > 0)
+                    ).sum(),
+                )
+            ),
+            "fit_counts": {
+                stage: {
+                    key: sum(item[3][stage][key] for item in results)
+                    for key in (
+                        "forest_feature_batch_fits",
+                        "location_only_feature_batch_fits",
+                        "unsupported_feature_batch_fits",
+                        "invalid_baseline_predictions",
+                        "invalid_qc_baseline_predictions",
+                        "invalid_sample_baseline_predictions",
+                    )
+                }
+                for stage in ("full", "oof")
+            },
+            "fit_count_interpretation": (
+                "OOF counts sum fold refits; baseline counts include all "
+                "QC and sample predictions used for fold scaling"
+            ),
+            "invalid_sample_baseline_cells": [
+                {
+                    "feature": str(intensity_df.index[feature]),
+                    "sample": str(intensity_df.columns[sample]),
+                }
+                for feature, _, _, diagnostic in results
+                for sample in diagnostic["full"]["invalid_sample_indices"]
+            ],
+            "differences_from_author": [
+                "sklearn forest and configured seed/tree count",
+                "no random imputation or post-hoc outlier replacement",
+                "location-only fallback for unavailable predictors",
+                "blank projection uses interpolated fitted QC factors",
+            ],
+        }
+        full_counts = self.diagnostics["fit_counts"]["full"]
+        failed_samples = full_counts["invalid_sample_baseline_predictions"]
+        failed_qcs = full_counts["invalid_qc_baseline_predictions"]
+        unsupported = full_counts["unsupported_feature_batch_fits"]
+        location_only = full_counts["location_only_feature_batch_fits"]
+        coverage = self.diagnostics["qc_oof_eligible_value_coverage"]
+        degraded = (
+            failed_samples
+            or failed_qcs
+            or unsupported
+            or location_only
+            or coverage < 1
+        )
+        self.diagnostics["status"] = "degraded" if degraded else "ok"
+        if degraded:
+            logger.warning(
+                "SERRF correction is degraded: {} sample and {} QC values "
+                "have invalid baselines and become missing; "
+                "{} unsupported and {} location-only feature/batch fits; "
+                "eligible held-out QC coverage is {:.1%}.",
+                failed_samples,
+                failed_qcs,
+                unsupported,
+                location_only,
+                coverage,
+            )
+        full_frame.attrs["serrf_diagnostics"] = self.diagnostics
+        oof_frame.attrs["serrf_diagnostics"] = self.diagnostics
+        return {"SERRF": (full_frame, oof_frame)}

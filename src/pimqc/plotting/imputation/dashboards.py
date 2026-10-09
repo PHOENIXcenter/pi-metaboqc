@@ -26,8 +26,10 @@ class ImputationDashboardMixin:
         selected_method: str,
     ) -> tuple[str, tuple[dict[str, float], np.ndarray, np.ndarray]] | None:
         """
-        Return the selected AUTO benchmark tuple without changing candidate
-        order.
+        Return only the selected successful, nonempty masked benchmark.
+
+        A missing or failed selected benchmark is not evidence for another
+        method; use the same eligibility check as ImputationStageRunner.
         """
         selected_key = IMPUTATION_METHODS.canonicalize(
             selected_method, strict=False
@@ -37,8 +39,17 @@ class ImputationDashboardMixin:
                 IMPUTATION_METHODS.canonicalize(method_name, strict=False)
                 == selected_key
             ):
+                metrics, true_vals, pred_vals = item
+                if (
+                    metrics.get("status", "ok") != "ok"
+                    or true_vals is None
+                    or pred_vals is None
+                    or len(true_vals) == 0
+                    or len(pred_vals) == 0
+                ):
+                    return None
                 return method_name, item
-        return next(iter(results_dict.items()), None)
+        return None
 
     def plot_imputation_reconstruction_article_dashboard(
         self,
@@ -66,27 +77,38 @@ class ImputationDashboardMixin:
         if best_item is None:
             return None
 
+        # Failed/final-fit-failed candidates remain in the Audit. Their stale
+        # benchmark scores must not be shown as eligible AUTO candidates.
+        renderable = {
+            method: candidate
+            for method, candidate in results_dict.items()
+            if candidate[0].get("status", "ok") == "ok"
+            and candidate[1] is not None
+            and candidate[2] is not None
+            and len(candidate[1]) > 0
+            and len(candidate[2]) > 0
+        }
         method_name, (metrics, true_vals, pred_vals) = best_item
         pw.clear()
         panel_height = pu.ARTICLE_PANEL_HEIGHT_IN
 
         summary_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.85, panel_height),
+            figsize=pu.article_brick_size(2.05, panel_height),
             label="article_imputation_summary",
         )
         self.plot_imputation_score_summary(
-            results_dict=results_dict,
+            results_dict=renderable,
             selected_method=selected_method,
             ax=summary_ax,
             show_legend=False,
         )
         self._apply_article_panel_format(
             summary_ax,
-            title="Auto Imputation Method Selection",
+            title="AUTO Imputation\nScore Components",
         )
 
         scatter_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.85, panel_height),
+            figsize=pu.article_brick_size(2.05, panel_height),
             label="article_imputation_masked_nrmse",
         )
         self._plot_nrmse_scatter(
@@ -102,17 +124,19 @@ class ImputationDashboardMixin:
         )
         self._apply_article_panel_format(
             scatter_ax,
-            title="MAR Masked Simulation",
+            title="Masked-Value\nReconstruction",
         )
-        scatter_ax.set_xlabel("Known Masked Intensity (log2)")
-        scatter_ax.set_ylabel("Reconstructed Intensity (log2)")
+        scatter_ax.set_xlabel("Known masked intensity (log2)")
+        scatter_ax.set_ylabel("Reconstructed intensity (log2)")
 
         legend_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.30, panel_height),
+            figsize=pu.article_brick_size(1.40, panel_height),
             label="article_imputation_score_legend",
         )
         self.plot_imputation_article_score_legend(ax=legend_ax)
-        return summary_ax | scatter_ax | legend_ax
+        return self._finalize_article_dashboard(
+            summary_ax | scatter_ax | legend_ax
+        )
 
     def plot_imputation_preservation_article_dashboard(
         self,
@@ -145,7 +169,7 @@ class ImputationDashboardMixin:
         panel_height = pu.ARTICLE_PANEL_HEIGHT_IN
 
         density_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.85, panel_height),
+            figsize=pu.article_brick_size(2.05, panel_height),
             label="article_imputation_density",
         )
         self._plot_masked_distribution_fidelity(
@@ -159,30 +183,32 @@ class ImputationDashboardMixin:
         )
         self._apply_article_panel_format(
             density_ax,
-            title="Masked-Value Distribution Fidelity",
+            title="Masked-Value\nDistribution Fidelity",
         )
 
         sample_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.85, panel_height),
+            figsize=pu.article_brick_size(2.05, panel_height),
             label="article_imputation_sample_structure",
         )
         plot_sample_structure_change_map(
             ax=sample_ax,
             diagnostics=self.payload.sample_structure,
-            title="Sample Structure Change Map",
+            title="Full-fit Sample Structure\nChange Map",
             compact_style=True,
         )
         self._apply_article_panel_format(
             sample_ax,
-            title="Sample Structure Change Map",
+            title="Full-fit Sample Structure\nChange Map",
         )
 
         legend_ax = pw.Brick(
-            figsize=pu.article_brick_size(1.30, panel_height),
+            figsize=pu.article_brick_size(1.40, panel_height),
             label="article_imputation_density_legend",
         )
         self.plot_imputation_article_density_legend(ax=legend_ax)
-        return density_ax | sample_ax | legend_ax
+        return self._finalize_article_dashboard(
+            density_ax | sample_ax | legend_ax
+        )
 
     def plot_imputation_dashboard_legend(
         self,
@@ -318,7 +344,7 @@ class ImputationDashboardMixin:
         ],
         selected_method: str,
     ) -> object | None:
-        """Create the final MAR imputation Auto-selection dashboard."""
+        """Create the final R-route imputation Auto-selection dashboard."""
         try:
             import patchworklib as pw
         except ImportError:

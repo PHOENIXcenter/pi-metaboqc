@@ -8,20 +8,20 @@
 
 ![Pipeline of π-MetaboQC](https://github.com/PHOENIXcenter/pi-metaboqc/raw/main/docs/pipeline_of_pi-metaboqc.png)
 
-The overview figure is a conceptual workflow summary. In v1.4.0, the framework-neutral object produced after construction is `MetaboDataset`. `MetaboDatasetBuilder.run_build()` returns this dataset and its typed audit through `StageResult`, the same boundary used by later processing actions. The same boundaries are intended to support future workflow-plugin and LLM-skill adapters while keeping those integrations outside the scientific core. The figure should therefore be read together with the current object contracts in the [native API reference](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/docs/native_api.md).
+The overview figure is a conceptual workflow summary. In v1.5.0, the framework-neutral object produced after construction is `MetaboDataset`. `MetaboDatasetBuilder.run_build()` returns this dataset and its typed audit through `StageResult`, the same boundary used by later processing actions. The same boundaries are intended to support future workflow-plugin and LLM-skill adapters while keeping those integrations outside the scientific core. The figure should therefore be read together with the current object contracts in the [native API reference](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/docs/native_api.md).
 
 > [!IMPORTANT]
-> **Version 1.4.0 is a breaking data-model release.** The former pandas-subclass-based `MetaboInt` API has been removed. Native integrations should now use `MetaboDataset` and typed `StageResult`/`AuditPayload` contracts. See the [changelog](CHANGELOG.md) for the complete migration boundary.
+> **Version 1.5.0 adds an optional R compatibility backend.** The 1.4.0 breaking data-model boundary remains in force: the former pandas-subclass-based `MetaboInt` API has been removed. Native integrations should use `MetaboDataset` and typed `StageResult`/`AuditPayload` contracts. See the [changelog](CHANGELOG.md) for the complete migration boundary.
 
 ## ✨ Core Capabilities
 
 * **Matrix-level LC-MS metabolomics QC workflow:** π-MetaboQC focuses on feature-intensity matrices from large, multi-batch metabolomics studies. It integrates dataset construction, missing-value triage, blank/QC filtering, signal correction, imputation, normalization, QA diagnostics, and report generation in a single reproducible workflow.
 
-* **Explicit Python-native data model and method implementations:** The core `MetaboDataset` keeps the intensity matrix, sample metadata, feature metadata, schema, and processing context as separate values. Classical preprocessing methods that often require R dependencies, including quantile normalization, VSN, QRILC, BPCA, RUV-III, and WaveICA 2.0, are implemented or reconstructed in Python and checked against optional R reference tests where applicable.
+* **Explicit Python-native data model and selectable implementations:** The core `MetaboDataset` keeps the intensity matrix, sample metadata, feature metadata, schema, and processing context as separate values. Python implementations remain the default. Users may explicitly select original R calls through the optional `rpy2` backend for VSN, BPCA, QRILC, Metanorm rLOESS, WaveICA 2.0, RUV-III, and a pinned local SERRF source adapter; the selected provider, source identity, package versions, parameters, and transformations are retained in the stage audit.
 
-* **Adaptive missing-value classification and imputation:** High-missing-value features are routed through biological-group MNAR rescue, QC-level MNAR rescue, MAR eligibility checking, or exclusion. MAR candidates are compared using a GMM- and low-intensity-noise mask that reflects the greater dropout risk of low-abundance MS signals. Selection integrates total and low-intensity NRMSE with masked-value distribution fidelity and study-sample structure preservation.
+* **Route-aware filtering and imputation:** Detection patterns, biological groups and QC intensity guide feature retention and handling. The reconstruction route (**R-route**, unrelated to the R programming language) evaluates candidate imputers; the special-handling route (**S-route**) retains features through group-pattern or low-intensity QC rescue and applies the configured lower-tail or small-value strategy. These are operational routes, not statistical missingness mechanisms. Reconstruction candidates are evaluated with an intensity-aware mask and a combination of total and low-intensity NRMSE, distribution fidelity and study-sample structure preservation.
 
-* **Evidence- and preservation-aware adaptive selection:** `AUTO` mode uses a common design across correction, imputation, and normalization. Candidate methods are evaluated with stage-specific evidence and a study-sample structure-preservation guardrail; the selected method and candidate metrics remain available for audit.
+* **Evidence- and preservation-aware adaptive selection:** `AUTO` selects among eligible candidates using predefined stage-specific metrics and study-sample structure preservation. Correction combines QC precision and D-ratio with sample-structure preservation; imputation evaluates masked reconstruction and distribution fidelity; normalization evaluates QC alignment, variance and structure. The selected method, candidate metrics and evaluation basis remain available for audit.
 
 * **Typed and serializable stage contracts:** Each stage returns a `StageResult` containing the data product and a stage-specific `AuditPayload`. Versioned, checksummed serialization makes these boundaries reproducible across Python sessions and suitable for workflow-plugin or LLM-skill adapters without relying on hidden DataFrame state.
 
@@ -83,9 +83,15 @@ cd pi-metaboqc
 pip install -e .
 ```
 
+### Optional original R implementations
+
+R is **not required** for the default Python workflow. To call supported original R implementations, follow the [optional R backend installation guide](docs/r_backend.md), then select `implementation="r"` in the relevant stage configuration. The guide covers R/rpy2, required packages, the separately obtained SERRF source and dependency checks.
+
+For API examples and input requirements, see [optional R implementations](docs/native_api.md#135-optional-r-implementations). R-enabled `AUTO` selection may include Python candidates where no R adapter exists; failed R calls never silently fall back to Python.
+
 ## 🚀 Quickstart & Tutorials
 
-π-MetaboQC is designed for zero-friction deployment. You only need three files to trigger the fully automated pipeline: a sample metadata table, a raw intensity matrix, and a TOML or JSON configuration file.
+After installing the dependencies, the pipeline accepts three input files: a sample metadata table, a feature-intensity matrix, and a TOML or JSON configuration file. The bundled demo supplies all three and uses `global_seed = 123`, shared with the supplementary case studies and manuscript analyses.
 
 We provide execution modalities for different use cases in the `examples/` directory. **For first-time users, we strongly recommend starting with the Interactive Notebook.**
 
@@ -93,13 +99,13 @@ We provide execution modalities for different use cases in the `examples/` direc
 | --- | --- |
 | [Interactive Notebook Tutorial](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/examples/interactive_tutorial.ipynb) | Step-by-step processing and QA dashboards |
 | [Headless CLI Example](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/examples/run_pimqc.py) | Scripted execution for production and batch workflows |
-| [Native Python API Reference (1.4.0)](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/docs/native_api.md) | Dataset and audit contracts, current method signatures, configuration, plotting, serialization, and reporting |
+| [Native Python API Reference (1.5.0)](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/docs/native_api.md) | Dataset and audit contracts, current method signatures, configuration, plotting, serialization, reporting, and optional R backends |
 
 ### 1. Interactive Notebook (Recommended for Onboarding)
 
 **[Interactive Tutorial (`interactive_tutorial.ipynb`)](https://github.com/PHOENIXcenter/pi-metaboqc/blob/main/examples/interactive_tutorial.ipynb)**: The maintained, end-to-end introduction to π-MetaboQC. It presents the native API step by step and displays the corresponding processing and QA dashboards at each stage. Use this notebook as the canonical template for adapting the workflow to a new dataset.
 
-**[Pre-rendered HTML Viewer](https://raw.githack.com/PHOENIXcenter/pi-metaboqc/main/examples/interactive_tutorial.html)**: A zero-loading, fully rendered static webpage. This ensures all inline high-resolution plots and metrics are displayed instantly, bypassing any GitHub API rendering timeouts or file size limits.
+Download and open the notebook in VS Code or Jupyter to inspect its saved outputs if GitHub's preview is unavailable. It reads the bundled configuration without imposing extra worker limits; edit the configuration to suit your machine. The tutorial contains standard processing and QA examples, not manuscript-specific exports.
 
 ### 2. Headless CLI Execution (For Production & Batch Processing)
 
@@ -134,6 +140,7 @@ pi-metaboqc/
 ├── README.md
 ├── pyproject.toml
 ├── LICENSE
+├── docs/                     # API, optional R setup and environment help
 ├── examples/
 │   ├── interactive_tutorial.ipynb
 │   └── run_pimqc.py
@@ -168,30 +175,23 @@ pi-metaboqc/
 └── tests/
     ├── unit/                  # Fast isolated behavior
     ├── integration/           # End-to-end pipeline execution
-    └── reference/             # Optional Python-to-R comparisons
+    ├── quality/               # Source conventions
+    └── reference/             # Optional production R-backend checks
 ```
 
-> *💡 **Note on Configuration:** The analytical workflow can be configured with either a `pipeline_parameters.toml` or `pipeline_parameters.json` file. Notebook or runtime keyword arguments take priority over file configuration, and file configuration takes priority over built-in defaults. Most users can therefore change datasets and analysis settings without modifying package source code.
+> **Note on configuration:** Non-`None` stage `run_*` overrides take priority over constructor overrides, followed by the validated TOML/JSON configuration and built-in defaults. The bundled demo intentionally overrides some built-in values. Most users can change datasets and settings without modifying package source code.
 
-## 📖 Hands-on Case Study
+## 📖 Supplementary Analyses
 
-To demonstrate the robustness, reproducibility, and correction efficacy of π-MetaboQC in real-world scenarios, we provide a dedicated case study repository. It contains paper-reproduction materials and is not a runtime dependency of π-MetaboQC.
-
-👉 **[pi-metaboqc-casestudy](https://github.com/PHOENIXcenter/pi-metaboqc-casestudy)**
-
-The case study repository contains:
-
-* **Diverse Real-World & Benchmark Datasets**: Includes actual metabolomics datasets generated in-house and benchmark data from published tools. Both the originally downloaded raw datasets and the fully pre-processed versions are provided.
-
-* **Transparent Data Preparation**: We provide all data cleaning and formatting scripts used to convert raw matrices into the standardized input formats required by π-MetaboQC.
-
-* **Highly Organized Project Structure**: All ready-to-run data is systematically categorized by project under the `data/processed/` directory. Each project directory is self-contained with its specific matrices, metadata, and a dedicated `pipeline_parameters.toml` configuration file.
-
-* **Project-Specific Analytical Notebooks**: For every dataset, you will find a dedicated, interactive Jupyter Notebook that executes the complete π-MetaboQC analytical pipeline under the `scripts/evaluation` directory, providing step-by-step demonstrations and embedded diagnostic visualizations.
-
-The case study is intended for reproducibility and method comparison; new users should first use the interactive notebook to learn the pipeline's configuration and capabilities.
+Research comparisons, case studies and sensitivity analyses are maintained in [pi-metaboqc-supplementary](https://github.com/PHOENIXcenter/pi-metaboqc-casestudy), independently of the core package. The link retains the currently configured GitHub address; renaming the local checkout does not rename the remote repository.
 
 ## 🤝 Contributing & License
 
 This project is licensed under the **MIT License**.
 Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/PHOENIXcenter/pi-metaboqc/issues).
+
+### AI-assisted development
+
+Codex (OpenAI) assisted with project refactoring and the Python reimplementation of selected R algorithms.
+
+The project maintainers remain responsible for scientific decisions, code review, validation, and releases. AI-assisted implementation does not by itself establish correctness or Python–R equivalence; such claims require the documented comparisons and their limitations. The original algorithms and upstream R code remain credited to their respective authors. AI tools are not credited as authors.

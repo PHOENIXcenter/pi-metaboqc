@@ -129,10 +129,66 @@ def test_saved_audit_renders_without_distance_or_qc_recalculation(
             audit.candidate_results, audit.selected_label
         )
     assert dashboard is not None
+    if stage == "correction":
+        assert "selected_correction_d_ratio" in dashboard.bricks_dict
+        assert len(dashboard.bricks_dict) == 7
+        d_ratio_ax = dashboard.bricks_dict["selected_correction_d_ratio"]
+        assert any(
+            "Median D-ratio" in text.get_text()
+            for text in d_ratio_ax.texts
+        )
     plotter.save_and_show_pw(
         dashboard, file_path=str(tmp_path / f"{stage}.svg"), show_plot=False
     )
     assert (tmp_path / f"{stage}.svg").stat().st_size > 1000
+    if stage == "correction":
+        method_dashboard = plotter.plot_correction_dashboard(
+            audit.candidate_results,
+            audit.selected_label,
+            include_auto_summary=False,
+        )
+        assert set(method_dashboard.bricks_dict) == {
+            "selected_correction_qc_rsd",
+            "selected_featurewise_qc_rsd_ecdf",
+            "selected_correction_d_ratio",
+            "selected_correction_sample_structure",
+        }
+        plotter.save_and_show_pw(
+            method_dashboard,
+            file_path=str(tmp_path / "correction_method.svg"),
+            show_plot=False,
+        )
+        assert (tmp_path / "correction_method.svg").stat().st_size > 1000
+        candidates = plotter.plot_correction_candidate_dashboard(
+            audit.candidate_results, audit.selected_label
+        )
+        assert set(candidates.bricks_dict) == {
+            "candidate_qc_rsd_comparison",
+            "candidate_d_ratio_comparison",
+            "correction_mode_legend",
+        }
+        rsd_labels = [
+            tick.get_text()
+            for tick in candidates.bricks_dict[
+                "candidate_qc_rsd_comparison"
+            ].get_xticklabels()
+        ]
+        assert len(rsd_labels) == 2  # Baseline and one final candidate result.
+        assert all("Intra" not in label for label in rsd_labels)
+        assert all("Inter" not in label for label in rsd_labels)
+        assert all(
+            "OOF" not in label and "Full" not in label for label in rsd_labels
+        )
+        np.testing.assert_allclose(
+            candidates.bricks_dict["candidate_qc_rsd_comparison"].get_xticks(),
+            candidates.bricks_dict["candidate_d_ratio_comparison"].get_xticks(),
+        )
+        plotter.save_and_show_pw(
+            candidates,
+            file_path=str(tmp_path / "correction_candidates.svg"),
+            show_plot=False,
+        )
+        assert (tmp_path / "correction_candidates.svg").stat().st_size > 1000
     if stage != "imputation":
         names = {item.name for item in fields(audit)}
         assert "candidate_results" not in names

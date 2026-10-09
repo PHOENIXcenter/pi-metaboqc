@@ -51,6 +51,11 @@ class NormalizationStageRunner(StageRunner["DataNormalizer", MetaboDataset]):
                 "log_base": "2" if is_logged else "None",
                 "is_scaled": False,
                 "scale_method": "None",
+                "extra_attrs": {
+                    **self.processor.dataset.context.extra_attrs,
+                    "value_scale": normalized_frame.attrs["value_scale"],
+                    "norm_method": normalized_frame.attrs["norm_method"],
+                },
             },
         )
         seed = int(
@@ -122,6 +127,8 @@ class NormalizationStageRunner(StageRunner["DataNormalizer", MetaboDataset]):
     def _output_suffix(normalized: pd.DataFrame) -> str:
         method = normalized.attrs.get("norm_method", "ROBUST_LOG_ONLY")
         parts = [method]
+        if normalized.attrs.get("implementation") == "r":
+            parts.append("R")
         if normalized.attrs.get("is_logged", False) and method.upper() not in {
             "VSN",
             "ROBUST_LOG_ONLY",

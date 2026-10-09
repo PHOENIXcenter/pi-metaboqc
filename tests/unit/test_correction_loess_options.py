@@ -64,8 +64,8 @@ def test_span_selection_uses_grid_and_falls_back_below_minimum_qcs() -> None:
     assert fallback == 0.5
 
 
-def test_qc_rlsc_gcv_options_support_standard_and_robust_modes() -> None:
-    """Confirm both weighting modes share degree and span settings."""
+def test_nonrobust_qc_rlsc_retains_legacy_degree_and_span_options() -> None:
+    """Keep the preexisting ordinary QC-RLSC prediction/OOF contract."""
     orders = np.arange(1.0, 19.0)
     qc_mask = np.zeros(len(orders), dtype=bool)
     qc_mask[::2] = True
@@ -82,9 +82,9 @@ def test_qc_rlsc_gcv_options_support_standard_and_robust_modes() -> None:
         "cv_folds": 3,
     }
 
-    for robust in (False, True):
+    for robust in (False,):
         stages = RegressionCorrector(
-            "QC-RLSC", robust=robust, robust_iterations=3, **common_params
+            "QC-RLSC", robust=robust, **common_params
         ).fit_transform(
             intensity_df=data,
             batch_array=np.repeat("batch_1", len(orders)),

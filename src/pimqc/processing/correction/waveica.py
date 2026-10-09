@@ -16,6 +16,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import SplineTransformer
 
 from ...constants import DEFAULT_RANDOM_SEED
+from .missing_input import prepare_median_input
 
 
 class WaveICA2Corrector:
@@ -61,28 +62,7 @@ class WaveICA2Corrector:
         self.selected_component_r2: list[np.ndarray] = []
         self.blank_proxy_extrapolation_cells = 0
         self.blank_source_extrapolation_count = 0
-
-    @staticmethod
-    def _fill_missing_by_feature_median(data: np.ndarray) -> np.ndarray:
-        """Fill missing feature values before matrix factorization."""
-        filled = data.copy().astype(float)
-        nan_mask = np.isnan(filled)
-        if not nan_mask.any():
-            return filled
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            col_medians = np.nanmedian(filled, axis=0)
-            global_median = np.nanmedian(filled)
-
-        if not np.isfinite(global_median):
-            global_median = 0.0
-        col_medians = np.where(
-            np.isfinite(col_medians), col_medians, global_median
-        )
-        row_idx, col_idx = np.where(nan_mask)
-        filled[row_idx, col_idx] = col_medians[col_idx]
-        return filled
+        self.diagnostics = {}
 
     def _decompose(self, data: np.ndarray) -> list[np.ndarray]:
         """Compute periodic Haar MODWT coefficients along the sample axis."""
@@ -529,6 +509,10 @@ class WaveICA2Corrector:
 
         raw = sorted_df.T.values.astype(float)
         nan_mask = np.isnan(raw)
+        median_frame, _, missing_diagnostics = prepare_median_input(
+            sorted_df, fit_mask, scale="raw"
+        )
+        self.diagnostics["missing_input_adapter"] = missing_diagnostics
         proxy, self.blank_proxy_extrapolation_cells = (
             self._interpolate_nonblank_proxy(
                 raw=raw,
@@ -537,7 +521,16 @@ class WaveICA2Corrector:
                 fit_mask=fit_mask,
             )
         )
-        filled = self._fill_missing_by_feature_median(proxy)
+        filled = proxy.copy()
+        proxy_missing = np.isnan(filled)
+        filled[proxy_missing] = median_frame.T.to_numpy()[proxy_missing]
+        fit_missing_count = int(nan_mask[fit_mask].sum())
+        if fit_missing_count:
+            logger.warning(
+                "WaveICA temporarily median-filled {} missing cells; "
+                "original missing positions will be restored.",
+                fit_missing_count,
+            )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             fit_means = np.nanmean(raw[fit_mask, :], axis=0)
@@ -568,7 +561,6 @@ class WaveICA2Corrector:
                 self.blank_source_extrapolation_count,
             )
 
-        corrected = np.clip(corrected, a_min=1e-6, a_max=None)
         corrected[nan_mask] = np.nan
         corrected = corrected[inverse_idx, :]
 

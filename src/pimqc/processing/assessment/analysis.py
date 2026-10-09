@@ -144,35 +144,19 @@ class QualityAssessor(DatasetProcessor):
     @cached_property
     def rsd_distribution(self) -> dict[str, dict[str, int]]:
         """Calculates and caches the RSD distribution for QA reporting."""
+        from ...statistics.value_scale import positive_view_rsd
+
         sample_type = self.config.get("sample_type", "Sample Type")
         actual_label = self.config.get("sample_dict", {}).get(
             "Actual sample", "Sample"
         )
 
-        def _get_dist(data: pd.DataFrame) -> dict[str, int]:
+        self.stats["rsd_evaluation"] = {}
+
+        def _get_dist(data: pd.DataFrame, role: str) -> dict[str, int]:
             labels = ["0-10%", "10-20%", "20-30%", ">30%"]
-            if data.empty:
-                return {label: 0 for label in labels}
-
-            # =================================================================
-            # State-Aware Pseudo-linearization (The Magic Trick)
-            # Restore exponential distribution to calculate meaningful RSD
-            # =================================================================
-            if self.config.get("is_logged", False):
-                # Use exp2 to reverse both robust_log and approximate VSN glog.
-                # Since RSD(C*X) == RSD(X), the constants don't affect the
-                # ratio.
-                linear_data = np.exp2(data.astype(float)) - 1.0
-                # Prevent negative intensities caused by LOD offsets or VSN
-                linear_data = linear_data.clip(lower=1e-9)
-            else:
-                linear_data = data.astype(float)
-
-            # Prevent division by zero if a feature is completely blank
-            means = linear_data.mean(axis=1).replace(0, 1e-9)
-            stds = linear_data.std(axis=1, ddof=1)
-
-            rsd = stds / means
+            rsd, report = positive_view_rsd(data, self.config)
+            self.stats["rsd_evaluation"][role] = report
 
             # Binning logic
             bins = [-np.inf, 0.1, 0.2, 0.3, np.inf]
@@ -186,8 +170,10 @@ class QualityAssessor(DatasetProcessor):
         )
 
         return {
-            "qc": _get_dist(self.qc_data),
-            "actual": _get_dist(self.frame.loc[:, actual_sample_mask]),
+            "qc": _get_dist(self.qc_data, "qc"),
+            "actual": _get_dist(
+                self.frame.loc[:, actual_sample_mask], "actual"
+            ),
         }
 
     @cached_property
@@ -771,4 +757,5 @@ class QualityAssessor(DatasetProcessor):
 
         # Feature RSD Distribution Statistics
         metrics["rsd_distribution"] = self.rsd_distribution
+        metrics["rsd_evaluation"] = self.stats.get("rsd_evaluation", {})
         return metrics

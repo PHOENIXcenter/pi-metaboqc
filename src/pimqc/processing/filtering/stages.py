@@ -16,6 +16,12 @@ from typing import Any, Mapping
 import pandas as pd
 
 from ...core import MetaboDataset
+from ...core.routes import (
+    R_ROUTE,
+    S_ROUTE,
+    normalize_route_labels,
+    routes_from_metadata,
+)
 from ...runtime import log_execution_time
 from ..audit import MissingValueFilterAuditPayload
 from ..stage import StageResult
@@ -198,36 +204,28 @@ class FeatureQualityFilter(_FilterStageFacade):
     def _indices_from_metadata(
         metadata: pd.DataFrame | pd.Series | None,
     ) -> tuple[pd.Index | None, pd.Index | None]:
-        """Extract MAR/MNAR identifiers from explicit feature metadata."""
+        """Extract R/S-route identifiers, accepting historical route aliases."""
         if metadata is None:
             return None, None
         if isinstance(metadata, pd.Series):
             labels = metadata
         elif isinstance(metadata, pd.DataFrame):
-            if "missingness_type" in metadata.columns:
-                labels = metadata["missingness_type"]
+            if {"imputation_route", "missingness_type"} & set(metadata.columns):
+                labels = routes_from_metadata(metadata, strict=False)
             elif "Stage1_Status" in metadata.columns:
-                labels = metadata["Stage1_Status"].map(
-                    lambda value: (
-                        "MNAR"
-                        if "MNAR" in str(value).upper()
-                        else "MAR"
-                        if str(value).upper() == "MAR"
-                        else "INVALID"
-                    )
-                )
+                labels = metadata["Stage1_Status"]
             else:
                 raise ValueError(
-                    "missingness_metadata must contain a 'missingness_type' "
-                    "or 'Stage1_Status' column."
+                    "missingness_metadata must contain 'imputation_route', "
+                    "legacy 'missingness_type', or 'Stage1_Status'."
                 )
         else:
             raise TypeError(
                 "missingness_metadata must be a pandas Series or DataFrame."
             )
-        labels = labels.astype(str).str.upper()
-        idx_mar = labels.index[labels == "MAR"]
-        idx_mnar = labels.index[labels == "MNAR"]
+        labels = normalize_route_labels(labels, strict=False)
+        idx_mar = labels.index[labels == R_ROUTE]
+        idx_mnar = labels.index[labels == S_ROUTE]
         if idx_mar.empty and idx_mnar.empty:
             # An audit table without any recognized class is equivalent to an
             # absent upstream missingness result for this independent action.

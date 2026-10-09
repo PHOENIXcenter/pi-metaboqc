@@ -74,11 +74,15 @@ def test_sample_ids_and_threshold_follow_upstream_audit():
 @pytest.mark.parametrize("method", ["QC-SVR", "QC-RLSC"])
 def test_no_missing_correction_to_normalization_is_numeric(method):
     """Float output remains usable when imputation legitimately skips."""
+    # This three-QC fixture tests ordinary regression, not quadratic rLOESS.
+    # Sparse robust fits have explicit unavailable-output coverage elsewhere.
     corrected = SignalCorrector(
-        _dataset(), base_est=method, n_jobs=1
+        _dataset(), base_est=method, rlsc_robust=False, n_jobs=1
     ).run_signal_correction()
     final = list(corrected.data.values())[-1]
+    assert corrected.audit.selected_label == method
     assert all(pd.api.types.is_numeric_dtype(t) for t in final.intensity.dtypes)
+    assert np.isfinite(final.intensity.to_numpy()).all()
     imputed = MissingValueImputer(final).run_imputation()
     assert imputed.audit.skipped
     normalized = DataNormalizer(

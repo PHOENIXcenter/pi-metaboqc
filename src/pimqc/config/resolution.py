@@ -12,7 +12,7 @@ from collections.abc import Mapping
 
 from pydantic import ValidationError
 
-from .schema import PipelineConfig
+from .schema import PipelineConfig, normalize_imputation_route_options
 
 
 _PIPELINE_SECTION_NAMES = frozenset(PipelineConfig.model_fields)
@@ -30,7 +30,11 @@ def resolve_stage_config(
     pipeline section, then explicit non-``None`` constructor arguments.
     """
 
-    resolved = dict(defaults)
+    resolved = (
+        normalize_imputation_route_options(defaults)
+        if section_name == "MissingValueImputer"
+        else dict(defaults)
+    )
     if pipeline_params is not None:
         if section_name in _PIPELINE_SECTION_NAMES:
             # Direct processor construction uses the same strict boundary as
@@ -57,6 +61,10 @@ def resolve_stage_config(
             resolved.update(section)
 
     if explicit_overrides is not None:
+        if section_name == "MissingValueImputer":
+            explicit_overrides = normalize_imputation_route_options(
+                explicit_overrides
+            )
         resolved.update(
             {
                 key: value
@@ -71,6 +79,8 @@ def validate_stage_values(
     section_name: str, values: Mapping[str, object]
 ) -> dict[str, object]:
     """Validate scientific settings while retaining dataset context fields."""
+    if section_name == "MissingValueImputer":
+        values = normalize_imputation_route_options(values)
     section = PipelineConfig.model_fields.get(section_name)
     if section is None:
         return dict(values)

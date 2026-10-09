@@ -11,6 +11,12 @@ CORRECTION_METHODS = MethodRegistry(
     [
         MethodSpec("AUTO", "AUTO", aliases=("Auto",)),
         MethodSpec(
+            "Metanorm-rLOESS",
+            "Metanorm-rLOESS",
+            handler_name="MetanormRLOESSCorrector",
+            supports_auto=False,
+        ),
+        MethodSpec(
             "QC-RLSC",
             "QC-RLSC",
             aliases=("RLSC", "LOESS"),

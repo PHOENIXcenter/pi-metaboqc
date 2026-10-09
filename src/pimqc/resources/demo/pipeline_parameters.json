@@ -8,7 +8,7 @@
     "batch": "Batch",
     "inject_order": "Inject Order",
     "boundary": "IQR",
-    "global_seed": 0,
+    "global_seed": 123,
     "internal_standard": [
       "Phenylalanine-d5",
       "Choline-d4",
@@ -58,6 +58,7 @@
     "qc_rsd_tol": 0.3
   },
   "SignalCorrector": {
+    "implementation": "python",
     "base_est": "Auto",
     "loess_span": 0.5,
     "loess_degree": 1,
@@ -69,7 +70,9 @@
     ],
     "rlsc_min_qc": 7,
     "rlsc_robust": true,
-    "rlsc_robust_iterations": 3,
+    "rloess_span_selection": "gcv",
+    "rloess_span": 0.75,
+    "rloess_iterations": 4,
     "rf_n_tree": 200,
     "serrf_n_tree": 100,
     "serrf_corr_features": 5,
@@ -81,6 +84,7 @@
     "ruv_k": 5,
     "waveica_components": 10,
     "waveica_cutoff": 0.1,
+    "waveica_alpha": 0.0,
     "waveica_spline_knots": 5,
     "waveica_max_iter": 1000,
     "regression_backend": "loky",
@@ -89,9 +93,10 @@
     "n_jobs": -1
   },
   "MissingValueImputer": {
-    "mnar_method": "QRILC",
+    "implementation": "python",
+    "s_route_method": "QRILC",
     "mnar_fraction": 0.5,
-    "mar_method": "Auto",
+    "r_route_method": "Auto",
     "knn_neighbors": 5,
     "lls_neighbors": 15,
     "bpca_components": 2,
@@ -100,6 +105,7 @@
     "sim_mask_ratio": 0.05
   },
   "DataNormalizer": {
+    "implementation": "python",
     "norm_method": "Auto",
     "n_jobs": -1
   }

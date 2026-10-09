@@ -1,1 +1,1 @@
-"""Optional cross-language reference tests for numerical implementations."""
+"""Optional original-R adapter and numerical-backend contract tests."""

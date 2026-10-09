@@ -472,8 +472,17 @@ class NarrativeStatsReporter:
             values = distribution.get(sample_class, {})
             return {label: int(values.get(label, 0)) for label in labels}
 
+        def get_evaluation(stage_key: str) -> Dict[str, Any]:
+            stage_data = qa_metrics.get(stage_key, {})
+            evaluation = stage_data.get("rsd_evaluation", {})
+            qc_evaluation = evaluation.get("qc", {})
+            return (
+                dict(qc_evaluation) if isinstance(qc_evaluation, dict) else {}
+            )
+
         raw_qc = get_distribution("raw_dataset", "qc")
         raw_actual = get_distribution("raw_dataset", "actual")
+        raw_evaluation = get_evaluation("raw_dataset")
         raw_total = sum(raw_qc.values())
         raw_actual_total = sum(raw_actual.values())
 
@@ -490,6 +499,7 @@ class NarrativeStatsReporter:
 
         final_qc = get_distribution(final_key, "qc")
         final_actual = get_distribution(final_key, "actual")
+        final_evaluation = get_evaluation(final_key)
         final_total = sum(final_qc.values())
         actual_total = sum(final_actual.values())
         if final_total == 0 or actual_total == 0:
@@ -510,6 +520,23 @@ class NarrativeStatsReporter:
             "final_actual_high_count": final_actual[">30%"],
             "final_actual_total": actual_total,
             "final_actual_high_pct": 100 * final_actual[">30%"] / actual_total,
+            "raw_evaluation_scale": raw_evaluation.get(
+                "evaluation_scale", "N/A"
+            ),
+            "final_evaluation_scale": final_evaluation.get(
+                "evaluation_scale", "N/A"
+            ),
+            "raw_input_scale": raw_evaluation.get("input_scale", "N/A"),
+            "final_input_scale": final_evaluation.get("input_scale", "N/A"),
+            "scale_comparable": (
+                raw_evaluation.get("input_scale")
+                in {"raw_positive", "log2", "log2p1"}
+                and final_evaluation.get("input_scale")
+                in {"raw_positive", "log2", "log2p1"}
+            ),
+            "final_is_raw_intensity_inverse": final_evaluation.get(
+                "is_raw_intensity_inverse", False
+            ),
         }
 
     def _create_pca_summary_table(self, qa_metrics: Dict[str, Any]) -> str:
@@ -740,6 +767,7 @@ class NarrativeStatsReporter:
             rows.append(
                 [
                     label,
+                    candidate.get("implementation", "N/A"),
                     self._format_candidate_metric(candidate.get("nrmse_low")),
                     self._format_candidate_metric(candidate.get("nrmse_total")),
                     self._format_candidate_metric(candidate.get("jsd_total")),
@@ -752,6 +780,7 @@ class NarrativeStatsReporter:
 
         headers = [
             "Candidate",
+            "Implementation",
             "Low NRMSE",
             "Total NRMSE",
             "JSD",
@@ -788,6 +817,7 @@ class NarrativeStatsReporter:
             rows.append(
                 [
                     method,
+                    candidate.get("implementation", "N/A"),
                     self._format_candidate_metric(
                         candidate.get("overall_score")
                     ),
@@ -810,6 +840,7 @@ class NarrativeStatsReporter:
             return ""
         headers = [
             "Candidate",
+            "Implementation",
             "Overall",
             "RLE",
             "Variance",
@@ -846,13 +877,14 @@ class NarrativeStatsReporter:
             rows.append(
                 [
                     method,
+                    candidate.get("implementation", "N/A"),
                     self._format_candidate_metric(candidate.get("auto_score")),
                     self._format_candidate_metric(candidate.get("eval_rsd")),
                     self._format_candidate_metric(
-                        candidate.get("median_qc_rsd_improvement_score")
+                        candidate.get("technical_precision_score")
                     ),
                     self._format_candidate_metric(
-                        candidate.get("featurewise_qc_rsd_improvement_score")
+                        candidate.get("d_ratio_preservation_score")
                     ),
                     self._format_candidate_metric(
                         candidate.get("sample_structure_score")
@@ -864,11 +896,12 @@ class NarrativeStatsReporter:
             return ""
         headers = [
             "Candidate",
+            "Implementation",
             "AUTO score",
             "Eval. QC RSD",
-            "Median RSD gain",
-            "Feature RSD gain",
-            "Sample structure",
+            "Technical precision",
+            "D-ratio preservation",
+            "Sample-structure preservation",
         ]
         table = tabulate(
             rows,

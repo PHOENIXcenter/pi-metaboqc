@@ -32,7 +32,7 @@ class ImputationScorecardMixin:
         ax: plt.Axes | None = None,
         show_legend: bool = False,
     ) -> plt.Axes:
-        """Plot MAR imputation AUTO score components or fallback NRMSE."""
+        """Plot R-route imputation AUTO score components or fallback NRMSE."""
         try:
             import patchworklib as pw
         except ImportError as exc:
@@ -172,7 +172,7 @@ class ImputationScorecardMixin:
                     fontsize=pu.DEFAULT_ANNOTATION_FONTSIZE,
                 )
             current_ax.tick_params(axis="y", length=0)
-            title = "MAR Imputer Ranking"
+            title = "R-route Imputer Ranking"
             xlabel = "NRMSE Total"
 
         self._apply_standard_format(
@@ -325,7 +325,7 @@ class ImputationScorecardMixin:
         title_fontsize: float = pu.DEFAULT_LEGEND_TITLE_FONTSIZE,
         article_compact: bool = False,
     ) -> plt.Axes:
-        """Draw a standalone legend for MAR imputation score components."""
+        """Draw a standalone legend for R-route imputation score components."""
         import matplotlib.patches as mpatches
 
         ax.axis("off")

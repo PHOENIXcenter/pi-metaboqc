@@ -259,11 +259,9 @@ def test_correction_helpers_read_composed_dataset_roles() -> None:
     """Resolve QC and control features without subclass-only attributes."""
     processor = SignalCorrector(_minimal_dataset())
 
-    correlation = processor._prepare_serrf_correlation_matrix()
     controls = processor._prepare_ruv_control_features()
 
-    assert correlation is not None
-    assert correlation.shape == (2, 2)
+    assert not processor.qc_data.empty
     assert set(controls) == {"F1", "F2"}
 
 
@@ -323,6 +321,8 @@ def test_auto_imputation_keeps_request_and_selection_separate() -> None:
     assert candidate_result["jsd_total"] == 0.1
     assert candidate_result["wasserstein_normalized"] == 0.1
     assert result.audit.metrics["feature_distribution"] == {
+        "r_route_count": 2,
+        "s_route_count": 0,
         "mar_count": 2,
         "mnar_count": 0,
     }

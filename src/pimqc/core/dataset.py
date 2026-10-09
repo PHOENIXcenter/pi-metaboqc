@@ -119,9 +119,11 @@ class DatasetSchema:
 class ProcessingContext:
     """Framework-independent acquisition and transformation context.
 
-    ``extra_attrs`` is reserved for framework-neutral acquisition annotations
-    that are not yet represented by first-class fields. Scientific results
-    and stage decisions belong in typed audit payloads instead.
+    ``extra_attrs`` holds framework-neutral acquisition and value-scale
+    annotations not yet represented by first-class fields. ``value_scale``
+    distinguishes raw, log2, log2p1 and VSN glog coordinates without changing
+    the artifact dataclass schema. Numerical results and stage decisions
+    belong in typed audit payloads instead.
     """
 
     acquisition_mode: str = "ESI+"

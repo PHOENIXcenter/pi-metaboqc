@@ -1,96 +1,58 @@
-# π-MetaboQC: VS Code Environment & Troubleshooting Guide
+# VS Code and Conda troubleshooting — pi-metaboqc 1.5.0
 
-**IDE-Level Configuration for Large-Scale Clinical Metabolomics QC Pipelines**
+This guide covers the public [interactive tutorial](../examples/interactive_tutorial.ipynb) and [CLI example](../examples/run_pimqc.py). Follow the [installation instructions](../README.md#-installation) first. The optional R backend has its own [setup guide](r_backend.md).
 
-**Category:** Technical Deployment & Architecture | **Core Stack:** Conda (metaboqc) + VS Code Integrated Terminal
+## Select and verify the environment
 
----
+Select the `metaboqc` interpreter with **Python: Select Interpreter**. For notebooks, also select the matching kernel: a terminal's active environment does not determine the notebook kernel. Open a fresh terminal, activate the environment, and check the actual executable and installed package:
 
-## 1. Introduction & Architectural Background
-
-π-MetaboQC is a high-performance, automated quality control pipeline optimized for large-scale, multi-batch metabolomics data. It is distributed as `pi-metaboqc` and provides the `pimqc` Python package. To meet the non-interactive deployment requirements of High-Performance Computing (HPC) clusters and backend batch processing, the project features a robust, `argparse`-based CLI execution script (`run_pimqc.py`).
-
-However, when using **Visual Studio Code (VS Code)** as an Integrated Development Environment (IDE) on Windows, developers frequently encounter a specific anomaly: *pure Python dependencies run perfectly, but system-level graphical or report rendering modules crash or gracefully degrade*. 
-
-This is rarely a flaw in the code logic. Instead, it stems from partial incompatibilities between the IDE's terminal process management and Conda's virtual environment isolation mechanisms. This document comprehensively analyzes these traps and provides industrial-grade solutions.
-
-## 2. Core Technical Dependencies
-
-Understanding the root cause requires clarifying the underlying report rendering architecture of `run_pimqc.py`. The pipeline relies heavily on `WeasyPrint` and `librsvg` engines to generate publication-quality PDF audit reports.
-
-| Component                            | Required Ecosystem                                        | Core Function & Manifestation                                |
-| :----------------------------------- | :-------------------------------------------------------- | :----------------------------------------------------------- |
-| **Python Computational Core**        | Pandas, NumPy, SciPy, Scikit-learn, Numba, Loguru         | Handles data ingestion, parallel/JIT-accelerated algorithm execution, baseline modeling, and matrix correction. |
-| **Report Compilation Engine**        | WeasyPrint, Jinja2, Pandoc                                | Converts intermediate QC assets into semantic HTML/Markdown and compiles them into high-fidelity PDF reports. |
-| **System-Level Dynamic C-Libraries** | **GTK3, Pango, Cairo, GObject** *(Native OS environment)* | Responsible for complex text layout, font mapping, and high-precision anti-aliased rendering of **lossless SVG vectors** into PDF media. |
-
-## 3. Typical Issues & Resolution Strategies
-
-### Issue 1: The VS Code Terminal Inheritance Trap (Missing C-Libraries)
-
-> **Symptom:** Logs indicate that the pipeline experienced a "graceful degradation" during report rendering, outputting an `.html` report instead of a `.pdf`, or the terminal throws underlying C-library addressing errors like `cannot load library 'gobject-2.0-0'`. However, rendering succeeds 100% of the time in a native system terminal (e.g., Anaconda Prompt).
-
-**Mechanism:** When executing `conda activate metaboqc` in a standard terminal, Conda not only switches the Python interpreter path but also triggers system hook scripts located in the `activate.d` directory. These scripts inject non-Python C-library paths (e.g., `Library/bin`) into the OS's global `PATH` variable.
-
-To maximize launch speed, VS Code's integrated terminal often employs a "shortcut" mechanism—**it merely swaps the Python executable path without running Conda's full system-level environment activation sequence**. Consequently, when `WeasyPrint` attempts to call system graphics libraries, the address resolution fails.
-
-#### 🛠️ Solution A: Force IDE Full Topology Activation (Highly Recommended)
-Configure VS Code to strictly invoke the system's Shell initialization chain when launching an integrated terminal.
-
-1. Press `Ctrl + ,` to open VS Code **Settings**.
-2. Search for `python.terminal.activateEnvironment` and ensure it is **Checked**.
-3. Search for `terminal.integrated.inheritEnv` and ensure it is **Checked**.
-4. **Crucial Step:** Press `Ctrl + Shift + P` to open the Command Palette and execute `Developer: Reload Window`.
-5. Terminate all existing integrated terminals and open a new one. You should now see the terminal explicitly print the full activation command rather than silently switching.
-
-#### 🛠️ Solution B: Hardcode Static Paths via Workspace Settings
-
-If Solution A fails due to OS security policies, you can explicitly inject the physical paths of the underlying C-libraries in the project's `.vscode/settings.json` (assuming installation at `D:\miniconda3`):
-
-```json
-{
-    "terminal.integrated.env.windows": {
-        "PATH": "D:\\miniconda3\\envs\\metaboqc\\Library\\bin;D:\\miniconda3\\envs\\metaboqc\\Scripts;${env:PATH}"
-    }
-}
+```bash
+conda activate metaboqc
+python -c "import sys, pimqc; print(sys.executable); print(pimqc.__version__)"
 ```
 
-> (Note: Backslashes `\` must be double-escaped `\\` in JSON. Placing `Library\bin` before `${env:PATH}` ensures the process prioritizes the GTK3/Pango dynamic link libraries deployed inside Conda.)
+If environment activation is missing, review VS Code's `python.terminal.activateEnvironment` and `terminal.integrated.inheritEnv` settings, then close the old terminal and open a new one. Activation behavior can also depend on the installed Python environment extensions. Selecting an interpreter alone does not prove that every external executable or shared library is available.
 
-### Issue 2: Windows PowerShell Execution Policy Restrictions
+The notebook uses the packaged configuration without additional worker caps. Adjust `n_jobs` in your configuration for your machine; `-1` requests the available CPU workers. Saved notebook displays are historical results, not evidence that your local environment has completed the workflow.
 
-> **Symptom:** When attempting to activate the environment or run a project shortcut within VS Code's built-in PowerShell terminal, a red security warning appears:
->
-> ```
-> cannot be loaded because running scripts is disabled on this system... UnauthorizedAccess
-> ```
+## Diagnose report conversion separately from processing
 
-**Mechanism:** This is a native security barrier in Windows OS (Execution Policy). The default PowerShell policy is usually `Restricted`, the highest defensive posture, which prohibits the execution of any `.ps1` scripts. This directly locks out the PowerShell environment activation hooks built into Miniforge/Miniconda.
+Generating Markdown reports does not require a PDF converter. Exporting HTML or PDF uses Pandoc; PDF export additionally needs WeasyPrint or XeLaTeX. The recommended Conda setup is:
 
-#### 🛠️ Solution: Elevate Script Trust Level for the Current User
+```bash
+conda install -c conda-forge pandoc weasyprint tinycss2 librsvg -y
+pandoc --version
+weasyprint --version
+```
 
-You do not need to compromise global system security. Simply grant `RemoteSigned` permission to the "Current User" (this allows locally written scripts to run, while internet-downloaded scripts still require authoritative digital signatures).
+On Windows, `where.exe pandoc` and `where.exe weasyprint` help check which executables the terminal resolves. Shared-library errors such as a missing GObject or Pango library can indicate incomplete activation, a missing dependency, or incompatible library versions; they are not automatically a VS Code defect.
 
-1. Type `PowerShell` into the Windows taskbar search box.
+Compare these checks in a newly activated Conda terminal and the VS Code terminal. Correct the selected environment or its dependencies before changing system paths. The report layer checks the active environment's `Library/bin` on Windows, but this cannot repair missing or incompatible libraries. Avoid committing machine-specific paths to the repository.
 
-2. Right-click **Windows PowerShell** and select **Run as Administrator** (Crucial).
+With `pdf_engine="weasyprint"`, export tries WeasyPrint, then XeLaTeX, then HTML. XeLaTeX is optional and needs `rsvg-convert` for SVG assets. Tools are not downloaded automatically. Successful HTML fallback returns `True`, so inspect the generated file and log to determine the actual format. CLI exit code `2` means scientific processing completed but report export failed; completed stage outputs remain available.
 
-3. Type the following command into the elevated console and press Enter:
+The tutorial defaults to Markdown generation with `EXPORT_PDF = False`. Enable that switch only when you want final report conversion. It does not disable scientific computation or the notebook's diagnostic displays.
 
-   PowerShell
+## PowerShell activation policy
 
-   ```
-   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-   ```
+If PowerShell reports that script execution is disabled, inspect the effective policies:
 
-4. When prompted by the console regarding risk, type **`Y`** and press Enter.
+```powershell
+Get-ExecutionPolicy -List
+```
 
-5. Completely close the VS Code process and restart it. Terminal script execution privileges are now fully unlocked.
+You can use Anaconda Prompt or another approved shell without changing the PowerShell policy. If local policy permits and you choose to allow local activation scripts, the following setting affects only your user account and normally does not require an administrator console:
 
-## 4. Pre-Flight Environment Health Checklist
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
 
-Before feeding large-scale clinical cohorts into the pipeline for formal batch processing, verify that VS Code meets the following technical benchmarks:
+Organizational Group Policy can override this setting. Do not bypass an enforced policy; ask your administrator for an approved activation route. Reopen the terminal after changing activation settings.
 
-- [ ] **Interpreter Verification:** The bottom-right status bar displays `Python 3.1X ('metaboqc': conda)`.
-- [ ] **Terminal Identifier:** The newly created integrated terminal line begins with a clear `(metaboqc)` environment tag.
-- [ ] **Addressing Test:** Type `where.exe weasyprint` (Windows) or `which weasyprint` (Linux/macOS) in the terminal. The system should seamlessly echo the absolute path within the Conda environment, rather than returning a "not found" error.
+## Before running
+
+- Confirm that the terminal and notebook kernel use the intended Python environment.
+- Verify the package version and load a valid TOML or JSON configuration.
+- Check report converters only if report conversion is required.
+- For `implementation="r"`, check R, the needed packages and any external SERRF source using the [R backend guide](r_backend.md).
+- Save the executed notebook to retain visible tables, plots, warnings and logs in VS Code.

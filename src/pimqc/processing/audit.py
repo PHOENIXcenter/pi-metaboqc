@@ -220,7 +220,11 @@ class QualityFilterAuditPayload(AuditPayload):
 
 @dataclass
 class ImputationAuditPayload(AuditPayload):
-    """Typed MAR/MNAR method selection and reconstruction audit."""
+    """Typed R/S-route method selection and reconstruction audit.
+
+    ``mar_feature_count`` retains its serialized name for historical readers.
+    New callers can use the equivalent ``r_route_feature_count`` property.
+    """
 
     metric_values: Mapping[str, Any]
     candidate_results: Mapping[str, Any]
@@ -234,6 +238,11 @@ class ImputationAuditPayload(AuditPayload):
     plot_payload: ImputationPlotPayload | None = field(repr=False)
 
     audit_type: ClassVar[str] = "imputation"
+
+    @property
+    def r_route_feature_count(self) -> int:
+        """Return the reconstruction count without changing saved schemas."""
+        return self.mar_feature_count
 
     @property
     def metrics(self) -> Mapping[str, Any]:

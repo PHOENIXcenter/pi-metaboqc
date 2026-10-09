@@ -1,6 +1,6 @@
 """Export and visualize completed sample and feature filtering results.
 
-The runners keep high-missing sample removal, MAR/MNAR classification, and
+The runners keep high-missing sample removal, R/S-route assignment, and
 low-quality feature rules inside ``FeatureFilter`` while moving CSV output and
 dashboard construction into explicit post-transformation lifecycle phases.
 """
@@ -61,7 +61,7 @@ class MissingValueFilteringStageRunner(
     """Run missingness classification and its feature-retention dashboard."""
 
     def compute(self) -> StageResult[MetaboDataset]:
-        """Classify features and retain accepted MAR or MNAR features."""
+        """Assign and retain accepted R-route or S-route features."""
         return self.processor.filter_missing_values()
 
     def export(self, result: StageResult[MetaboDataset]) -> None:
@@ -84,7 +84,7 @@ class MissingValueFilteringStageRunner(
         )
 
     def render(self, result: StageResult[MetaboDataset]) -> None:
-        """Render the MAR/MNAR classification and retention dashboard."""
+        """Render operational route assignment and feature retention."""
         assert self.output_dir is not None
         audit = result.require_audit(MissingValueFilterAuditPayload)
         payload = audit.plot_payload
@@ -167,8 +167,8 @@ class QualityFilteringStageRunner(StageRunner["FeatureFilter", MetaboDataset]):
         Args:
             processor: Filtering processor containing the source matrix.
             output_dir: Optional directory for tables and dashboards.
-            idx_mar: Optional MAR feature identifiers.
-            idx_mnar: Optional MNAR feature identifiers.
+            idx_mar: Legacy name for optional R-route feature identifiers.
+            idx_mnar: Legacy name for optional S-route feature identifiers.
             missingness_tracking: Optional complete Feature MV audit table used
                 to render explicit cross-stage retention history.
             runtime_overrides: Named threshold overrides for this execution.

@@ -34,7 +34,8 @@ inject_order = "Inject Order"
 boundary = "IQR"
 
 # [Integer] Base seed for deterministic random components and simulations.
-global_seed = 0
+# Shared with the supplementary three-batch case study.
+global_seed = 123
 
 # [Array] Target feature IDs acting as internal standards for drift tracking and outlier detection.
 internal_standard = [
@@ -113,14 +114,16 @@ mv_qc_tol = 0.3
 # [Float] Maximum allowed missing value ratio within at least ONE biological group.
 mv_group_tol = 0.5
 
-# 3. MNAR Rescue Thresholds (Trace-level Biomarker Rescue)
-# [Float] Missing ratio threshold to define a feature as MNAR based on Biology.
+# 3. S-route Rescue Thresholds (Operational Special Handling)
+# The legacy mnar_* names are retained for configuration compatibility.
+# These rules assign processing routes; they do not infer MAR/MNAR mechanisms.
+# [Float] Group missingness threshold used with the group-retention criterion.
 mnar_group_mv_tol = 0.8
 
-# [Float] Missing ratio threshold to define a feature as MNAR based on analytical QC.
+# [Float] QC missingness threshold used with the low-QC-intensity criterion.
 mnar_qc_mv_tol = 0.2
 
-# [Float] Percentile of lowest intensities to check for LOD issue in QC samples.
+# [Float] Lower QC-intensity percentile used by the S-route rescue rule.
 mnar_intensity_pct = 0.1
 
 # 4.  Feature-Level Filtering (Quality-based)
@@ -134,6 +137,12 @@ qc_rsd_tol = 0.3
 # Signal Drift Correction
 # ------------------------------------------------------------------------------
 [SignalCorrector]
+# R methods: robust QC-RLSC, Metanorm-rLOESS, WaveICA 2.0, RUV-III, SERRF.
+# WaveICA/RUV/SERRF require complete non-Blank intensities.
+# RUV requires explicit ruv_control_features; SERRF needs serrf_r_source.
+# AUTO replaces robust QC-RLSC/SERRF/RUV/WaveICA with R.
+# Failed R candidates stay failed, without same-method Python fallback.
+implementation = "python"
 # [String] Primary algorithm for intra/inter-batch signal drift correction.
 # Options: "QC-SVR", "QC-RFSC", "QC-RLSC", "SERRF", "RUV-III", "WaveICA 2.0", "Auto".
 # "RUV", "WaveICA2", "WaveICA2.0", and "WaveICA-2.0" are accepted aliases.
@@ -143,16 +152,16 @@ qc_rsd_tol = 0.3
 # full-data QC RSD rather than out-of-fold QC RSD.
 base_est = "Auto"
 
-# [Float] LOESS span fraction, used strictly if base_est is "QC-RLSC".
+# [Float] Fixed LOESS span for nonrobust QC-RLSC only.
 loess_span = 0.5
 
 # [Integer] Local polynomial degree for QC-RLSC. Use 1 for linear LOESS (default)
-# or 2 for quadratic LOESS. This setting is shared by standard and robust QC-RLSC.
+# or 2 for quadratic LOESS. This affects nonrobust QC-RLSC only.
 loess_degree = 1
 
 # [String] QC-RLSC span selection: "fixed" uses loess_span; "gcv" selects from
-# rlsc_span_grid using QC-only OOF error. This setting is shared by standard and
-# robust QC-RLSC.
+# rlsc_span_grid using QC-only OOF error (legacy name, not true GCV).
+# These settings affect nonrobust QC-RLSC only.
 rlsc_span_selection = "fixed"
 
 # [Array] Constrained candidate spans used only when rlsc_span_selection = "gcv".
@@ -162,11 +171,16 @@ rlsc_span_grid = [0.3, 0.5, 0.7]
 # Features below this threshold fall back to the fixed loess_span.
 rlsc_min_qc = 7
 
-# [Boolean] Apply Tukey-bisquare residual reweighting when QC-RLSC is explicitly selected.
+# [Boolean] Use QC-only MetaNorm rLOESS when QC-RLSC is selected.
 rlsc_robust = true
 
-# [Integer] Residual-reweighting iterations when QC-RLSC robustness is enabled.
-rlsc_robust_iterations = 3
+# MetaNorm rLOESS: log2, batchwise quadratic symmetric LOESS, nonblank center.
+# Continuous fANCOVA GCV searches [0.05, 0.95]; fixed uses rloess_span.
+# Unestimable fits and predictions outside QC support remain missing.
+rloess_span_selection = "gcv"
+rloess_span = 0.75
+# Total fits including the initial fit (R loess.control iterations convention).
+rloess_iterations = 4
 
 # [Integer] Number of decision trees, used strictly if base_est is "QC-RFSC".
 # High density required to smooth 1D temporal signals.
@@ -179,6 +193,8 @@ serrf_n_tree = 100
 # [Integer] Number of top highly correlated metabolites to borrow for prediction network in "SERRF".
 # Set to 0 to degrade to pure temporal/batch regression. Recommended range: 5 to 50.
 serrf_corr_features = 5
+# R-only source, obtained separately (uncomment only with implementation="r"):
+# serrf_r_source = "C:/R-sources/Shiny-SERRF/app.R"
 
 # [String] Joblib backend for feature-wise SERRF correction.
 # Options: "loky" (recommended default) or "threading".
@@ -199,12 +215,17 @@ svr_gamma = 1.0
 
 # [Integer] Number of latent factors of unwanted variation to estimate and remove.
 ruv_k = 5
+# R-only negative controls and optional technical-repeat metadata column:
+# ruv_control_features = ["IS_1", "IS_2", "IS_3"]
+# ruv_replicate_column = "Technical Replicate"
 
 # [Integer] Number of independent components for WaveICA 2.0.
 waveica_components = 10
 
 # [Float] R2 cutoff for selecting injection-order-associated WaveICA 2.0 components.
 waveica_cutoff = 0.1
+# R-only stICA weighting; native Python does not use this option.
+waveica_alpha = 0.0
 
 # [Optional Integer] Number of periodic Haar MODWT levels for WaveICA 2.0.
 # Leave unset to use floor(log2(number of samples)).
@@ -234,22 +255,29 @@ n_jobs = -1
 # Missing Value Imputation
 # ------------------------------------------------------------------------------
 [MissingValueImputer]
-# [String] Imputation algorithm specifically for MNAR (LOD/Detection failure) values. Options: "Row-wise", "Column-wise", "Global", "QRILC".
-mnar_method = "QRILC"
+# R-route = reconstruction; S-route = special handling, not MAR/MNAR causes.
+# Route names do not specify the programming-language backend.
+# Use "r" with r_route_method="BPCA" or "Auto", and s_route_method="QRILC".
+# AUTO uses R BPCA/QRILC; other candidates keep their Python kernels.
+# Preferred input aliases below normalize to mar_method/mnar_method in
+# loaded dictionaries and serialized configuration for older consumers.
+implementation = "python"
+# [String] S-route method. Options: "Row-wise", "Column-wise", "Global", "QRILC".
+s_route_method = "QRILC"
 
-# [Float] Fraction of the minimum value to be used for mnar_method constant imputation (e.g., 0.5 = 50% of min).
+# [Float] Minimum fraction for S-route constant imputation; legacy key retained.
 mnar_fraction = 0.5
 
-# [String] Algorithm for MAR (random) missing values. Options: "Auto", "MinProb", "KNN", "LLS", "BPCA", "Median".
-mar_method = "Auto"
+# [String] R-route method. Options: "Auto", "MinProb", "KNN", "LLS", "BPCA", "Median".
+r_route_method = "Auto"
 
-# [Integer] Number of neighboring samples to evaluate. Active strictly if mar_method is "KNN".
+# [Integer] Number of neighboring samples to evaluate. Active if r_route_method is "KNN".
 knn_neighbors = 5
 
-# [Integer] Number of neighboring samples to evaluate. Active strictly if mar_method is "LLS".
+# [Integer] Number of neighboring samples to evaluate. Active if r_route_method is "LLS".
 lls_neighbors = 15  
 
-# [Integer] Number of principal components for Bayesian PCA. Active strictly if mar_method is "BPCA" or Auto evaluates BPCA.
+# [Integer] Number of principal components for BPCA, fixed or evaluated by Auto.
 bpca_components = 2
 
 # [Integer] Maximum BPCA EM/Bayesian update steps.
@@ -258,13 +286,16 @@ bpca_max_iter = 100
 # [Float] BPCA convergence threshold based on residual precision change.
 bpca_tol = 0.0001
 
-# [Float] Ratio of known data to artificially mask for internal simulation and auto-evaluating the best MAR method via NRMSE metric.
+# [Float] Fraction of observed entries hidden for masked-reconstruction evaluation.
+# The low-intensity-weighted GMM mask is a stress test, not a mechanism label.
 sim_mask_ratio = 0.05
 
 # ------------------------------------------------------------------------------
 # Normalization
 # ------------------------------------------------------------------------------
 [DataNormalizer]
+# Use "r" with norm_method="VSN" or "Auto"; only VSN switches to R.
+implementation = "python"
 
 # [String] Normalization strategy.
 # Options: "Auto", "ROBUST_LOG_ONLY", "PQN", "MDFC", "TIC", "Median", "VSN", "Quantile".

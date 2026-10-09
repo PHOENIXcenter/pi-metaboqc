@@ -16,10 +16,10 @@ from ..constants import DEFAULT_RANDOM_SEED
 from .metrics import (
     _extract_log2_target,
     _role_columns,
+    fixed_weighted_mean_score,
     finite_or_nan,
     rank_loss_from_distances,
     robust_feature_zscore,
-    weighted_mean_score,
 )
 
 
@@ -343,18 +343,20 @@ def _summarize_sample_structure(
             np.exp(-median_relative_delta / scale_rel_delta_tol)
         )
 
-    metrics["sample_structure_scale_preservation"] = weighted_mean_score(
+    metrics["sample_structure_scale_preservation"] = fixed_weighted_mean_score(
         [
             (metrics["sample_structure_scale_shift_preservation"], 1.0),
             (metrics["sample_structure_scale_delta_preservation"], 1.0),
         ],
     )
-    metrics["sample_structure_composite_preservation"] = weighted_mean_score(
-        [
-            (metrics["sample_structure_trustworthiness"], 0.50),
-            (metrics["sample_structure_rank_preservation"], 0.25),
-            (metrics["sample_structure_scale_preservation"], 0.25),
-        ],
+    metrics["sample_structure_composite_preservation"] = (
+        fixed_weighted_mean_score(
+            [
+                (metrics["sample_structure_trustworthiness"], 0.50),
+                (metrics["sample_structure_rank_preservation"], 0.25),
+                (metrics["sample_structure_scale_preservation"], 0.25),
+            ],
+        )
     )
 
     return metrics
